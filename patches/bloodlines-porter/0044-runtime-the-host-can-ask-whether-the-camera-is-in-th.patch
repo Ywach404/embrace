@@ -1,0 +1,52 @@
+From f9db09f65a392086dba61840b523e63287c77dfd Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 01:01:43 -0600
+Subject: [PATCH] runtime: the host can ask whether the camera is in third
+ person
+
+Full view turns the game's crosshair off and draws its own reticle at the aiming hand; behind the player the game aims through the middle of its frame instead, so the host needs to know which. rt_host_third_person reports the runtime's own test, either CInput byte.
+---
+ runtime/host.h  |  4 ++++
+ runtime/input.c | 11 +++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 7df26e5..fa7b90c 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -63,6 +63,10 @@ void rt_host_mouse_button(int button, int down);
+ void rt_host_mouse_wheel(float dy);
+ int rt_host_cursor(float *u, float *v);
+ 
++/* Whether the game's camera is in third person now, so the host draws its
++ * reticle at the game's aim point rather than at the aiming hand. Any
++ * thread. */
++int rt_host_third_person(void);
+ /*
+  * rt_host_vitals returns 1 when the player is in the world with the HUD
+  * up, and writes the health and blood the game's HUD shows with the
+diff --git a/runtime/input.c b/runtime/input.c
+index e153a4d..4e524f1 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1426,6 +1426,17 @@ static void vitals_update(void)
+     last_blood = b;
+ }
+ 
++/* Whether the game's camera is behind the player (rt_input's own test,
++   either CInput byte), so the host draws its reticle where the game aims
++   rather than at the hand. Any thread. */
++int rt_host_third_person(void)
++{
++    pthread_mutex_lock(&s_mu);
++    int on = S.third_person;
++    pthread_mutex_unlock(&s_mu);
++    return on;
++}
++
+ int rt_host_vitals(int *health, int *health_max, int *blood, int *blood_max)
+ {
+     uint64_t w = __atomic_load_n(&s_vitals, __ATOMIC_ACQUIRE);
+-- 
+2.54.0 (Apple Git-157)
+

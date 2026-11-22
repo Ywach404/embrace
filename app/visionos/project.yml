@@ -1,0 +1,56 @@
+# XcodeGen source of truth; Host.xcodeproj is generated from it (gitignored).
+# app/visionos/build.sh runs xcodegen before every build.
+name: Host
+options:
+  deploymentTarget:
+    visionOS: "27.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+targets:
+  Host:
+    type: application
+    platform: visionOS
+    sources:
+      - path: Host
+      - path: Assets.xcassets
+    configFiles:
+      Debug: Link.xcconfig
+      Release: Link.xcconfig
+    settings:
+      base:
+        # Neutral on purpose: no person, no domain and no game in the
+        # identifier or the name shown under the icon.
+        PRODUCT_NAME: XRHost
+        PRODUCT_BUNDLE_IDENTIFIER: local.port.xrhost
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "0.1"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Support/Info.plist
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: Support/Host.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Support/Bridging.h
+        TARGETED_DEVICE_FAMILY: "7"
+        SUPPORTED_PLATFORMS: "xros xrsimulator"
+        # The runtime and its libraries are built for arm64 only, which is
+        # every device and every simulator on Apple silicon.
+        ARCHS: arm64
+        # The Mac executable is linked without dead stripping, so the lift
+        # is linked whole here too.
+        DEAD_CODE_STRIPPING: NO
+        # The guard phase reads the whole bundle it checks.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    postBuildScripts:
+      - name: Refuse game data in a shareable build
+        script: |
+          exec "$SRCROOT/scripts/refuse-game-data.sh" --phase
+        basedOnDependencyAnalysis: false
+        showEnvVars: false
+schemes:
+  Host:
+    build:
+      targets:
+        Host: all
+    archive:
+      config: Release

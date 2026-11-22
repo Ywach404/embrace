@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:18:25 -0600
+Subject: [PATCH 4/4] bridge: keep the fx layer path off in metal mode
+
+rt_fx_attach, rt_gfx_layer_fit and the MetalFX frame hook install
+process wide swizzles on CAMetalLayer and CAMetalDrawable for pacing and
+upscaling of the DXVK drawable. The metal backend owns its layer and its
+present, so CreateDevice and Present skip all three in that mode. The
+layer fit call itself stays in place for dxvk.
+---
+ shims/d3d9_bridge.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index e21eb8b..ddb6009 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -1008,7 +1008,10 @@ static uint32_t d_createdevice(const uint32_t *a)
+     s_pr.bh = pp.BackBufferHeight;
+     s_pr.windowed = pp.Windowed != 0;
+     pthread_mutex_unlock(&s_pr_mu);
+-    rt_fx_attach(s_dev_window);
++    /* fx.m swizzles CAMetalLayer and CAMetalDrawable for the whole process
++       and feeds MetalFX from the DXVK drawable; the metal backend owns its
++       layer and present, so none of that is started in metal mode. */
++    if (s_mode == RT_GFX_DXVK) rt_fx_attach(s_dev_window);
+     MEM32(a[6]) = wrap(dev, K_DEVICE, 0);
+     return 0;
+ }
+@@ -1299,7 +1302,7 @@ static uint32_t v_present(const uint32_t *a)
+             s_pr.dst = 1;
+         }
+     }
+-    void *fx_win = s_pr.win;
++    void *fx_win = s_mode == RT_GFX_DXVK ? s_pr.win : NULL;
+     uint32_t fx_bw = s_pr.bw, fx_bh = s_pr.bh;
+     pthread_mutex_unlock(&s_pr_mu);
+     if (cap[0]) capture(e->host, cap);

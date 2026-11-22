@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 23:04:27 -0600
+Subject: [PATCH] runtime: a Present held in the background is no graphics hang
+
+On the headset, taking it off or losing the space before the window was dismissed sends the app to the background, where the system holds its GPU work and Present waits for the frame in flight. The watchdog counted that wait and ended the game at exit 15 (17.7 s, after the space closed and the window was minimised). The host now reports background and foreground (rt_host_background), and the watchdog counts a blocked call only while in the foreground, from the app's return.
+---
+ runtime/host.h           |  8 ++++++++
+ runtime/input_selftest.c | 19 +++++++++++++++++++
+ runtime/rt.h             |  4 ++++
+ runtime/thread.c         | 26 +++++++++++++++++++++++++-
+ 4 files changed, 56 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index b034a11..7e9a548 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -121,4 +121,12 @@ int rt_host_aim_hand(void);
+  */
+ void rt_host_log(const char *msg);
+ 
++/*
++ * The app went to the background (1) or came back (0). On the headset
++ * the system holds a background app's GPU work, so a Present can wait
++ * there until the app returns; the graphics watchdog does not count that
++ * wait as a hang. Any thread.
++ */
++void rt_host_background(int on);
++
+ #endif
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 430c424..0d5066b 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1,4 +1,5 @@
+ #include "headlook.h"
++#include "rt.h"
+ #include "input.h"
+ #include "toggles.h"
+ 
+@@ -2926,9 +2927,27 @@ static void pad_recentre(void)
+     padpump(&s, &d, 10);
+ }
+ 
++/* The graphics watchdog: a Present held while the app is in the
++   background (the headset taken off, the space closed before the window
++   was dismissed) is no hang, and counts only from the app's return. The
++   headset run that ended at exit 15 after 17.7 s of such a wait. */
++static void hang_background(void)
++{
++    const uint64_t S = 1000000000ull;
++    check(rt_hang_blocked_ms(30 * S, 10 * S, 0, 0) == 20000, "hang_background", "in the foreground a call blocked 20 s counts 20 s");
++    check(rt_hang_blocked_ms(30 * S, 10 * S, 0, 1) == 0, "hang_background", "in the background it counts nothing");
++    check(rt_hang_due(rt_hang_blocked_ms(28 * S, 10 * S, 0, 1), 0) == 0, "hang_background",
++          "18 s held in the background is not a hang");
++    check(rt_hang_blocked_ms(30 * S, 10 * S, 28 * S, 0) == 2000, "hang_background", "back in the foreground it counts from the return");
++    check(rt_hang_due(rt_hang_blocked_ms(36 * S, 10 * S, 30 * S, 0), 0) == 1, "hang_background",
++          "a call still blocked 6 s after the return is a hang");
++    check(rt_hang_blocked_ms(30 * S, 0, 0, 0) == 0, "hang_background", "no call in progress counts nothing");
++}
++
+ int rt_input_selftest(void)
+ {
+     setvbuf(stdout, NULL, _IOLBF, 0);
++    hang_background();
+     keys();
+     lparams();
+     buttons();
+diff --git a/runtime/rt.h b/runtime/rt.h
+index 9da2330..42ab449 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -212,6 +212,10 @@ void rt_yield(void);
+ extern volatile uint64_t rt_bridge_t0;
+ extern const char *volatile rt_bridge_name;
+ int rt_hang_due(uint64_t elapsed_ms, int player);
++/* How long a bridge call that began at call_ns counts as blocked: none
++   while the app is in the background, and only from foreground_ns once it
++   is back, since the system holds a background app's GPU work. */
++uint64_t rt_hang_blocked_ms(uint64_t now, uint64_t call_ns, uint64_t foreground_ns, int background);
+ void rt_watchdog_start(int until, double close_after_s, double capture_after_s);
+ void rt_stage8_reached(void);
+ void rt_note_event(void);
+diff --git a/runtime/thread.c b/runtime/thread.c
+index 056a40b..e75ca8b 100644
+--- a/runtime/thread.c
++++ b/runtime/thread.c
+@@ -707,6 +707,29 @@ static void dxvk_log_scan(time_t started)
+ 
+ static int since(uint64_t now, uint64_t t, uint64_t ns) { return t && now >= t && now - t >= ns; }
+ 
++/* While the app is in the background (on the headset: taken off, or the
++   space and window both gone) the system holds its GPU work, so a Present
++   waiting on a frame's completion waits until the app is back. That is
++   not a hang: the watchdog leaves such a wait alone, and counts a blocked
++   call from when the app came back, not from when it started. */
++static _Atomic int s_background;
++static _Atomic uint64_t s_foreground_ns;
++
++uint64_t rt_hang_blocked_ms(uint64_t now, uint64_t call_ns, uint64_t foreground_ns, int background)
++{
++    uint64_t from = call_ns > foreground_ns ? call_ns : foreground_ns;
++    if (!call_ns || background || now <= from) return 0;
++    return (now - from) / 1000000ull;
++}
++
++void rt_host_background(int on)
++{
++    int was = atomic_exchange(&s_background, on != 0);
++    if (was == (on != 0)) return;
++    if (!on) atomic_store(&s_foreground_ns, rt_now_ns());
++    rt_log("app %s", on ? "in the background: the graphics watchdog waits" : "back in the foreground");
++}
++
+ static void *watchdog(void *arg)
+ {
+     (void)arg;
+@@ -717,7 +740,8 @@ static void *watchdog(void *arg)
+         uint64_t now = rt_now_ns();
+         uint64_t b0 = __atomic_load_n(&rt_bridge_t0, __ATOMIC_ACQUIRE);
+         const char *bn = __atomic_load_n(&rt_bridge_name, __ATOMIC_ACQUIRE);
+-        if (b0 && now > b0 && rt_hang_due((now - b0) / 1000000ull, rt_player()) && __atomic_load_n(&rt_bridge_t0, __ATOMIC_ACQUIRE) == b0)
++        uint64_t blocked = rt_hang_blocked_ms(now, b0, atomic_load(&s_foreground_ns), atomic_load(&s_background));
++        if (blocked && rt_hang_due(blocked, rt_player()) && __atomic_load_n(&rt_bridge_t0, __ATOMIC_ACQUIRE) == b0)
+             rt_stop(15, 0, "gfx hang: %s blocked %llu ms (load %.2f)", bn, (unsigned long long)((now - b0) / 1000000ull), load1());
+         if (now - last_scan >= 500000000ull) {
+             last_scan = now;

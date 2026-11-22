@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:46:28 -0600
+Subject: [PATCH 09/10] bridge: call the metal backend statically on visionOS
+
+A visionOS app cannot dlopen a library it carries, so there the backend
+is linked into the app with the runtime. Under TARGET_OS_VISION metal
+mode takes Direct3DCreate9, metal_d3d9_set_host and metal_d3d9_shutdown
+as linked symbols and skips the library path, its access check and the
+dlopen. The shader cache and the vidcfg.bin check are unchanged.
+
+The post stage 9 image check would stop the run, since it expects one
+libSDL3 and one libmetal_d3d9 image and both are now static. On visionOS
+it expects none of either and still refuses a dxvk or Vulkan image.
+
+dxvk mode refuses on visionOS with a log line: no Vulkan loader or ICD
+can be loaded there. The Mac paths are unchanged.
+---
+ shims/d3d9_bridge.c | 40 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index 34f3335..d709d11 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -5,6 +5,7 @@
+ #include "toggles.h"
+ 
+ #include <SDL3/SDL.h>
++#include <TargetConditionals.h>
+ #include <dirent.h>
+ #include <dlfcn.h>
+ #include <errno.h>
+@@ -227,6 +228,15 @@ typedef struct {
+ static int s_mode;
+ static void *s_lib;
+ static void *(*s_create9)(uint32_t);
++
++#if TARGET_OS_VISION
++/* visionOS apps cannot load a library of their own at run time, so the
++   metal backend is linked into the app with the runtime, and these are its
++   exports called directly. */
++void *Direct3DCreate9(uint32_t sdk_version);
++void metal_d3d9_set_host(void (*log)(const char *msg), void (*stop)(const char *msg));
++void metal_d3d9_shutdown(void);
++#endif
+ static char s_overlay[PATH_MAX];
+ static uint32_t s_vtbl[K_N];
+ static int s_slot[M_N];
+@@ -944,9 +954,18 @@ static void metal_image_check(void)
+         ours += !strncmp(b, "libmetal_d3d9", 13);
+         other += strstr(b, "libdxvk_d3d9") || strstr(b, "libvulkan");
+     }
++#if TARGET_OS_VISION
++    /* SDL and the backend are static here, so neither has an image of its
++       own; a second renderer would still show as an image. */
++    if (sdl || ours || other)
++        rt_stop(15, 0, "gfx image check failed: libSDL3 images %d, libmetal_d3d9 %d, dxvk or Vulkan images %d (all are "
++                "linked in statically on visionOS)", sdl, ours, other);
++    rt_log("gfx image check: SDL3 and the metal backend linked in, no dxvk or Vulkan image");
++#else
+     if (sdl != 1 || ours != 1 || other)
+         rt_stop(15, 0, "gfx image check failed: libSDL3 images %d, libmetal_d3d9 %d, dxvk or Vulkan images %d", sdl, ours,
+                 other);
++#endif
+ }
+ 
+ static void native_window(rt_win *w)
+@@ -2517,7 +2536,9 @@ static void metal_stop(const char *msg) { rt_stop(10, 0, "gfx metal %s", msg); }
+    or required here. */
+ static int metal_init(const char *overlay)
+ {
+-    char exe[PATH_MAX], lib[PATH_MAX], path[PATH_MAX + 64];
++    char path[PATH_MAX + 64];
++#if !TARGET_OS_VISION
++    char exe[PATH_MAX], lib[PATH_MAX];
+     own_exe(exe);
+     const char *e_lib = getenv("RT_METAL_D3D9_LIB");
+     char *slash = strrchr(exe, '/');
+@@ -2532,6 +2553,7 @@ static int metal_init(const char *overlay)
+         rt_log("gfx missing %s; --gfx null runs without it", lib);
+         return -1;
+     }
++#endif
+     snprintf(path, sizeof path, "%s/files/Vampire/vidcfg.bin", overlay);
+     FILE *f = fopen(path, "rb");
+     if (f) {
+@@ -2551,6 +2573,12 @@ static int metal_init(const char *overlay)
+     mkdir(path, 0755);
+     setenv("RT_METAL_CACHE_DIR", path, 0);
+     rt_log("gfx metal shader cache %s", getenv("RT_METAL_CACHE_DIR"));
++#if TARGET_OS_VISION
++    s_create9 = Direct3DCreate9;
++    metal_d3d9_set_host(metal_log, metal_stop);
++    rt_log("gfx metal linked in");
++    return 0;
++#else
+     s_lib = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+     if (!s_lib) {
+         rt_log("gfx missing %s: %s; --gfx null runs without it", lib, dlerror());
+@@ -2566,6 +2594,7 @@ static int metal_init(const char *overlay)
+     host(metal_log, metal_stop);
+     rt_log("gfx metal %s", lib);
+     return 0;
++#endif
+ }
+ 
+ int rt_gfx_init(int mode, const char *overlay)
+@@ -2578,6 +2607,11 @@ int rt_gfx_init(int mode, const char *overlay)
+         rt_log("gfx null");
+         return 0;
+     }
++#if TARGET_OS_VISION
++    /* No Vulkan loader or ICD can be loaded by a visionOS app. */
++    rt_log("gfx dxvk is not available on visionOS; --gfx metal or --gfx null");
++    return -1;
++#endif
+     char exe[PATH_MAX], path[PATH_MAX + 64];
+     own_exe(exe);
+     rt_gfx_paths gp;
+@@ -2645,10 +2679,14 @@ void rt_gfx_report(void)
+        neither would happen. It does both here instead, before this
+        report, so its lines land with the rest of the exit. Resolved
+        late and optional: a backend without the export just skips it. */
++#if TARGET_OS_VISION
++    if (s_mode == RT_GFX_METAL) metal_d3d9_shutdown();
++#else
+     if (s_mode == RT_GFX_METAL && s_lib) {
+         void (*shutdown)(void) = (void (*)(void))dlsym(s_lib, "metal_d3d9_shutdown");
+         if (shutdown) shutdown();
+     }
++#endif
+     uint32_t n = s_nframes;
+     double q[4] = {0, 0, 0, 0};
+     uint64_t *v = n ? malloc(n * sizeof *v) : NULL;

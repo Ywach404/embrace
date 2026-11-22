@@ -1,0 +1,661 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:28:55 -0600
+Subject: [PATCH] runtime: drive the Sense halves as one pad, and log for the
+ host
+
+With both PSVR2 Sense controllers on at launch, GameController gives
+the app one controller, "PlayStation VR2 Sense Controllers (L/R)", and
+SDL one pad. A half that connects on its own is a controller of its
+own instead: a device run with the controllers joining late logged
+only "PlayStation VR2 Sense Controller (R)", and with no left stick the
+player could not walk. Hot-plug itself reaches SDL: its MFi observers
+run where GameController posts, on the main run loop SwiftUI keeps, so
+they need no SDL event pump, and pads were added after the immersive
+space opened in earlier runs too.
+
+The pad layer read only the pad that drives, and with two separate
+halves the one used last would have taken the drive from the other
+rather than adding to it. Now a slot knows from its name whether it
+is a left half, a right half, a pair or a whole pad. Open halves are
+one pad: the drive goes to the group, buttons are read as down when
+either half holds them and each axis as the one further out, so the
+left stick, L1, L2 and L3 come from (L) and the right side from (R)
+without naming where each half's face buttons land in SDL. A fresh
+press on either half is the group's use, so a DualSense or Xbox pad
+still takes over on its own fresh press and either half takes the
+drive back. A half joining the group that drives releases nothing,
+and a half leaving releases nothing either: the merged read in the
+same poll lifts what only the gone half held and keeps the rest, so a
+trigger held through it is not let go and pressed again.
+
+A pair is a whole pad that replaces its halves. One that arrives
+after them closes them and takes the drive straight over with the
+pad's state as it was, so what both report held is neither pressed
+twice nor dropped; halves are ignored while a pair is open, pairs are
+opened first in a poll so halves beside them are never opened only to
+be closed, and when the pair goes the halves still connected open
+again. Names are read from the joystick, not the gamepad, since SDL
+can name a gamepad after a mapping another device shares, and the two
+halves differ only in their names.
+
+The log says what arrived: "pad added ... half=left", "pad combined
+... with ... as one pad", "pad combined: ... gives way to ...", "pad
+half left, ... drives alone", and "pad drives" names every member.
+rt_host_log gives the host a line in the same run log, for its own
+view of GameController's controllers.
+
+The input self test adds virtual pads named like the halves: L then
+R, R then L, a pair after its halves, each half leaving and coming
+back, a pair while a DualSense drives, and a DualSense taking over and
+handing back, with stick, trigger and button routing checked in each.
+---
+ runtime/host.h           |   8 ++
+ runtime/input_selftest.c | 236 +++++++++++++++++++++++++++++++++++++++
+ runtime/pad.c            | 201 +++++++++++++++++++++++++++------
+ runtime/pad.h            |  10 ++
+ runtime/trace.c          |   3 +
+ 5 files changed, 426 insertions(+), 32 deletions(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 86d02ba..d12e322 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -76,4 +76,12 @@ int rt_host_cursor(float *u, float *v);
+  */
+ void *rt_host_game_window(void);
+ 
++/*
++ * Writes one line from the host to the runtime's log, after "host: ", so
++ * what the host sees (GameController's own view of the controllers, say)
++ * lands in the same run log, in order with the runtime's lines. Any
++ * thread. Lines before the runtime opens its log go to stderr only.
++ */
++void rt_host_log(const char *msg);
++
+ #endif
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 7b1fecd..7961aae 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -954,6 +954,241 @@ static void pad_drive(void)
+     rt_pad_test_detach(id3);
+ }
+ 
++#define SENSE_L "PlayStation VR2 Sense Controller (L)"
++#define SENSE_R "PlayStation VR2 Sense Controller (R)"
++#define SENSE_LR "PlayStation VR2 Sense Controllers (L/R)"
++
++static int has_msg(uint32_t msg, uint32_t wp)
++{
++    for (int i = 0; i < s_n; i++)
++        if (s_m[i].msg == msg && (!wp || s_m[i].wp == wp)) return 1;
++    return 0;
++}
++
++static int pair_open(const rt_pad_dev *d)
++{
++    for (int i = 0; i < d->nslots; i++)
++        if (d->slot[i].half == RT_PAD_PAIR) return 1;
++    return 0;
++}
++
++static void play_state(rt_input_state *s, rt_pad_dev *d)
++{
++    st(s);
++    s->cursor = 0;
++    s->x = 640;
++    s->y = 512;
++    rt_input_relative_update(s);
++    rt_pad_dev_init(d, NULL);
++}
++
++/* The Sense halves as GameController presents them when they connect one
++   at a time: each its own pad, the left stick and L side on (L), the
++   right stick, Cross and R2 on (R). Each half is only ever given the
++   inputs it has. */
++static void pad_halves(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    static const struct {
++        const char *name;
++        int want;
++    } k_names[] = {
++        {SENSE_L, RT_PAD_HALF_L},
++        {SENSE_R, RT_PAD_HALF_R},
++        {SENSE_LR, RT_PAD_PAIR},
++        {"Left Spatial Controller", RT_PAD_HALF_L},
++        {"Right Spatial Controller", RT_PAD_HALF_R},
++        {"DualSense Wireless Controller", RT_PAD_WHOLE},
++        {"Joy-Con (L)", RT_PAD_WHOLE},
++        {NULL, RT_PAD_WHOLE},
++    };
++    for (size_t i = 0; i < sizeof k_names / sizeof *k_names; i++)
++        check(rt_pad_half(k_names[i].name) == k_names[i].want, "Sense half names", "case %zu gave %d", i, rt_pad_half(k_names[i].name));
++
++    /* L, then R. */
++    play_state(&s, &d);
++    SDL_JoystickID l = rt_pad_test_attach(SENSE_L);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == l && d.nslots == 1 && rt_pad_kind() == RT_PAD_PLAYSTATION, "a lone left half drives as a PlayStation pad",
++          "%s id %u slots %d kind %d", dump(), (unsigned)d.id, d.nslots, rt_pad_kind());
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, 32767);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_KEYDOWN, 0x44, 1), "the left half alone walks", "%s", dump());
++    s_n = 0;
++    SDL_JoystickID r = rt_pad_test_attach(SENSE_R);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.nslots == 2 && d.id == l && rt_pad_kind() == RT_PAD_PLAYSTATION,
++          "the right half joining the left releases nothing and takes no drive", "%s slots %d", dump(), d.nslots);
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_LBUTTONDOWN, 1, 1), "R2 on the right half fires while the left half walks", "%s", dump());
++    s_n = 0;
++    rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 1);
++    rt_pad_test_button(l, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 2 && has_msg(WM_KEYDOWN, 0x20) && has_msg(WM_MOUSEWHEEL, 0), "Cross from the right and L1 from the left in one pump",
++          "%s", dump());
++    rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 0);
++    rt_pad_test_button(l, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    s.x = 640;
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHTX, 32767);
++    for (int i = 0; i < 10; i++) padpump(&s, &d, 10);
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHTX, 0);
++    check(s.x >= 639 + 120 && s.x <= 641 + 120 && !has_msg(WM_KEYUP, 0x44), "the right half's stick looks while the left keeps walking",
++          "%d %s", s.x, dump());
++
++    /* One half going: the other keeps driving and keeps what it holds. */
++    s_n = 0;
++    rt_pad_test_detach(l);
++    padpump(&s, &d, 10);
++    check(has_msg(WM_KEYUP, 0x44) && !has_msg(WM_LBUTTONUP, 0) && s_n <= 2 && d.id == r && d.nslots == 1,
++          "the left half leaving lifts only its walk key, R2 stays held", "%s id %u", dump(), (unsigned)d.id);
++    s_n = 0;
++    l = rt_pad_test_attach(SENSE_L);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == r && d.nslots == 2, "the left half coming back joins with no switch", "%s", dump());
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTY, -32767);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_KEYDOWN, 0x57, 1), "the returned left half walks again", "%s", dump());
++    s_n = 0;
++    rt_pad_test_detach(r);
++    padpump(&s, &d, 10);
++    check(s_n == 1 && s_m[0].msg == WM_LBUTTONUP && d.id == l && d.gp, "the right half leaving lets go of R2 and hands the drive to the left",
++          "%s", dump());
++    s_n = 0;
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTY, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_detach(l);
++    padpump(&s, &d, 10);
++    check(!d.gp && d.nslots == 0, "both halves gone leaves no pad", "slots %d", d.nslots);
++
++    /* R, then L: the right half alone has no walk until the left comes. */
++    play_state(&s, &d);
++    r = rt_pad_test_attach(SENSE_R);
++    padpump(&s, &d, 10);
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_LBUTTONDOWN, 1, 1) && d.id == r, "a lone right half fires", "%s", dump());
++    s_n = 0;
++    l = rt_pad_test_attach(SENSE_L);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == r && d.nslots == 2 && rt_pad_kind() == RT_PAD_PLAYSTATION,
++          "the left half joining a firing right half releases nothing", "%s", dump());
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, -32767);
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 20000);
++    padpump(&s, &d, 10);
++    check(s_n == 2 && has_msg(WM_KEYDOWN, 0x41) && has_msg(WM_RBUTTONDOWN, 0), "the late left half walks and takes L2", "%s", dump());
++
++    /* A pair arriving after its halves replaces them with no double
++       input: what both report held stays held, once. Buttons and sticks
++       only, since SDL reports a trigger held as a pad opens only once it
++       moves. */
++    s_n = 0;
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 0);
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
++    rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 3 && has_msg(WM_RBUTTONUP, 0) && has_msg(WM_LBUTTONUP, 0) && has_msg(WM_KEYDOWN, 0x20),
++          "the halves let go of both triggers and hold Cross", "%s", dump());
++    s_n = 0;
++    SDL_JoystickID lr = rt_pad_test_attach(SENSE_LR);
++    rt_pad_test_axis(lr, SDL_GAMEPAD_AXIS_LEFTX, -32767);
++    rt_pad_test_button(lr, SDL_GAMEPAD_BUTTON_SOUTH, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == lr && d.nslots == 1 && d.nignored == 2, "a pair after its halves takes over silently and closes them",
++          "%s id %u slots %d ignored %d", dump(), (unsigned)d.id, d.nslots, d.nignored);
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, 0);
++    rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 0);
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
++    for (int i = 0; i < 3; i++) padpump(&s, &d, 10);
++    check(s_n == 0 && d.nslots == 1, "the closed halves are ignored while the pair is open", "%s", dump());
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
++    rt_pad_test_axis(lr, SDL_GAMEPAD_AXIS_LEFTX, 0);
++    rt_pad_test_button(lr, SDL_GAMEPAD_BUTTON_SOUTH, 0);
++    padpump(&s, &d, 10);
++    check(s_n == 2 && has_msg(WM_KEYUP, 0x41) && has_msg(WM_KEYUP, 0x20), "the pair lets go of the walk key and Cross once", "%s", dump());
++
++    /* The pair going brings back the halves still connected. */
++    s_n = 0;
++    rt_pad_test_detach(lr);
++    padpump(&s, &d, 10);
++    check(d.nslots == 2 && d.gp && rt_pad_half(SDL_GetJoystickName(SDL_GetGamepadJoystick(d.gp))) != RT_PAD_WHOLE && d.nignored == 0,
++          "with the pair gone the halves drive again", "slots %d ignored %d", d.nslots, d.nignored);
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, 32767);
++    padpump(&s, &d, 10);
++    check(has_msg(WM_KEYDOWN, 0x44), "the reopened left half walks", "%s", dump());
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, 0);
++    padpump(&s, &d, 10);
++
++    /* A pad already open when a pair arrives: only the halves give way. */
++    s_n = 0;
++    SDL_JoystickID ds = rt_pad_test_attach("DualSense Wireless Controller");
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.nslots == 3 && rt_pad_half(SDL_GetJoystickName(SDL_GetGamepadJoystick(d.gp))) != RT_PAD_WHOLE, "a DualSense connecting does not take the drive",
++          "%s slots %d", dump(), d.nslots);
++
++    /* A DualSense takes over from the pair of halves and hands back. */
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_button(ds, SDL_GAMEPAD_BUTTON_EAST, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 2 && s_m[0].msg == WM_LBUTTONUP && s_m[1].msg == WM_KEYDOWN && s_m[1].wp == 0x45 && d.id == ds,
++          "a fresh DualSense press takes the drive from the halves and lifts their R2", "%s", dump());
++    s_n = 0;
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == ds, "a half letting go of a held trigger does not take the drive back", "%s", dump());
++    rt_pad_test_button(ds, SDL_GAMEPAD_BUTTON_EAST, 0);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, 32767);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_KEYDOWN, 0x44, 1) && rt_pad_half(SDL_GetJoystickName(SDL_GetGamepadJoystick(d.gp))) == RT_PAD_HALF_L && rt_pad_kind() == RT_PAD_PLAYSTATION,
++          "a fresh push on the left half takes the drive back for both halves", "%s", dump());
++    s_n = 0;
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_LBUTTONDOWN, 1, 1) && rt_pad_half(SDL_GetJoystickName(SDL_GetGamepadJoystick(d.gp))) == RT_PAD_HALF_L,
++          "the right half's press counts as the same pad and switches nothing", "%s", dump());
++
++    /* A pair arriving while the DualSense drives closes the halves and
++       leaves the drive where it is. */
++    rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
++    rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_button(ds, SDL_GAMEPAD_BUTTON_EAST, 1);
++    padpump(&s, &d, 10);
++    rt_pad_test_button(ds, SDL_GAMEPAD_BUTTON_EAST, 0);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_detach(l);
++    rt_pad_test_detach(r);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == ds && d.nslots == 1, "halves leaving while a DualSense drives change nothing", "%s", dump());
++    l = rt_pad_test_attach(SENSE_L);
++    r = rt_pad_test_attach(SENSE_R);
++    padpump(&s, &d, 10);
++    lr = rt_pad_test_attach(SENSE_LR);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == ds && d.nslots == 2 && pair_open(&d), "a pair while a DualSense drives replaces the halves, not the drive",
++          "%s slots %d", dump(), d.nslots);
++    rt_pad_test_button(lr, SDL_GAMEPAD_BUTTON_SOUTH, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 1 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x20 && d.id == lr, "a fresh press on the pair takes the drive", "%s", dump());
++    rt_pad_test_button(lr, SDL_GAMEPAD_BUTTON_SOUTH, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_detach(lr);
++    rt_pad_test_detach(l);
++    rt_pad_test_detach(r);
++    rt_pad_test_detach(ds);
++    padpump(&s, &d, 10);
++    check(!d.gp && d.nslots == 0, "everything gone leaves no pad", "slots %d", d.nslots);
++}
++
+ static void padpump_ns(rt_input_state *s, rt_pad_dev *d, uint64_t ns)
+ {
+     s_pad_t += ns;
+@@ -1978,6 +2213,7 @@ int rt_input_selftest(void)
+     waitmap();
+     pad_detect();
+     pad_drive();
++    pad_halves();
+     pad_curve();
+     pad_modes();
+     /* The answer highlight works on a fake HUD in guest memory, so this
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 84c1f30..f43c191 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -97,6 +97,23 @@ int rt_pad_detect(SDL_GamepadType type, const char *name)
+     return RT_PAD_XBOX;
+ }
+ 
++/* By name, since SDL has no type for the halves: GameController names
++   them by vendor ("PlayStation VR2 Sense Controller (L)"), and the
++   product category ("Left Spatial Controller") is what SDL falls back on
++   when a controller has no vendor name. */
++int rt_pad_half(const char *name)
++{
++    if (!name) return RT_PAD_WHOLE;
++    if (strcasestr(name, "Left Spatial Controller")) return RT_PAD_HALF_L;
++    if (strcasestr(name, "Right Spatial Controller")) return RT_PAD_HALF_R;
++    if (!strcasestr(name, "Sense Controller") && !strcasestr(name, "Spatial Controller")) return RT_PAD_WHOLE;
++    size_t n = strlen(name);
++    if (n >= 5 && !strcasecmp(name + n - 5, "(L/R)")) return RT_PAD_PAIR;
++    if (n >= 3 && !strcasecmp(name + n - 3, "(L)")) return RT_PAD_HALF_L;
++    if (n >= 3 && !strcasecmp(name + n - 3, "(R)")) return RT_PAD_HALF_R;
++    return RT_PAD_WHOLE;
++}
++
+ int rt_pad_kind(void) { return atomic_load(&s_detected); }
+ 
+ const char *rt_pad_type_name(int kind) { return kind == RT_PAD_PLAYSTATION ? "playstation" : "xbox"; }
+@@ -654,11 +671,38 @@ static int slot_of(const rt_pad_dev *d, SDL_JoystickID id)
+     return -1;
+ }
+ 
++static int is_half(int half) { return half == RT_PAD_HALF_L || half == RT_PAD_HALF_R; }
++
++/* Two open slots drive as one when they are the same slot or both
++   halves. Any (L) and (R) count as one pad: there is one Sense pair to a
++   headset. */
++static int grouped(const rt_pad_dev *d, int i, int j)
++{
++    return i == j || (is_half(d->slot[i].half) && is_half(d->slot[j].half));
++}
++
++static int pair_slot(const rt_pad_dev *d)
++{
++    for (int i = 0; i < d->nslots; i++)
++        if (d->slot[i].half == RT_PAD_PAIR) return i;
++    return -1;
++}
++
++/* The joystick's own name, not the gamepad's: SDL can name a gamepad
++   after a mapping it shares with another device, and the two halves
++   differ only in their names. */
++static const char *slot_name(const rt_pad_dev *d, int i)
++{
++    const char *nm = SDL_GetJoystickName(SDL_GetGamepadJoystick(d->slot[i].gp));
++    return nm ? nm : "?";
++}
++
+ /* What a pad is doing, one bit per button (the triggers at their click
+    point) and one per stick direction past the dead zone. A pad takes
+    over on a bit that newly sets, not on bits that stay set, so a
+    resting stick that drifts past the dead zone cannot steal the drive
+-   back. */
++   back. Each half keeps its own bits; a fresh bit on either takes the
++   drive for both. */
+ static uint32_t live(SDL_Gamepad *gp)
+ {
+     uint32_t b = 0;
+@@ -674,18 +718,61 @@ static uint32_t live(SDL_Gamepad *gp)
+     return b;
+ }
+ 
++/* The driving pad's input, merged over its group. A lone half reports
++   nothing for the side it does not have, so a button is down when either
++   half holds it and an axis is the one further out: the left stick, L1,
++   L2 and L3 come from (L) and the right side from (R) without naming
++   which SDL button each half's face buttons land on. */
++static int group_button(const rt_pad_dev *d, int drv, SDL_GamepadButton b)
++{
++    for (int i = 0; i < d->nslots; i++)
++        if (grouped(d, i, drv) && SDL_GetGamepadButton(d->slot[i].gp, b)) return 1;
++    return 0;
++}
++
++static int group_axis(const rt_pad_dev *d, int drv, SDL_GamepadAxis a)
++{
++    int best = 0;
++    for (int i = 0; i < d->nslots; i++) {
++        if (!grouped(d, i, drv)) continue;
++        int v = SDL_GetGamepadAxis(d->slot[i].gp, a);
++        if (abs(v) > abs(best)) best = v;
++    }
++    return best;
++}
++
+ static void drive(rt_pad_dev *d, int i, const char *why)
+ {
+     d->gp = d->slot[i].gp;
+     d->id = d->slot[i].id;
+-    const char *nm = SDL_GetGamepadName(d->gp);
++    const char *nm = slot_name(d, i);
+     atomic_store(&s_detected, rt_pad_detect(SDL_GetGamepadType(d->gp), nm));
+-    rt_log("pad drives %s type=%s (%s)", nm ? nm : "?", rt_pad_type_name(rt_pad_kind()), why);
++    char all[256] = "";
++    size_t at = 0;
++    for (int j = 0; j < d->nslots && at < sizeof all; j++)
++        if (grouped(d, i, j) && j != i) at += (size_t)snprintf(all + at, sizeof all - at, " with %s", slot_name(d, j));
++    rt_log("pad drives %s%s type=%s (%s)", nm, all, rt_pad_type_name(rt_pad_kind()), why);
++}
++
++static void ignore(rt_pad_dev *d, SDL_JoystickID id, const char *why)
++{
++    if (d->nignored >= 8) return;
++    d->ignored[d->nignored++] = id;
++    const char *nm = SDL_GetJoystickNameForID(id);
++    rt_log("pad ignored %s (%s)", nm ? nm : "?", why);
++}
++
++static void close_slot(rt_pad_dev *d, int i)
++{
++    SDL_CloseGamepad(d->slot[i].gp);
++    memmove(&d->slot[i], &d->slot[i + 1], (size_t)(d->nslots - i - 1) * sizeof d->slot[0]);
++    d->nslots--;
+ }
+ 
+ /* Every connected pad is open and the one used last drives, so a
+    DualSense or Xbox pad and the Sense pair both work without
+-   reconnecting either. A switch lifts what the old pad held first. */
++   reconnecting either. A switch lifts what the old pad held first. Open
++   Sense halves are one pad for this, whatever order they came in. */
+ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy)
+ {
+     int n = 0;
+@@ -695,14 +782,26 @@ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_
+             i++;
+             continue;
+         }
+-        const char *nm = SDL_GetGamepadName(d->slot[i].gp);
+-        rt_log("pad removed %s", nm ? nm : "?");
+-        int was = d->slot[i].id == d->id;
+-        SDL_CloseGamepad(d->slot[i].gp);
+-        memmove(&d->slot[i], &d->slot[i + 1], (size_t)(d->nslots - i - 1) * sizeof d->slot[0]);
+-        d->nslots--;
++        int drv = slot_of(d, d->id), was = i == drv, member = drv >= 0 && grouped(d, i, drv) && !was;
++        int half = d->slot[i].half, other = -1;
++        rt_log("pad removed %s", slot_name(d, i));
++        close_slot(d, i);
+         d->nignored = 0;
++        if (member) {
++            /* The other half still drives. Nothing is released here: the
++               merged read below lifts what only the gone half held and
++               keeps what the other half holds, so a trigger held through
++               it is not let go and pressed again. */
++            rt_log("pad half left, %s drives alone", slot_name(d, slot_of(d, d->id)));
++            continue;
++        }
+         if (!was) continue;
++        for (int j = 0; j < d->nslots && is_half(half); j++)
++            if (is_half(d->slot[j].half)) other = j;
++        if (other >= 0) {
++            drive(d, other, "the other half left, it drives alone");
++            continue;
++        }
+         n += rt_pad_release(&d->pad, pt, out + n, cap - n);
+         d->gp = NULL;
+         d->id = 0;
+@@ -711,35 +810,73 @@ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_
+     }
+     int count = 0;
+     SDL_JoystickID *ids = SDL_GetGamepads(&count);
+-    for (int i = 0; ids && i < count; i++) {
+-        if (slot_of(d, ids[i]) >= 0 || ignored(d, ids[i])) continue;
+-        if (d->nslots >= RT_PAD_MAX) {
+-            if (d->nignored >= 8) continue;
+-            d->ignored[d->nignored++] = ids[i];
+-            const char *nm = SDL_GetGamepadNameForID(ids[i]);
+-            rt_log("pad ignored %s (%d pads open)", nm ? nm : "?", RT_PAD_MAX);
++    /* A pair first, so halves listed beside it in the same poll are never
++       opened only to be closed again. */
++    for (int pass = 0; pass < 2; pass++) {
++        for (int i = 0; ids && i < count; i++) {
++            if (slot_of(d, ids[i]) >= 0 || ignored(d, ids[i])) continue;
++            int half = rt_pad_half(SDL_GetJoystickNameForID(ids[i]));
++            if ((half == RT_PAD_PAIR) != (pass == 0)) continue;
++            if (is_half(half) && pair_slot(d) >= 0) {
++                ignore(d, ids[i], "the Sense pair is open");
++                continue;
++            }
++            if (d->nslots >= RT_PAD_MAX) {
++                ignore(d, ids[i], "4 pads open");
++                continue;
++            }
++            SDL_Gamepad *gp = SDL_OpenGamepad(ids[i]);
++            if (!gp) continue;
++            /* What is held at connect is not use: the first pad is adopted
++               silently, and a later one waits for a fresh press. */
++            rt_pad_slot *s = &d->slot[d->nslots++];
++            *s = (rt_pad_slot){gp, ids[i], live(gp), half};
++            const char *nm = slot_name(d, d->nslots - 1);
++            static const char *const k_half[] = {"", " half=left", " half=right", " half=pair"};
++            rt_log("pad added %s type=%s%s", nm, rt_pad_type_name(rt_pad_detect(SDL_GetGamepadType(gp), nm)), k_half[half]);
++            int drv = slot_of(d, d->id);
++            if (!d->gp) {
++                drive(d, d->nslots - 1, "first pad");
++                d->last_ns = now_ns;
++            } else if (drv >= 0 && grouped(d, d->nslots - 1, drv)) {
++                /* The other half of the pad that drives: it joins the
++                   drive at once, with no switch and nothing released. */
++                rt_log("pad combined %s with %s as one pad", nm, slot_name(d, drv));
++            }
++        }
++    }
++    SDL_free(ids);
++    /* A pair that came after its halves replaces them. The drive passes
++       straight to it with nothing released: the pad's own state carries
++       over, so what both report held is neither pressed twice nor
++       dropped, and the next read settles any difference. */
++    int pair = pair_slot(d), took = 0;
++    for (int i = 0; pair >= 0 && i < d->nslots;) {
++        if (!is_half(d->slot[i].half)) {
++            i++;
+             continue;
+         }
+-        SDL_Gamepad *gp = SDL_OpenGamepad(ids[i]);
+-        if (!gp) continue;
+-        /* What is held at connect is not use: the first pad is adopted
+-           silently, and a later one waits for a fresh press. */
+-        rt_pad_slot *s = &d->slot[d->nslots++];
+-        *s = (rt_pad_slot){gp, ids[i], live(gp)};
+-        const char *nm = SDL_GetGamepadName(gp);
+-        rt_log("pad added %s type=%s", nm ? nm : "?", rt_pad_type_name(rt_pad_detect(SDL_GetGamepadType(gp), nm)));
+-        if (!d->gp) {
+-            drive(d, d->nslots - 1, "first pad");
+-            d->last_ns = now_ns;
++        int drv = slot_of(d, d->id);
++        took |= drv >= 0 && grouped(d, i, drv);
++        rt_log("pad combined: %s gives way to %s", slot_name(d, i), slot_name(d, pair));
++        SDL_JoystickID id = d->slot[i].id;
++        close_slot(d, i);
++        pair = pair_slot(d);
++        if (took) {
++            d->gp = NULL;
++            d->id = 0;
+         }
++        ignore(d, id, "the Sense pair is open");
+     }
+-    SDL_free(ids);
++    if (took) drive(d, pair, "the pair replaces its halves");
++    int drv = slot_of(d, d->id);
+     for (int i = 0; i < d->nslots; i++) {
+         uint32_t now = live(d->slot[i].gp), fresh = now & ~d->slot[i].live;
+         d->slot[i].live = now;
+-        if (!fresh || d->slot[i].id == d->id) continue;
++        if (!fresh || (drv >= 0 && grouped(d, i, drv))) continue;
+         n += rt_pad_release(&d->pad, pt, out + n, cap - n);
+         drive(d, i, "used last");
++        drv = i;
+     }
+     if (!d->gp || !active) {
+         if (d->gp) d->last_ns = now_ns;
+@@ -748,8 +885,8 @@ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_
+     d->pad.now_ns = now_ns;
+     n += rt_pad_mode(&d->pad, mode, pt, out + n, cap - n);
+     for (int i = 0; i < RT_PAD_NBTN; i++)
+-        if (k_sdl[i] >= 0) n += rt_pad_button(&d->pad, i, SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)k_sdl[i]), pt, out + n, cap - n);
+-    for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++) n += rt_pad_axis(&d->pad, a, SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a), pt, out + n, cap - n);
++        if (k_sdl[i] >= 0) n += rt_pad_button(&d->pad, i, group_button(d, drv, (SDL_GamepadButton)k_sdl[i]), pt, out + n, cap - n);
++    for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++) n += rt_pad_axis(&d->pad, a, group_axis(d, drv, (SDL_GamepadAxis)a), pt, out + n, cap - n);
+     n += rt_pad_flick(&d->pad, pt, out + n, cap - n);
+     n += rt_pad_repeat(&d->pad, out + n, cap - n);
+     /* Real elapsed time, not whole milliseconds: at 120 Hz truncating to
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 132c71f..a7cc3d9 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -7,6 +7,12 @@
+ 
+ enum { RT_PAD_XBOX, RT_PAD_PLAYSTATION };
+ 
++/* What part of a controller a pad is. A PSVR2 Sense half that connects
++   on its own reaches SDL as a pad of its own, "(L)" or "(R)", while both
++   on as the app starts arrive as one "(L/R)" pad. Open halves drive
++   together as one pad; a pair is a whole pad that replaces them. */
++enum { RT_PAD_WHOLE, RT_PAD_HALF_L, RT_PAD_HALF_R, RT_PAD_PAIR };
++
+ /* The answer kinds are the dialogue selector's own actions, not guest
+    input: the pad hands them to input.c as SDL user events, and the
+    selector there decides what the game is sent. */
+@@ -95,8 +101,11 @@ typedef struct {
+     SDL_Gamepad *gp;
+     SDL_JoystickID id;
+     uint32_t live;
++    int half;
+ } rt_pad_slot;
+ 
++/* gp and id are the pad that drives, or for halves the member the
++   drive was given to; every open half drives with it. */
+ typedef struct {
+     rt_pad pad;
+     SDL_Gamepad *gp;
+@@ -108,6 +117,7 @@ typedef struct {
+ } rt_pad_dev;
+ 
+ int rt_pad_detect(SDL_GamepadType type, const char *name);
++int rt_pad_half(const char *name);
+ int rt_pad_kind(void);
+ const char *rt_pad_type_name(int kind);
+ const char *rt_pad_button_name(int idx);
+diff --git a/runtime/trace.c b/runtime/trace.c
+index 221455d..3ffaafc 100644
+--- a/runtime/trace.c
++++ b/runtime/trace.c
+@@ -1,5 +1,6 @@
+ #include "recomp_types.h"
+ #include "rt.h"
++#include "host.h"
+ #include "map.h"
+ #include "toggles.h"
+ 
+@@ -56,6 +57,8 @@ void rt_log(const char *fmt, ...)
+     va_end(ap);
+ }
+ 
++void rt_host_log(const char *msg) { rt_log("host: %s", msg ? msg : ""); }
++
+ void rt_trace_on(int on) { s_on = on; }
+ 
+ int rt_tracing(void) { return s_on; }
+-- 
+2.54.0 (Apple Git-157)
+

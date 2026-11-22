@@ -1,0 +1,990 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 14:03:07 -0600
+Subject: [PATCH] runtime: let the head drive the view angles on visionOS
+
+In the immersive space the eye images sat on planes on each eye's axis,
+but the game's camera ignored the head, so the world followed the head
+instead of the player looking around in it. The host now hands the
+runtime its head yaw and pitch (rt_host_head_pose), and once a game
+frame, at the first pump after each Present, the runtime writes the
+game's view angles from them: yaw is the body's yaw plus the head's
+turn, pitch is the head's own, clamped to the game's 89 degrees.
+
+The angles are written absolutely into the engine's one view-angle
+store (engine+0x314868, the QAngle VEngineClient006's GetViewAngles and
+SetViewAngles copy, with no other state), rather than sent as mouse
+counts, which would pass through sensitivity, m_yaw and a truncating
+scale and drift. A turn the game makes itself between two writes (a
+spawn facing, a teleport, a dialogue's look-at) is found against the
+last write and kept in the body. Menus, dialogues and the character
+sheet pause it; the body is kept, so the view on close is the same
+world seen from where the head is now. The pose each frame stands for
+goes to the backend before its Present, for the compositor's late
+rotation; a pump between CreateMove and Present changes nothing, so the
+pose is the one the frame was drawn with.
+
+While the head drives the view the right stick turns the body instead
+of looking: smooth at 150 degrees a second by default, or snap turns
+of 45 degrees (controls.txt turn=snap, turn_speed, snap_angle). Create
+plus Options recentres: the body takes the view's heading and the
+head's facing now becomes straight ahead, with no turn of the view.
+Options alone opens the menu on its press as before.
+
+The composition is headlook.c, pure and covered by the input self
+test: body plus head, the clamp, recentre, pause and resume, a game
+turn kept, the write into a fake angle store, and 10,000 frames of a
+wandering head with no drift.
+---
+ runtime/headlook.c           |  85 +++++++++++
+ runtime/headlook.h           |  82 ++++++++++
+ runtime/host.h               |  20 +++
+ runtime/input.c              | 109 ++++++++++++++
+ runtime/input.h              |   8 +
+ runtime/input_selftest.c     | 279 ++++++++++++++++++++++++++++++++++-
+ runtime/pad.c                |  66 ++++++++-
+ runtime/pad.h                |  24 ++-
+ runtime/sources.txt          |   1 +
+ runtime/sources_visionos.txt |   1 +
+ 10 files changed, 658 insertions(+), 17 deletions(-)
+ create mode 100644 runtime/headlook.c
+ create mode 100644 runtime/headlook.h
+
+diff --git a/runtime/headlook.c b/runtime/headlook.c
+new file mode 100644
+index 0000000..c27d3b1
+--- /dev/null
++++ b/runtime/headlook.c
+@@ -0,0 +1,85 @@
++#include "headlook.h"
++
++#include <math.h>
++#include <string.h>
++
++double rt_headlook_wrap(double a)
++{
++    a = fmod(a, 360.0);
++    if (a > 180.0) a -= 360.0;
++    if (a <= -180.0) a += 360.0;
++    return a;
++}
++
++double rt_headlook_diff(double a, double b) { return rt_headlook_wrap(b - a); }
++
++void rt_headlook_init(rt_headlook *h)
++{
++    memset(h, 0, sizeof *h);
++    h->pitch_down = RT_HEADLOOK_PITCH_DOWN;
++    h->pitch_up = RT_HEADLOOK_PITCH_UP;
++}
++
++int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3])
++{
++    if (!in->host_on || !in->have_angles) {
++        /* The game's camera is its own again: nothing recorded, and the
++           next start anchors afresh. */
++        h->on = h->anchored = h->playing = h->wrote = h->pose_valid = 0;
++        return 0;
++    }
++    h->on = 1;
++    if (!in->play) {
++        if (h->playing) h->pauses++;
++        h->playing = 0;
++        return 0;
++    }
++    h->playing = 1;
++    if (!h->anchored) {
++        /* Anchored so the view does not turn: the head's facing now is
++           straight ahead and the body is where the game looks. Pitch is
++           the head's own from the first write. */
++        h->anchored = 1;
++        h->starts++;
++        h->ref = in->head_yaw;
++        h->body = in->game[1];
++        h->wrote = 0;
++    }
++    if (h->wrote) {
++        double d = rt_headlook_diff(h->written[1], in->game[1]);
++        if (fabs(d) > RT_HEADLOOK_EPS_DEG) {
++            h->body += d;
++            h->absorbed++;
++        }
++    }
++    h->body = rt_headlook_wrap(h->body + in->turn);
++    double head = rt_headlook_diff(h->ref, in->head_yaw);
++    if (in->recentre) {
++        /* The body takes the view's heading and the head's facing now is
++           the new straight ahead, so the view itself does not move. */
++        h->body = rt_headlook_wrap(h->body + head);
++        h->ref = in->head_yaw;
++        head = 0;
++        h->recentres++;
++    }
++    float yaw = (float)rt_headlook_wrap(h->body + head);
++    float pitch = -in->head_pitch;
++    if (pitch > h->pitch_down || pitch < -h->pitch_up) {
++        pitch = pitch > h->pitch_down ? h->pitch_down : -h->pitch_up;
++        h->clamps++;
++    }
++    out[0] = pitch;
++    out[1] = yaw;
++    out[2] = in->game[2];
++    h->written[0] = pitch;
++    h->written[1] = yaw;
++    h->wrote = 1;
++    h->writes++;
++    /* The frame is drawn for the head's heading and the pitch actually
++       written: past a limit the image stays at the limit, and the late
++       rotation then shows it there rather than where the head is. */
++    h->pose_valid = 1;
++    h->pose_yaw = in->head_yaw;
++    h->pose_pitch = -pitch;
++    return 1;
++}
+diff --git a/runtime/headlook.h b/runtime/headlook.h
+new file mode 100644
+index 0000000..61a520a
+--- /dev/null
++++ b/runtime/headlook.h
+@@ -0,0 +1,82 @@
++#ifndef RT_HEADLOOK_H
++#define RT_HEADLOOK_H
++
++#include <stdint.h>
++
++/*
++ * Head look (visionOS, stereo): the game's view angles follow the head.
++ * Each game frame the view's yaw is the body's yaw plus the head's yaw
++ * since the reference, and its pitch is the head's own pitch, clamped to
++ * the game's limits. The game cannot roll; the compositor keeps the world
++ * level instead (immersive.h, mtl_late_rotation).
++ *
++ * The angles are written absolutely, never sent as mouse counts, so
++ * nothing accumulates: a frame's yaw is a sum of two numbers held here,
++ * not of every delta so far. What the game itself does to the yaw
++ * between two writes (a spawn or teleport facing, a script, a real
++ * mouse) is found by comparing the game's yaw with the last one written,
++ * and taken into the body, so the game's turns stand and the head turns
++ * on from there.
++ *
++ * Play only: a menu, a dialogue or the character sheet pauses it. The
++ * view is then the game's, and the pose each frame records (for the
++ * compositor's late rotation) stays the one last applied, so the plane
++ * stays world locked where the head left it. The body is kept through a
++ * pause, so on resume the view is the body plus wherever the head is
++ * now: the same world, seen from the head's new direction.
++ *
++ * Pure: no guest memory, no clock. input.c reads and writes the angles.
++ *
++ * Conventions: head angles are ARKit's (degrees, yaw positive turning
++ * left from -Z, pitch positive up); view angles are the game's (pitch,
++ * yaw, roll in degrees, pitch positive down, yaw positive left).
++ */
++
++/* The game's pitch limits: down is positive. */
++#define RT_HEADLOOK_PITCH_DOWN 89.0f
++#define RT_HEADLOOK_PITCH_UP 89.0f
++/* A game yaw further than this from the last one written was turned by
++   the game. The store is a plain float the engine copies untouched, but
++   the margin also covers any rounding of the angle on its way back
++   (a 16-bit angle is 0.0055 degrees), while a turn the game means
++   (a spawn facing, a teleport, a dialogue's look-at) is tens of degrees. */
++#define RT_HEADLOOK_EPS_DEG 0.05
++
++typedef struct {
++    int host_on;           /* the host gives a head pose: stereo is shown and the head is tracked */
++    float head_yaw, head_pitch;
++    int play;              /* in play: no menu, dialogue or character sheet */
++    double turn;           /* body turn from the stick since the last step, degrees, positive left */
++    int recentre;          /* a recentre was asked since the last step */
++    int have_angles;       /* the game's angles were read into game[] */
++    float game[3];         /* the game's view angles now: pitch, yaw, roll */
++} rt_headlook_in;
++
++typedef struct {
++    float pitch_down, pitch_up;
++    /* on: the host gives a pose. anchored: body and ref are set, at the
++       first step in play after on, so a start under a menu does not
++       carry the head's turn in the menu into the view. A pause keeps
++       the anchoring; the host switching off ends it. playing: the last
++       step was in play. */
++    int on, anchored, playing;
++    double body, ref;      /* body yaw (game degrees) and the head yaw at which the head adds nothing */
++    int wrote;             /* written[] holds what was last written */
++    float written[2];      /* pitch, yaw */
++    /* The head pose the latest written angles stand for, as the frame's
++       record (immersive.h): valid, yaw, pitch up. */
++    int pose_valid;
++    float pose_yaw, pose_pitch;
++    uint32_t starts, absorbed, recentres, writes, pauses, clamps;
++} rt_headlook;
++
++void rt_headlook_init(rt_headlook *h);
++/* One game frame. Returns 1 with out[] (pitch, yaw, roll) to be written
++   as the game's view angles, else 0 and nothing to write. */
++int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3]);
++/* b - a, wrapped into -180..180. */
++double rt_headlook_diff(double a, double b);
++/* Into -180..180. */
++double rt_headlook_wrap(double a);
++
++#endif
+diff --git a/runtime/host.h b/runtime/host.h
+index d12e322..20e2c94 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -76,6 +76,26 @@ int rt_host_cursor(float *u, float *v);
+  */
+ void *rt_host_game_window(void);
+ 
++/*
++ * Head look (runtime/headlook.h): the game's view angles follow the
++ * head. rt_host_head_pose(1, yaw, pitch) gives the head's yaw and pitch
++ * in degrees in ARKit's world (yaw positive turning left from -Z, pitch
++ * positive up), as often as the host likes; the runtime takes the latest
++ * once a game frame, at the first pump after each Present, and writes the
++ * view angles from it before the game builds its next frame.
++ * rt_host_head_pose(0, ...) hands the camera back to the game (mono, or
++ * the head not tracked), and the view stays where it was. While the head
++ * drives the view, the right stick turns the body instead of looking, a
++ * menu, dialogue or the character sheet pauses it, and the head pose
++ * each frame was drawn for goes to the backend with that frame
++ * (metal_d3d9_immersive_view_pose) for the compositor's late rotation.
++ * rt_host_head_recentre asks for what Create plus Options does: the
++ * body takes the view's heading and the head's facing becomes straight
++ * ahead, with no turn of the view. Any thread; neither waits.
++ */
++void rt_host_head_pose(int on, float yaw_deg, float pitch_deg);
++void rt_host_head_recentre(void);
++
+ /*
+  * Writes one line from the host to the runtime's log, after "host: ", so
+  * what the host sees (GameController's own view of the controllers, say)
+diff --git a/runtime/input.c b/runtime/input.c
+index 2361aba..16d7441 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1,4 +1,5 @@
+ #include "input.h"
++#include "headlook.h"
+ #include "toggles.h"
+ 
+ #include <TargetConditionals.h>
+@@ -705,6 +706,11 @@ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now
+             if (n < RT_PAD_EVENTS + 2) go[n++] = ev[i];
+             continue;
+         }
++        /* Head look's, not the dialogue's: counted for the pump to act on. */
++        if (ev[i].user.code == RT_PAD_ACT_RECENTRE) {
++            s->head_recentres++;
++            continue;
++        }
+         n += sel_act(s, ev[i].user.code, now_ns, go + n, RT_PAD_EVENTS + 2 - n);
+     }
+     return rt_input_pad_apply(s, go, n, dx, dy, mode, r, density, out, cap);
+@@ -1215,6 +1221,101 @@ static void dialogue_update(void)
+     if (on != was) rt_log("dialogue %s", on ? "open" : "closed");
+ }
+ 
++/* The engine's view angles: one QAngle (pitch, yaw, roll, degrees) that
++   IVEngineClient's GetViewAngles and SetViewAngles (VEngineClient006,
++   vtable +0xc4 and +0xc8) copy out of and into, with no other state and
++   no use of this, so a write here is exactly SetViewAngles. The client's
++   CreateMove reads it, adds mouse, clamps pitch to cl_pitchup and
++   cl_pitchdown (89 each) and writes it back; the view render copies it
++   each frame. An absolute write cannot drift, where mouse counts would
++   pass through sensitivity, m_yaw and a truncating scale. */
++#define VIEW_ANGLES_RVA 0x314868u
++
++int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va)
++{
++    in->have_angles = va != 0;
++    if (va) memcpy(in->game, rt_host(va), sizeof in->game);
++    float out[3];
++    if (!rt_headlook_step(h, in, out)) return 0;
++    memcpy(rt_host(va), out, sizeof out);
++    return 1;
++}
++
++#if TARGET_OS_VISION
++void metal_d3d9_immersive_view_pose(int valid, float yaw_deg, float pitch_deg);
++
++/* The host's latest head pose: the two angles' float bits in one word so
++   a pump never pairs one pose's yaw with another's pitch, and whether
++   there is one. Recentres from the host are counted. */
++static int s_head_on;
++static uint64_t s_head_bits;
++static uint32_t s_head_host_recentres;
++static rt_headlook s_head;
++static int s_head_init;
++static uint32_t s_head_present, s_head_seen_rc;
++
++void rt_host_head_pose(int on, float yaw_deg, float pitch_deg)
++{
++    uint32_t y, p;
++    memcpy(&y, &yaw_deg, 4);
++    memcpy(&p, &pitch_deg, 4);
++    __atomic_store_n(&s_head_bits, (uint64_t)y << 32 | p, __ATOMIC_RELAXED);
++    __atomic_store_n(&s_head_on, on != 0, __ATOMIC_RELEASE);
++}
++
++void rt_host_head_recentre(void) { __atomic_fetch_add(&s_head_host_recentres, 1, __ATOMIC_ACQ_REL); }
++
++/* Whether the pad's right stick should turn the body this poll: the host
++   gives a pose and the game's angles are there to write. */
++static int head_wanted(void)
++{
++    return __atomic_load_n(&s_head_on, __ATOMIC_ACQUIRE) && rt_hook_va("engine", VIEW_ANGLES_RVA) != 0;
++}
++
++/* Once a game frame, at the first pump after a Present: a pump can also
++   run between the game's CreateMove and its Present, and angles or a
++   pose changed there would not be the ones the frame is drawn with. The
++   pose given to the backend is the one the next Present latches. */
++static void head_pump(void)
++{
++    if (!s_head_init) {
++        rt_headlook_init(&s_head);
++        s_head_init = 1;
++    }
++    rt_headlook_in in;
++    memset(&in, 0, sizeof in);
++    in.host_on = __atomic_load_n(&s_head_on, __ATOMIC_ACQUIRE);
++    uint64_t b = __atomic_load_n(&s_head_bits, __ATOMIC_RELAXED);
++    uint32_t y = (uint32_t)(b >> 32), p = (uint32_t)b;
++    memcpy(&in.head_yaw, &y, 4);
++    memcpy(&in.head_pitch, &p, 4);
++    pthread_mutex_lock(&s_mu);
++    uint32_t presents = L.presents;
++    if (presents == s_head_present) {
++        pthread_mutex_unlock(&s_mu);
++        return;
++    }
++    s_head_present = presents;
++    in.play = S.focus && rt_input_pad_mode(&S) == RT_PAD_PLAY;
++    in.turn = rt_pad_take_turn(&s_padv.pad);
++    uint32_t rc = S.head_recentres + __atomic_load_n(&s_head_host_recentres, __ATOMIC_ACQUIRE);
++    in.recentre = rc != s_head_seen_rc;
++    s_head_seen_rc = rc;
++    pthread_mutex_unlock(&s_mu);
++    int was_on = s_head.on, was_playing = s_head.playing;
++    uint32_t was_rc = s_head.recentres, was_abs = s_head.absorbed;
++    rt_input_head_apply(&s_head, &in, rt_hook_va("engine", VIEW_ANGLES_RVA));
++    metal_d3d9_immersive_view_pose(s_head.pose_valid, s_head.pose_yaw, s_head.pose_pitch);
++    if (s_head.on != was_on) rt_log("head look %s", s_head.on ? "on: the head drives the view" : "off: the game's camera");
++    else if (s_head.on && s_head.playing != was_playing)
++        rt_log("head look %s", s_head.playing ? "resumed" : "paused (menu, dialogue or sheet)");
++    if (s_head.recentres != was_rc) rt_log("head look recentred (%u this run)", s_head.recentres);
++    if (s_head.absorbed != was_abs && s_head.absorbed <= 32)
++        rt_log("head look: the game turned the view itself, kept (%u this run)%s", s_head.absorbed,
++               s_head.absorbed == 32 ? "; no more of these" : "");
++}
++#endif
++
+ static void pad_pump(void)
+ {
+     rt_present_rects r;
+@@ -1222,6 +1323,9 @@ static void pad_pump(void)
+     rt_wmsg m[128];
+     rt_input_geometry(&r, &d);
+     pthread_mutex_lock(&s_mu);
++#if TARGET_OS_VISION
++    s_padv.pad.head = head_wanted();
++#endif
+     int n = rt_input_pad_pump(&S, &s_padv, S.focus, rt_now_ns(), &r, d, m, 128);
+     pthread_mutex_unlock(&s_mu);
+     post_all(m, n, 128);
+@@ -1233,6 +1337,9 @@ void rt_input_pump_end(void)
+     if (!s_win) return;
+     dialogue_update();
+     if (s_pad_started) pad_pump();
++#if TARGET_OS_VISION
++    head_pump();
++#endif
+     rt_wmsg m[1];
+     int warp = 0, shape, rel_changed;
+     int32_t wx = 0, wy = 0, ox = 0, oy = 0;
+@@ -1428,6 +1535,8 @@ void rt_input_report(void)
+         uint32_t hm = H.moves, hb = H.buttons, hw = H.wheels;
+         pthread_mutex_unlock(&s_mu);
+         rt_log("input host moves %u buttons %u wheels %u claim %s", hm, hb, hw, host_claimed() ? "on" : "off");
++        rt_log("input head look starts %u writes %u pauses %u recentres %u kept game turns %u pitch clamps %u", s_head.starts,
++               s_head.writes, s_head.pauses, s_head.recentres, s_head.absorbed, s_head.clamps);
+     }
+ #endif
+     if (!armed) return;
+diff --git a/runtime/input.h b/runtime/input.h
+index d700469..9fa55a5 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -1,6 +1,7 @@
+ #ifndef RT_INPUT_H
+ #define RT_INPUT_H
+ 
++#include "headlook.h"
+ #include "pad.h"
+ #include "rt.h"
+ 
+@@ -103,6 +104,9 @@ typedef struct {
+     int32_t warp_x, warp_y;
+     int client_w, client_h, origin_x, origin_y;
+     uint32_t moves, nbuttons, keys, chars, dropped, chords, warps;
++    /* Recentres asked for on the pad (Create plus Options), for head look
++       to compare with the count it has acted on. */
++    uint32_t head_recentres;
+ } rt_input_state;
+ 
+ enum { RT_CUR_UNSET = -2, RT_CUR_HIDDEN = -1 };
+@@ -143,6 +147,10 @@ int rt_input_pad_mode(const rt_input_state *s);
+ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now_ns, const rt_present_rects *r, float density,
+                       rt_wmsg *out, int cap);
+ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *r, float density, rt_wmsg *out, int cap);
++/* Head look's write (headlook.h): the game's view angles read from the
++   three floats at va (pitch, yaw, roll), one step, and the result
++   written back there. 1 when written. va 0 reads as no angles. */
++int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va);
+ int rt_input_release_all(rt_input_state *s, rt_wmsg *out, int cap);
+ int rt_input_flush_move(rt_input_state *s, rt_wmsg *out, int cap);
+ void rt_input_take(rt_input_state *s, uint32_t msg, uint32_t lp);
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index a1a3197..390e958 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1,3 +1,4 @@
++#include "headlook.h"
+ #include "input.h"
+ #include "toggles.h"
+ 
+@@ -2157,8 +2158,8 @@ static void pad_chords(void)
+     rt_pad_dev_init(&d, NULL);
+     SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
+     padpump(&s, &d, 10);
+-    check(d.pad.mode == RT_PAD_PLAY && d.pad.nchord == 1, "the view toggle chord is there by default", "mode %d chords %d", d.pad.mode,
+-          d.pad.nchord);
++    check(d.pad.mode == RT_PAD_PLAY && d.pad.nchord == 2, "the view toggle and recentre chords are there by default", "mode %d chords %d",
++          d.pad.mode, d.pad.nchord);
+     for (int round = 0; round < 2; round++) {
+         char name[96];
+         s_n = 0;
+@@ -2266,10 +2267,13 @@ static void pad_controls(void)
+     rmdir(dir);
+     const rt_pad_tgt *t = rt_pad_target(&p, 0, 1);
+     check(bad == 8, "eight bad controls lines are counted, a fallback on a step and four chords among them", "%d", bad);
+-    check(p.nchord == 1 && p.chord[0].mod == 3 && p.chord[0].btn == 10 && p.chord[0].target.kind == RT_PADT_KEY &&
+-              p.chord[0].target.arg == SDL_SCANCODE_Z,
+-          "chord.back+leftshoulder=none removes the view toggle, chord.north+dpup=z moves it", "%d chords, %d+%d", p.nchord, p.chord[0].mod,
+-          p.chord[0].btn);
++    /* Removing a chord moves the last into its place, so the recentre
++       default is first and the new one second. */
++    check(p.nchord == 2 && p.chord[0].mod == 4 && p.chord[0].btn == 5 && p.chord[0].target.kind == RT_PADT_RECENTRE &&
++              p.chord[1].mod == 3 && p.chord[1].btn == 10 && p.chord[1].target.kind == RT_PADT_KEY &&
++              p.chord[1].target.arg == SDL_SCANCODE_Z,
++          "chord.back+leftshoulder=none removes the view toggle, chord.north+dpup=z moves it, recentre stays", "%d chords, %d+%d",
++          p.nchord, p.chord[0].mod, p.chord[0].btn);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "menu.south remaps Cross in menus only", "%d %d", t->kind, t->arg);
+     t = rt_pad_target(&p, 0, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
+@@ -2307,6 +2311,264 @@ static void pad_controls(void)
+     check(t->kind == RT_PADT_NONE, "a flick is nothing outside a dialogue", "%d", t->kind);
+ }
+ 
++/* Head look's composition (headlook.c), as the pump drives it once a
++   game frame: the game stores what is written as floats, as its own
++   QAngle does. */
++static int hl_step(rt_headlook *h, rt_headlook_in *in, float game[3])
++{
++    memcpy(in->game, game, sizeof in->game);
++    float out[3];
++    int w = rt_headlook_step(h, in, out);
++    if (w) memcpy(game, out, sizeof out);
++    in->turn = 0;
++    in->recentre = 0;
++    return w;
++}
++
++static int near_deg(double a, double b, double eps) { return fabs(rt_headlook_diff(a, b)) <= eps; }
++
++static void head_look(void)
++{
++    rt_headlook h;
++    rt_headlook_init(&h);
++    rt_headlook_in in = {.host_on = 1, .head_yaw = 20, .head_pitch = 0, .play = 1, .have_angles = 1};
++    float game[3] = {12, 100, 0};
++
++    int w = hl_step(&h, &in, game);
++    check(w && game[1] == 100 && game[0] == 0 && h.pose_valid && h.pose_yaw == 20,
++          "head look starts where the game looks, at the head's pitch", "w %d pitch %.3f yaw %.3f pose %d %.3f", w, game[0], game[1],
++          h.pose_valid, h.pose_yaw);
++    in.head_yaw = 50;
++    hl_step(&h, &in, game);
++    check(game[1] == 130, "the view's yaw is the body plus the head's turn", "yaw %.4f", game[1]);
++    in.head_yaw = -170;
++    hl_step(&h, &in, game);
++    check(near_deg(game[1], -90, 1e-4), "a head turn across -180 wraps, not jumps", "yaw %.4f", game[1]);
++    in.head_yaw = 50;
++    in.head_pitch = 30;
++    hl_step(&h, &in, game);
++    check(game[0] == -30 && h.pose_pitch == 30, "looking up is negative game pitch", "pitch %.3f pose %.3f", game[0], h.pose_pitch);
++    in.head_pitch = -89.9f;
++    hl_step(&h, &in, game);
++    check(game[0] == RT_HEADLOOK_PITCH_DOWN && h.clamps == 1 && h.pose_pitch == -RT_HEADLOOK_PITCH_DOWN,
++          "pitch is clamped to the game's limit, and the frame's pose says the limit", "pitch %.3f clamps %u pose %.3f", game[0], h.clamps,
++          h.pose_pitch);
++    in.head_pitch = 89.9f;
++    hl_step(&h, &in, game);
++    check(game[0] == -RT_HEADLOOK_PITCH_UP, "and up", "pitch %.3f", game[0]);
++    in.head_pitch = 0;
++
++    in.turn = -45;
++    hl_step(&h, &in, game);
++    check(game[1] == 85, "the stick's turn adds to the body", "yaw %.4f", game[1]);
++
++    /* Recentre: the body takes the view's heading, the head's facing now
++       is straight ahead, and nothing moves. */
++    in.head_yaw = 80;
++    hl_step(&h, &in, game);
++    float before = game[1];
++    in.recentre = 1;
++    hl_step(&h, &in, game);
++    check(game[1] == before && h.recentres == 1 && near_deg(h.body, before, 1e-4) && h.ref == 80,
++          "recentre moves the body to the view and the view nowhere", "yaw %.4f before %.4f body %.4f ref %.3f", game[1], before, h.body,
++          h.ref);
++    in.head_yaw = 90;
++    hl_step(&h, &in, game);
++    check(near_deg(game[1], before + 10, 1e-4), "after it the head turns the view from there", "yaw %.4f", game[1]);
++
++    /* A menu pauses it: nothing written, the pose kept as it was. */
++    float kept_pose = h.pose_yaw, at_pause = game[1];
++    in.play = 0;
++    in.head_yaw = 130;
++    w = hl_step(&h, &in, game);
++    check(!w && game[1] == at_pause && h.pose_valid && h.pose_yaw == kept_pose && h.pauses == 1,
++          "a menu pauses head turning: the view stays and the frame keeps the last pose", "w %d yaw %.3f pose %.3f pauses %u", w, game[1],
++          h.pose_yaw, h.pauses);
++    for (int i = 0; i < 20; i++) hl_step(&h, &in, game);
++    in.play = 1;
++    hl_step(&h, &in, game);
++    check(near_deg(game[1], at_pause + 40, 1e-4) && h.absorbed == 0,
++          "on close the view is the body plus where the head is now", "yaw %.4f want %.4f absorbed %u", game[1], at_pause + 40, h.absorbed);
++
++    /* The game turns the player itself during a pause (a dialogue facing
++       the speaker): that stands, and the head turns on from it. */
++    in.play = 0;
++    hl_step(&h, &in, game);
++    game[1] = -20;
++    in.head_yaw = 140;
++    hl_step(&h, &in, game);
++    in.play = 1;
++    hl_step(&h, &in, game);
++    check(near_deg(game[1], -10, 1e-4) && h.absorbed == 1, "a turn the game made in a dialogue is kept", "yaw %.4f absorbed %u", game[1],
++          h.absorbed);
++    /* And during play (a teleport, a real mouse). */
++    game[1] += 33;
++    hl_step(&h, &in, game);
++    check(near_deg(game[1], 23, 1e-4) && h.absorbed == 2, "so is one the game made in play", "yaw %.4f", game[1]);
++
++    /* The host stops (mono, or the head lost): nothing written and no
++       pose; when it comes back the view does not jump. */
++    in.host_on = 0;
++    w = hl_step(&h, &in, game);
++    check(!w && !h.pose_valid, "with no head pose the camera is the game's and no pose is recorded", "w %d pose %d", w, h.pose_valid);
++    game[1] = 77;
++    in.host_on = 1;
++    in.head_yaw = -60;
++    hl_step(&h, &in, game);
++    check(game[1] == 77 && h.starts == 2, "a new start anchors where the game looks", "yaw %.4f starts %u", game[1], h.starts);
++    in.have_angles = 0;
++    w = hl_step(&h, &in, game);
++    check(!w && !h.pose_valid, "no angles to read (no map) is the same as no head", "w %d", w);
++
++    /* Started under a menu: anchored at the first frame in play, so the
++       head's turn in the menu does not move the view. */
++    in.have_angles = 1;
++    in.play = 0;
++    in.head_yaw = 0;
++    game[1] = 15;
++    hl_step(&h, &in, game);
++    in.head_yaw = 70;
++    hl_step(&h, &in, game);
++    in.play = 1;
++    hl_step(&h, &in, game);
++    check(game[1] == 15 && h.starts == 3, "a start under a menu anchors when play begins", "yaw %.4f starts %u", game[1], h.starts);
++}
++
++/* 10,000 game frames of a wandering head and a turning stick, the game
++   storing each write as float and keeping its yaw in 0..360 as an
++   anglemod would: every frame's yaw is the exact body plus head, nothing
++   is taken for a turn of the game's, and a head back at the start with
++   the turns undone is the starting yaw again. */
++static void head_look_drift(void)
++{
++    rt_headlook h;
++    rt_headlook_init(&h);
++    rt_headlook_in in = {.host_on = 1, .head_yaw = 10, .play = 1, .have_angles = 1};
++    float game[3] = {0, 45, 0};
++    hl_step(&h, &in, game);
++    double body = 45, ref = 10, worst = 0, turned = 0;
++    uint32_t seed = 12345;
++    for (int i = 0; i < 10000; i++) {
++        seed = seed * 1664525u + 1013904223u;
++        double r = (double)(seed >> 8) / (1 << 24) - 0.5;
++        in.head_yaw = (float)rt_headlook_wrap(in.head_yaw + r * 7.0);
++        in.head_pitch = (float)(40.0 * sin(i * 0.01));
++        if (i % 97 < 30) {
++            in.turn = (i % 2 ? 1 : -1) * 0.8;
++            turned += in.turn;
++            body += in.turn;
++        }
++        game[1] = fmodf(game[1] + 360.0f, 360.0f);
++        hl_step(&h, &in, game);
++        double want = rt_headlook_wrap(body + rt_headlook_diff(ref, in.head_yaw));
++        double err = fabs(rt_headlook_diff(want, game[1]));
++        if (err > worst) worst = err;
++    }
++    check(worst < 1e-3 && h.absorbed == 0, "10,000 frames: each yaw is the body plus the head to 0.001 degrees, nothing taken for the game's",
++          "worst %.6f absorbed %u", worst, h.absorbed);
++    in.head_yaw = 10;
++    in.turn = -turned;
++    in.head_pitch = 0;
++    hl_step(&h, &in, game);
++    check(near_deg(game[1], 45, 1e-3), "and back where it started is the starting yaw: no drift", "yaw %.6f", game[1]);
++}
++
++/* Route (b): the write goes to the engine's QAngle as three floats, the
++   way SetViewAngles copies it, on a fake one in guest memory. */
++static void head_look_write(void)
++{
++    const uint32_t va = 0x30100000u;
++    float *q = rt_host(va);
++    q[0] = 4.0f;
++    q[1] = -170.0f;
++    q[2] = 2.5f;
++    rt_headlook h;
++    rt_headlook_init(&h);
++    rt_headlook_in in = {.host_on = 1, .head_yaw = 0, .head_pitch = 10, .play = 1};
++    int w1 = rt_input_head_apply(&h, &in, va);
++    check(w1 && q[0] == -10.0f && q[1] == -170.0f && q[2] == 2.5f,
++          "the view angles are written in place: pitch from the head, yaw kept at the start, roll left alone", "%d %.3f %.3f %.3f", w1, q[0],
++          q[1], q[2]);
++    in.head_yaw = 25;
++    rt_input_head_apply(&h, &in, va);
++    check(q[1] == -145.0f, "a head turn is the angle the next frame reads", "yaw %.3f", q[1]);
++    rt_headlook_in none = {.host_on = 1, .play = 1};
++    int w0 = rt_input_head_apply(&h, &none, 0);
++    check(!w0 && !h.pose_valid, "no angle store, nothing written", "w %d", w0);
++}
++
++/* The right stick under head look: it turns the body, smoothly or in
++   snaps, and sends no mouse look. */
++static void pad_turn(void)
++{
++    rt_pad p;
++    rt_pad_defaults(&p);
++    int dx, dy;
++    p.mode = RT_PAD_PLAY;
++    p.rx = 32767;
++    rt_pad_move(&p, 0.01, &dx, &dy);
++    check(dx > 0 && rt_pad_take_turn(&p) == 0, "without head look the right stick still looks", "dx %d", dx);
++    p.head = 1;
++    p.ry = 32767;
++    rt_pad_move(&p, 0.5, &dx, &dy);
++    double t = rt_pad_take_turn(&p);
++    check(dx == 0 && dy == 0 && fabs(t + RT_PAD_TURN_SPEED * 0.5) < 1e-9,
++          "with head look a full right push turns right at the turn speed, and up and down do nothing", "dx %d dy %d turn %.4f", dx, dy, t);
++    check(rt_pad_take_turn(&p) == 0, "a turn is taken once", "left %.4f", p.turn_deg);
++    p.rx = 4000;
++    rt_pad_move(&p, 0.5, &dx, &dy);
++    check(rt_pad_take_turn(&p) == 0, "inside the dead zone nothing turns", "%.4f", p.turn_deg);
++    check(rt_pad_tune(&p, "turn", "snap") == 0 && p.turn_mode == RT_PAD_TURN_SNAP && rt_pad_tune(&p, "turn", "sideways") == -2,
++          "turn=snap is taken, a bad value is not", "mode %d", p.turn_mode);
++    p.rx = 32767;
++    rt_pad_move(&p, 0.01, &dx, &dy);
++    double s1 = rt_pad_take_turn(&p);
++    for (int i = 0; i < 50; i++) rt_pad_move(&p, 0.01, &dx, &dy);
++    double s2 = rt_pad_take_turn(&p);
++    p.rx = 0;
++    rt_pad_move(&p, 0.01, &dx, &dy);
++    p.rx = -32767;
++    rt_pad_move(&p, 0.01, &dx, &dy);
++    double s3 = rt_pad_take_turn(&p);
++    check(s1 == -RT_PAD_SNAP_DEG && s2 == 0 && s3 == RT_PAD_SNAP_DEG, "snap: one 45 degree step a push, held or not, either way",
++          "%.1f %.1f %.1f", s1, s2, s3);
++    check(rt_pad_tune(&p, "snap_angle", "30") == 0 && p.snap_deg == 30 && rt_pad_tune(&p, "turn_speed", "0") == -2,
++          "snap_angle and turn_speed are tunable within range", "%.1f", p.snap_deg);
++}
++
++/* Create plus Options recentres, in play; Options alone is still the
++   game's menu, and the chord opens no character sheet. */
++static void pad_recentre(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 1);
++    padpump(&s, &d, 10);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && s.head_recentres == 1, "Create + Options asks for a recentre and sends the game nothing", "%s recentres %u", dump(),
++          s.head_recentres);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 0);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && s.head_recentres == 1, "letting go opens neither the menu nor the character sheet", "%s", dump());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 1);
++    padpump(&s, &d, 10);
++    check(s_n >= 1 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x1B, "Options alone is still Escape, on its press", "%s", dump());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
+ int rt_input_selftest(void)
+ {
+     setvbuf(stdout, NULL, _IOLBF, 0);
+@@ -2338,6 +2600,11 @@ int rt_input_selftest(void)
+     pad_lone();
+     pad_chords();
+     pad_controls();
++    head_look();
++    head_look_drift();
++    head_look_write();
++    pad_turn();
++    pad_recentre();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+ }
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 6f86b65..e832b8a 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -79,10 +79,15 @@ static const struct {
+    L3 (quest log) and R3 (crouch) and the two together (stereo) take.
+    Create is the character sheet, which then opens on release when no
+    chord was made; L1 alone still steps the weapon down. */
++/* Create plus Options recentres head look: the body's heading becomes
++   the view's, and the head's facing now becomes straight ahead
++   (headlook.h). Options alone opens the game's menu on its press, so it
++   cannot be held for this; behind Create, which already waits for its
++   release in play, it costs nothing. */
+ static const struct {
+     int mod, btn;
+     const char *target;
+-} k_chord_default[] = {{4, 6, "z"}};
++} k_chord_default[] = {{4, 6, "z"}, {4, 5, "recentre"}};
+ 
+ static const char *const k_mode_names[RT_PAD_NMODES] = {"play", "menu", "dialogue"};
+ 
+@@ -145,7 +150,8 @@ static int parse_answer(const char *v, rt_pad_tgt *t)
+     } k_act[] = {{"answerup", RT_PADT_ANSWER_UP},
+                  {"answerdown", RT_PADT_ANSWER_DOWN},
+                  {"answerclear", RT_PADT_ANSWER_CLEAR},
+-                 {"answer", RT_PADT_ANSWER}};
++                 {"answer", RT_PADT_ANSWER},
++                 {"recentre", RT_PADT_RECENTRE}};
+     for (size_t i = 0; i < sizeof k_act / sizeof *k_act; i++) {
+         size_t n = strlen(k_act[i].name);
+         if (strncmp(v, k_act[i].name, n) || (v[n] && v[n] != '/')) continue;
+@@ -187,7 +193,7 @@ static const char *target_name(const rt_pad_tgt *t, char *b, size_t n)
+ {
+     const rt_key *k;
+     if (t->kind >= RT_PADT_ANSWER_UP) {
+-        static const char *const k_act[] = {"answerup", "answerdown", "answer", "answerclear"};
++        static const char *const k_act[] = {"answerup", "answerdown", "answer", "answerclear", "recentre"};
+         const char *a = k_act[t->kind - RT_PADT_ANSWER_UP];
+         if (t->kind < RT_PADT_ANSWER || t->alt_kind == RT_PADT_NONE) return a;
+         char ab[16];
+@@ -208,6 +214,10 @@ void rt_pad_defaults(rt_pad *p)
+     memset(p, 0, sizeof *p);
+     p->flick = -1;
+     p->look_speed = RT_PAD_LOOK_SPEED;
++    p->turn_mode = RT_PAD_TURN_SMOOTH;
++    p->turn_speed = RT_PAD_TURN_SPEED;
++    p->snap_deg = RT_PAD_SNAP_DEG;
++    p->snap_armed = 1;
+     p->cursor_speed = RT_PAD_CURSOR_SPEED;
+     p->cursor_power = RT_PAD_CURSOR_POWER;
+     p->cursor_dead = RT_PAD_CURSOR_DEAD;
+@@ -245,7 +255,7 @@ static int load_chord(rt_pad *p, const char *spec, const char *v)
+         rt_log("pad controls: bad chord \"%s\"", spec);
+         return 1;
+     }
+-    if (parse_target(v, &tg) || tg.kind >= RT_PADT_ANSWER_UP) {
++    if (parse_target(v, &tg) || (tg.kind >= RT_PADT_ANSWER_UP && tg.kind != RT_PADT_RECENTRE)) {
+         rt_log("pad controls: bad target \"%s\" for chord %s, default kept", v, spec);
+         return 1;
+     }
+@@ -303,6 +313,16 @@ int rt_pad_tune(rt_pad *p, const char *key, const char *v)
+     } else if (!strcmp(key, "cursor_left")) {
+         if (number(v, 0, 1, &n)) return -2;
+         p->cursor_left = n;
++    } else if (!strcmp(key, "turn")) {
++        if (!strcmp(v, "smooth")) p->turn_mode = RT_PAD_TURN_SMOOTH;
++        else if (!strcmp(v, "snap")) p->turn_mode = RT_PAD_TURN_SNAP;
++        else return -2;
++    } else if (!strcmp(key, "turn_speed")) {
++        if (number(v, 1, 1000, &n)) return -2;
++        p->turn_speed = n;
++    } else if (!strcmp(key, "snap_angle")) {
++        if (number(v, 1, 180, &n)) return -2;
++        p->snap_deg = n;
+     } else {
+         return -1;
+     }
+@@ -360,7 +380,8 @@ static int load_env(rt_pad *p)
+ {
+     static const char *const k_env[][2] = {{"RT_PAD_LOOK_SPEED", "look_speed"},     {"RT_PAD_CURSOR_SPEED", "cursor_speed"},
+                                            {"RT_PAD_CURSOR_POWER", "cursor_power"}, {"RT_PAD_CURSOR_DEAD", "cursor_dead"},
+-                                           {"RT_PAD_CURSOR_LEFT", "cursor_left"}};
++                                           {"RT_PAD_CURSOR_LEFT", "cursor_left"},   {"RT_PAD_TURN", "turn"},
++                                           {"RT_PAD_TURN_SPEED", "turn_speed"},     {"RT_PAD_SNAP_ANGLE", "snap_angle"}};
+     int bad = 0;
+     for (size_t i = 0; i < sizeof k_env / sizeof *k_env; i++) {
+         const char *v = getenv(k_env[i][0]);
+@@ -392,8 +413,9 @@ int rt_pad_load(rt_pad *p, const char *dir)
+     }
+     if (!dir || !dir[0]) return bad;
+     bad += load_env(p);
+-    rt_log("pad cursor speed %d power %.2f dead %d left %.2f, look speed %d", p->cursor_speed, p->cursor_power, p->cursor_dead,
+-           p->cursor_left, p->look_speed);
++    rt_log("pad cursor speed %d power %.2f dead %d left %.2f, look speed %d, head look turn %s (%.0f deg/s, snap %.0f deg)",
++           p->cursor_speed, p->cursor_power, p->cursor_dead, p->cursor_left, p->look_speed,
++           p->turn_mode == RT_PAD_TURN_SNAP ? "snap" : "smooth", p->turn_speed, p->snap_deg);
+     return bad;
+ }
+ 
+@@ -697,6 +719,33 @@ static void look(rt_pad *p, double dt, int *dx, int *dy)
+ 
+ void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy) { look(p, ms / 1000.0, dx, dy); }
+ 
++/* Head look's right stick: across turns the body, smoothly or in snaps,
++   and up and down does nothing, since the head is the pitch. No mouse
++   motion is made, so nothing is left for the game's own mouse look. A
++   right push is a turn to the right, which is negative yaw. */
++static void turn(rt_pad *p, double dt, int *dx, int *dy)
++{
++    *dx = *dy = 0;
++    p->fx = p->fy = 0;
++    if (p->turn_mode == RT_PAD_TURN_SNAP) {
++        int x = p->rx;
++        if (abs(x) <= RT_PAD_DEAD) p->snap_armed = 1;
++        else if (p->snap_armed && abs(x) > RT_PAD_FLICK_ON) {
++            p->snap_armed = 0;
++            p->turn_deg -= x > 0 ? p->snap_deg : -p->snap_deg;
++        }
++        return;
++    }
++    p->turn_deg -= deflect(p->rx) * p->turn_speed * dt;
++}
++
++double rt_pad_take_turn(rt_pad *p)
++{
++    double t = p->turn_deg;
++    p->turn_deg = 0;
++    return t;
++}
++
+ /* A radial dead zone and a power curve on what is left: the stick's
+    direction is kept whole, so a diagonal is not slowed by squaring each
+    axis, and speed rises slowly near the centre and fast at the rim. */
+@@ -718,7 +767,8 @@ void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *v
+ void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy)
+ {
+     if (p->mode == RT_PAD_PLAY) {
+-        look(p, dt, dx, dy);
++        if (p->head) turn(p, dt, dx, dy);
++        else look(p, dt, dx, dy);
+         return;
+     }
+     if (p->mode == RT_PAD_DIALOGUE) {
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 3ec72ef..db27579 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -16,10 +16,12 @@ enum { RT_PAD_WHOLE, RT_PAD_HALF_L, RT_PAD_HALF_R, RT_PAD_PAIR };
+ /* The answer kinds are the dialogue selector's own actions, not guest
+    input: the pad hands them to input.c as SDL user events, and the
+    selector there decides what the game is sent. */
+-enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL, RT_PADT_ANSWER_UP, RT_PADT_ANSWER_DOWN, RT_PADT_ANSWER, RT_PADT_ANSWER_CLEAR };
++/* Recentre is the same kind of action: head look's, not the game's. */
++enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL, RT_PADT_ANSWER_UP, RT_PADT_ANSWER_DOWN, RT_PADT_ANSWER, RT_PADT_ANSWER_CLEAR,
++       RT_PADT_RECENTRE };
+ 
+-/* The user event code of each answer action, and its button in data1. */
+-enum { RT_PAD_ACT_UP = 1, RT_PAD_ACT_DOWN, RT_PAD_ACT_CONFIRM, RT_PAD_ACT_CLEAR };
++/* The user event code of each action, and its button in data1. */
++enum { RT_PAD_ACT_UP = 1, RT_PAD_ACT_DOWN, RT_PAD_ACT_CONFIRM, RT_PAD_ACT_CLEAR, RT_PAD_ACT_RECENTRE };
+ 
+ /* The triggers keep 14 and 15 so controls.txt and the m9 rows read as
+    before; the touchpad and Xbox share button come after them. The four
+@@ -52,6 +54,14 @@ enum { RT_PAD_PLAY, RT_PAD_MENU, RT_PAD_DIALOGUE, RT_PAD_NMODES };
+ #define RT_PAD_STEP_DELAY_NS 400000000ull
+ #define RT_PAD_STEP_RATE_NS 150000000ull
+ 
++/* Head look (headlook.h): the head is the view, so the right stick only
++   turns the body. Smooth turning at full tilt in degrees a second, or
++   snap turns of a fixed angle, one per push past half tilt; the stick
++   has to come back under the dead zone before the next. */
++enum { RT_PAD_TURN_SMOOTH, RT_PAD_TURN_SNAP };
++#define RT_PAD_TURN_SPEED 150
++#define RT_PAD_SNAP_DEG 45
++
+ /* The menu cursor, in guest client pixels per second at full tilt. At
+    the default power half tilt is about 18% of that, so an inventory slot
+    can be hit without overshooting and a full push still crosses the
+@@ -96,6 +106,12 @@ typedef struct {
+     uint8_t over_set[RT_PAD_NMODES - 1][RT_PAD_NBTN];
+     rt_pad_tgt held[RT_PAD_NBTN];
+     int look_speed;
++    /* Head look: set by input.c before each poll while the head drives
++       the view, when the right stick turns the body instead of looking.
++       turn_deg collects the turn (degrees, positive to the left, as the
++       game's yaw) until input.c takes it. */
++    int head, turn_mode, snap_armed;
++    double turn_speed, snap_deg, turn_deg;
+     int cursor_speed, cursor_dead;
+     double cursor_power, cursor_left;
+     int mode;
+@@ -155,6 +171,8 @@ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy);
+ void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *vy);
+ void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy);
++/* The body turn collected since the last take, in degrees, and none left. */
++double rt_pad_take_turn(rt_pad *p);
+ 
+ void rt_pad_dev_init(rt_pad_dev *d, const char *dir);
+ int rt_pad_start(const char *dir);
+diff --git a/runtime/sources.txt b/runtime/sources.txt
+index c45f462..19e0f19 100644
+--- a/runtime/sources.txt
++++ b/runtime/sources.txt
+@@ -7,6 +7,7 @@ runtime/window.c
+ runtime/input.c
+ runtime/input_script.c
+ runtime/pad.c
++runtime/headlook.c
+ runtime/input_selftest.c
+ runtime/devmenu.c
+ runtime/toggles.c
+diff --git a/runtime/sources_visionos.txt b/runtime/sources_visionos.txt
+index cc53eff..9c18441 100644
+--- a/runtime/sources_visionos.txt
++++ b/runtime/sources_visionos.txt
+@@ -7,6 +7,7 @@ runtime/window.c
+ runtime/input.c
+ runtime/input_script.c
+ runtime/pad.c
++runtime/headlook.c
+ runtime/input_selftest.c
+ runtime/devmenu.c
+ runtime/toggles.c
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:28:25 -0600
+Subject: [PATCH] runtime: full view keeps dialogue, and the view model guess
+ is opt in
+
+A dialogue is play in full view: the world stays round the player and
+head look stays on, the game's turn toward the speaker kept as the
+body's. On the theater screen it still pauses head look so the close up
+holds (rt_input_view_play).
+
+No view model in the frames no longer counts as third person by
+default. A jump, a holstered weapon and a dialogue draw none either,
+and a headset run flipped between full view and the plane 62 times on
+it. Full view launches with camera_prefs 0, so melee and fists stay in
+first person; RT_FULLVIEW_VM_THIRD=1 brings the guess back.
+---
+ runtime/input.c          | 34 ++++++++++++++++++++++++++++------
+ runtime/input.h          |  4 ++++
+ runtime/input_selftest.c | 15 +++++++++++++++
+ 3 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 0ea2b52..d7367a0 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1294,10 +1294,18 @@ static void third_person_update(void)
+     int on = in && panel32(in) == rt_hook_va("client", CINPUT_VTABLE_RVA) && panel8(in + CINPUT_THIRDPERSON) != 0;
+ #if TARGET_OS_VISION
+     /* The game also goes to third person by itself with a melee weapon or
+-       bare fists (camera_prefs), which a headset run showed never touches
+-       that byte. The renderer sees it instead: no view model in the frames
+-       (0) is third person, once one has been seen this session. */
+-    if (metal_d3d9_fullview_view_model() == 0) on = 1;
++       bare fists (camera_prefs), which never touches that byte. Full view
++       launches with camera_prefs 0, so that no longer happens there. The
++       renderer's guess (no view model in the frames) is opt in with
++       RT_FULLVIEW_VM_THIRD=1: a jump, a holstered weapon and a dialogue
++       draw none either, and a headset run (2026-11-20) flipped between
++       full view and the plane 62 times on it. */
++    static int vm_third = -1;
++    if (vm_third < 0) {
++        const char *v = getenv("RT_FULLVIEW_VM_THIRD");
++        vm_third = v && *v == '1';
++    }
++    if (vm_third && metal_d3d9_fullview_view_model() == 0) on = 1;
+ #endif
+     pthread_mutex_lock(&s_mu);
+     int was = S.third_person;
+@@ -1308,6 +1316,18 @@ static void third_person_update(void)
+ 
+ int rt_input_head_allowed(const rt_input_state *s) { return !s->head_off && !s->third_person; }
+ 
++/* Whether a frame is play for head look and full view. A dialogue counts
++   in full view: dropping to the plane took the world away for every line
++   spoken (2026-11-20 headset run), and head look staying on there keeps
++   the NPC still while the head turns, the game's turn toward the speaker
++   kept as the body's. On the theater screen it pauses head look as
++   before, so the game's close up holds. */
++int rt_input_view_play(int focus, int pad_mode, int head_allowed, int full_view)
++{
++    if (!focus || !head_allowed) return 0;
++    return pad_mode == RT_PAD_PLAY || (full_view && pad_mode == RT_PAD_DIALOGUE);
++}
++
+ /* The engine's view angles: one QAngle (pitch, yaw, roll, degrees) that
+    IVEngineClient's GetViewAngles and SetViewAngles (VEngineClient006,
+    vtable +0xc4 and +0xc8) copy out of and into, with no other state and
+@@ -1331,6 +1351,7 @@ int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va)
+ #if TARGET_OS_VISION
+ void metal_d3d9_immersive_view_pose(int valid, float yaw_deg, float pitch_deg);
+ void metal_d3d9_immersive_view_play(int play);
++int metal_d3d9_fullview_enabled(void);
+ 
+ /* The host's latest head pose: the two angles' float bits in one word so
+    a pump never pairs one pose's yaw with another's pitch, and whether
+@@ -1385,8 +1406,9 @@ static void head_pump(void)
+     }
+     s_head_present = presents;
+     /* Third person or head look off by hand pauses head look like a menu
+-       does, so the frame also leaves full view for the theater plane. */
+-    in.play = S.focus && rt_input_pad_mode(&S) == RT_PAD_PLAY && rt_input_head_allowed(&S);
++       does, so the frame also leaves full view for the theater plane. A
++       dialogue stays in full view when it is on (rt_input_view_play). */
++    in.play = rt_input_view_play(S.focus, rt_input_pad_mode(&S), rt_input_head_allowed(&S), metal_d3d9_fullview_enabled());
+     in.turn = rt_pad_take_turn(&s_padv.pad);
+     uint32_t rc = S.head_recentres + __atomic_load_n(&s_head_host_recentres, __ATOMIC_ACQUIRE);
+     in.recentre = rc != s_head_seen_rc;
+diff --git a/runtime/input.h b/runtime/input.h
+index 3449b89..6e01807 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -159,6 +159,10 @@ int rt_input_menu(const rt_input_state *s);
+ /* Whether head look may drive the view: not switched off by hand and
+    not in third person. */
+ int rt_input_head_allowed(const rt_input_state *s);
++/* Whether a frame is play for head look and full view: in focus, head
++   look allowed, and the pad in play, or in a dialogue when full view is
++   on. */
++int rt_input_view_play(int focus, int pad_mode, int head_allowed, int full_view);
+ int rt_input_pad_mode(const rt_input_state *s);
+ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now_ns, const rt_present_rects *r, float density,
+                       rt_wmsg *out, int cap);
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 01ebdd3..e0090ae 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -2417,6 +2417,21 @@ static void pad_headlook(void)
+     rt_pad_test_detach(id);
+     padpump(&s, &d, 10);
+ 
++    /* A dialogue is play in full view (the world stays round the player,
++       head look on), not on the theater screen; menus never are, and third
++       person or the hand switch still leave it. */
++    check(rt_input_view_play(1, RT_PAD_PLAY, 1, 0) && rt_input_view_play(1, RT_PAD_PLAY, 1, 1),
++          "play is play with full view off or on", "%d %d", rt_input_view_play(1, RT_PAD_PLAY, 1, 0),
++          rt_input_view_play(1, RT_PAD_PLAY, 1, 1));
++    check(rt_input_view_play(1, RT_PAD_DIALOGUE, 1, 1) && !rt_input_view_play(1, RT_PAD_DIALOGUE, 1, 0),
++          "a dialogue stays in full view, and pauses head look on the theater screen", "%d %d",
++          rt_input_view_play(1, RT_PAD_DIALOGUE, 1, 1), rt_input_view_play(1, RT_PAD_DIALOGUE, 1, 0));
++    check(!rt_input_view_play(1, RT_PAD_MENU, 1, 1) && !rt_input_view_play(1, RT_PAD_DIALOGUE, 0, 1) &&
++              !rt_input_view_play(0, RT_PAD_DIALOGUE, 1, 1),
++          "menus, third person or head look off, and no focus leave full view", "%d %d %d",
++          rt_input_view_play(1, RT_PAD_MENU, 1, 1), rt_input_view_play(1, RT_PAD_DIALOGUE, 0, 1),
++          rt_input_view_play(0, RT_PAD_DIALOGUE, 1, 1));
++
+     const char *tmp = getenv("TMPDIR");
+     char dir[512], path[600];
+     snprintf(dir, sizeof dir, "%s/rt-pad-headlook-XXXXXX", tmp && *tmp ? tmp : "/tmp");

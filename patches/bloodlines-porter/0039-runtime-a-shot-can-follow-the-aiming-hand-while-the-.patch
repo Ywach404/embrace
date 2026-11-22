@@ -1,0 +1,571 @@
+From 4e9c0ca1aa4c18c6048da4d02ab230a0f988a51b Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:47:51 -0600
+Subject: [PATCH] runtime: a shot can follow the aiming hand while the view
+ follows the head
+
+With head look the engine's view angles are the head's, so CreateMove copied them into every command and a shot went where the head looked, whatever the controller pointed at. A new m9 row (tools/m9/handaim.toml, cell 57) jumps out of CInput::CreateMove at client+0x1037a6, after SetViewAngles and ClientMode's CreateMove and before the command leaves, and the HandAim shim (runtime/handaim.c) turns the command's angles alone by the aiming hand's offset from the head pose those angles were written for (rt_headlook_hand_aim, with the head's yaw and pitch convention). The engine's angles, which the view is drawn from, are never written there, so the view stays the head's.
+
+It is off unless RT_HANDAIM=1: on a headset run every shot went where the hand pointed with nothing on screen to aim by, and ARKit's aim for a Sense controller sat 18 to 34 degrees above where the hand pointed, so the aim is also turned down by RT_HANDAIM_TILT degrees (25). It acts on visionOS in first person head look in play, the game's live angles switch set and the aiming hand tracked, and logs the angles every 120 commands. build_all.py always adds the set, and the binding is made on every platform so a lift with the row never calls an unbound cell.
+---
+ docs/recomp.md               |   2 +-
+ docs/release-checklist.md    |   2 +-
+ runtime/handaim.c            | 130 +++++++++++++++++++++++++++++++++++
+ runtime/headlook.c           |  35 ++++++++++
+ runtime/headlook.h           |  12 ++++
+ runtime/host.h               |   5 +-
+ runtime/input.c              |  41 ++++++++++-
+ runtime/input_selftest.c     |  58 ++++++++++++++++
+ runtime/main.c               |   1 +
+ runtime/rt.h                 |   6 ++
+ runtime/sources.txt          |   1 +
+ runtime/sources_visionos.txt |   1 +
+ tools/m9/handaim.toml        |  13 ++++
+ tools/recomp/build_all.py    |   3 +-
+ tools/recomp/test_uppatch.py |  31 +++++++++
+ 15 files changed, 333 insertions(+), 8 deletions(-)
+ create mode 100644 runtime/handaim.c
+ create mode 100644 tools/m9/handaim.toml
+
+diff --git a/docs/recomp.md b/docs/recomp.md
+index daef7b9..c8010f6 100644
+--- a/docs/recomp.md
++++ b/docs/recomp.md
+@@ -1064,7 +1064,7 @@ The game root is built by `tools/up/game_root.py`: an APFS clone of the vanilla
+ The fixes patch the lifted code at build time and switch on at run time.
+ 
+ - `runtime/hook.c` is the mechanism. `rt_hook_patch` writes new bytes only when the bytes there are the old ones (the old-byte guard); anything else is logged and left alone. `rt_hook_site` redirects a call site through a cell, and `rt_hook_revert` and `rt_hook_revert_all` restore the old bytes. `rt_hook_claimed` tells whether an address range belongs to a hook.
+-- `tools/recomp/uppatch.py` reads the rows in `tools/up/patches.toml` and produces the patched build input. `build_all.py --patch-set FILE --up-ini FILE --fallbacks tools/recomp/xflags_fallbacks_up.txt` builds with it; the fallbacks file is the UP's own xflags list. `build_all.py` takes one `--patch-set` file; it adds the aspect set (`tools/m9/aspect.toml`) itself unless `--no-engine-aspect` is given. `uppatch.py --patch-set` may repeat.
++- `tools/recomp/uppatch.py` reads the rows in `tools/up/patches.toml` and produces the patched build input. `build_all.py --patch-set FILE --up-ini FILE --fallbacks tools/recomp/xflags_fallbacks_up.txt` builds with it; the fallbacks file is the UP's own xflags list. `build_all.py` takes one `--patch-set` file; it adds the aspect set (`tools/m9/aspect.toml`) itself unless `--no-engine-aspect` is given, and the hand aim set (`tools/m9/handaim.toml`, one CreateMove row that `runtime/handaim.c` binds; it acts only on visionOS) always. `uppatch.py --patch-set` may repeat.
+ - The patched executable embeds the hash of its patch set as `up.sha256` (the kit-version line is `up-build-sha256`). A patched row run without `-game Unofficial_Patch` stops with `UP build needs -game Unofficial_Patch`.
+ - `--up-list-fixes` prints every row with its switch state, read from the game's `Bin/loader/loader.ini`.
+ - The 16 rows: `fix_paths_a`, `fix_paths_b`, `floats_female`, `model_lods`, `save_speed_a`, `save_speed_b`, `save_speed_c`, `ragdolls`, `histories`, `coronas_lights`, `claws_stats`, `shadows_rebuild`, `fov_reset_parse`, `fov_reset_store`, `no_tracers`, `protean_warform_b`.
+diff --git a/docs/release-checklist.md b/docs/release-checklist.md
+index fd7485d..3c284a3 100644
+--- a/docs/release-checklist.md
++++ b/docs/release-checklist.md
+@@ -29,7 +29,7 @@ Release waits for the maintainer's sign-off. Nothing here is signed off.
+ - [ ] Notarization: not done. The app is ad hoc signed; the README gives the Open Anyway steps.
+ - [ ] The bundle identifiers (today `local.*`).
+ - [ ] The mpdecimal text in `tools/kit/licences/python/mpdecimal/` comes from the 4.0.1 package; compare it with the 4.0.0 tarball. OpenSSL, expat, bzip2, libffi, liblzma and SQLite texts are in, each from the upstream tag of its version.
+-- [ ] The judgement calls of the legal scan (byte patterns in `tools/up/patches.toml` and `tools/m9/aspect.toml`, hash manifests, `docs/recomp.md`, the PGO profile).
++- [ ] The judgement calls of the legal scan (byte patterns in `tools/up/patches.toml`, `tools/m9/aspect.toml` and `tools/m9/handaim.toml`, hash manifests, `docs/recomp.md`, the PGO profile).
+ - [ ] The history: every commit carries the maintainer's work e-mail address. Publish with fresh history (`tools/release/orphan.sh`) or rewritten author data.
+ - [ ] The play-test defects listed in `README.md` under Known issues are fixed and re-tested (3 of 3 clean runs for a crash).
+ - [ ] Sign-off.
+diff --git a/runtime/handaim.c b/runtime/handaim.c
+new file mode 100644
+index 0000000..240c235
+--- /dev/null
++++ b/runtime/handaim.c
+@@ -0,0 +1,130 @@
++#include "recomp_types.h"
++#include "rt.h"
++#include "headlook.h"
++
++#include <TargetConditionals.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++/*
++ * Hand aim (visionOS, full view): a shot follows the aiming controller
++ * while the view keeps following the head. Head look writes the engine's
++ * view angles, which the view render copies and CreateMove copies into
++ * the user command; this turns only the command's angles, after the game
++ * has built the command, toward the hand. The command's angles are what
++ * the player fires along, and the engine's own, which the view is drawn
++ * from, are never written here, so they stay the head's. As in head look,
++ * the angles are absolute: the hand's offset from the head is added to
++ * this command alone, so nothing accumulates from one to the next.
++ *
++ * The seam is tools/m9/handaim.toml: CInput::CreateMove (client+0x103320)
++ * jumps at +0x1037a6, after SetViewAngles and ClientMode CreateMove, to a
++ * thunk that calls cell 57 with the command. Nothing after it writes the
++ * angles at cmd+0x14 before the command goes out.
++ */
++
++#define CMD_ANGLES 0x14u
++#define SITE_RVA 0x1037a6u
++#define CELL 57u
++/* The dword CreateMove reads at +0x103724 (0x102bd928 in the DLL): set,
++   the command takes the engine's angles and stores them; clear, it takes
++   the ones stored last, so the player's facing is held (Source's
++   g_iAlive). A held command keeps the game's angles. */
++#define LIVE_ANGLES_RVA 0x2bd928u
++
++static uint32_t s_aimed;
++
++uint32_t rt_hand_aim_commands(void) { return __atomic_load_n(&s_aimed, __ATOMIC_RELAXED); }
++
++#if TARGET_OS_VISION
++/* Off unless RT_HANDAIM=1: with nothing on screen showing where the hand
++   aims (the gun still follows the head), every shot of a headset run
++   (2026-11-21) went where the hand pointed and none where the player
++   looked. It comes on by default once the view model follows the hand. */
++static int wanted(void)
++{
++    static int env = -2;
++    if (env == -2) {
++        const char *v = getenv("RT_HANDAIM");
++        env = v && *v == '1';
++    }
++    return env;
++}
++
++/* ARKit's aim for a Sense controller points well above where the hand
++   points as it holds a gun: 18 to 34 degrees up with the player aiming
++   level or down at people (the same run). The aim is turned down about
++   the controller's own right axis by RT_HANDAIM_TILT degrees, 25 if not
++   set. */
++static void tilt_down(float m[16])
++{
++    static float deg = -1000.0f;
++    if (deg < -999.0f) {
++        const char *v = getenv("RT_HANDAIM_TILT");
++        deg = v && *v ? (float)atof(v) : 25.0f;
++        if (!(deg >= -60.0f && deg <= 60.0f)) deg = 25.0f;
++    }
++    float t = deg * (float)M_PI / 180.0f, c = cosf(t), s = sinf(t);
++    for (int r = 0; r < 3; r++) {
++        float y = m[4 + r], z = m[8 + r];
++        m[4 + r] = y * c - z * s;
++        m[8 + r] = z * c + y * s;
++    }
++}
++#endif
++
++static uint32_t hand_aim(const uint32_t *a)
++{
++#if TARGET_OS_VISION
++    uint32_t live = rt_hook_va("client", LIVE_ANGLES_RVA);
++    if (!a[0] || !live || !MEM32(live) || !wanted()) return 0;
++    float head_yaw, head_pitch, aim[16];
++    if (!rt_input_hand_aim_pose(&head_yaw, &head_pitch, aim)) return 0;
++    tilt_down(aim);
++    float cmd[3], out[3];
++    memcpy(cmd, rt_host(a[0] + CMD_ANGLES), sizeof cmd);
++    rt_headlook_hand_aim(cmd, head_yaw, head_pitch, aim, out);
++    memcpy(rt_host(a[0] + CMD_ANGLES), out, sizeof out);
++    uint32_t n = __atomic_add_fetch(&s_aimed, 1, __ATOMIC_RELAXED);
++    /* The first command and then one in 120, about two seconds: what the
++       game aimed, what the hand made of it, and the poses behind it, so a
++       run shows where shots go. */
++    if (n == 1 || n % 120 == 0) {
++        float hy, hp;
++        rt_headlook_yaw_pitch(aim, &hy, &hp);
++        rt_log("hand aim %u: game pitch %.1f yaw %.1f -> pitch %.1f yaw %.1f; head yaw %.1f pitch %.1f, hand yaw %.1f "
++               "pitch %.1f",
++               n, cmd[0], cmd[1], out[0], out[1], head_yaw, head_pitch, hy, hp);
++    }
++#else
++    (void)a;
++#endif
++    return 0;
++}
++
++static const rt_shim k_hand_aim = {"m9", "HandAim", 1, hand_aim, RT_SHIM_REAL};
++
++/* Bound on every platform: a lift with the row calls through the cell on
++   each CreateMove, and the shim does nothing off visionOS. A lift without
++   it keeps the stock store and nothing is bound. A site that matches
++   neither is logged and left alone, since the game plays the same
++   without hand aim. */
++void rt_hand_aim_init(void)
++{
++    static const uint8_t old[6] = {0x89, 0x87, 0xbc, 0x01, 0x00, 0x00};
++    uint32_t va = rt_hook_va("client", SITE_RVA);
++    if (!va) return;
++    if (rt_hook_claimed(va, sizeof old)) {
++        rt_log("hand aim: site 0x%08X owned by another hook", va);
++        return;
++    }
++    int st = rt_hook_site("hand_aim_cmd", va, old, sizeof old, -1, 0xE9, CELL, &k_hand_aim);
++    if (st == RT_HOOK_BAKED)
++        rt_log("hand aim: on (build), CreateMove at 0x%08X through cell %u%s", va, CELL,
++               TARGET_OS_VISION ? "" : "; it acts only on visionOS");
++    else if (st == RT_HOOK_ABSENT)
++        rt_log("hand aim: not in this build");
++    else
++        rt_log("hand aim: bytes at 0x%08X match neither the stock store nor the build's jump", va);
++}
+diff --git a/runtime/headlook.c b/runtime/headlook.c
+index 922734f..9063ce4 100644
+--- a/runtime/headlook.c
++++ b/runtime/headlook.c
+@@ -121,3 +121,38 @@ int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3])
+     h->pose_pitch = -pitch;
+     return 1;
+ }
++
++/* As the host computes the head's angles (mtl_head_yaw_pitch in the
++   Metal backend), so a hand held where the head looks adds nothing.
++   Straight up or down leaves no heading in the forward axis, so it comes
++   from the up axis. */
++void rt_headlook_yaw_pitch(const float m[16], float *yaw_deg, float *pitch_deg)
++{
++    const double deg = 57.29577951308232;
++    double fx = -m[8], fy = -m[9], fz = -m[10];
++    if (fy > 1.0) fy = 1.0;
++    if (fy < -1.0) fy = -1.0;
++    double hx = fx, hz = fz;
++    if (hx * hx + hz * hz < 1e-6) {
++        double s = m[9] > 0 ? 1.0 : -1.0;
++        hx = s * m[4];
++        hz = s * m[6];
++    }
++    *yaw_deg = hx * hx + hz * hz > 0 ? (float)(atan2(-hx, -hz) * deg) : 0.0f;
++    *pitch_deg = (float)(asin(fy) * deg);
++}
++
++void rt_headlook_hand_aim(const float cmd[3], float head_yaw, float head_pitch, const float aim[16], float out[3])
++{
++    float yaw, pitch;
++    rt_headlook_yaw_pitch(aim, &yaw, &pitch);
++    /* Both yaws are positive left, as the game's is; ARKit's pitch is up
++       positive and the game's down positive, so the hand's rise above the
++       head lowers the command's pitch. */
++    float p = (float)(cmd[0] - (pitch - head_pitch));
++    if (p > RT_HEADLOOK_PITCH_DOWN) p = RT_HEADLOOK_PITCH_DOWN;
++    if (p < -RT_HEADLOOK_PITCH_UP) p = -RT_HEADLOOK_PITCH_UP;
++    out[0] = p;
++    out[1] = (float)rt_headlook_wrap(cmd[1] + rt_headlook_diff(head_yaw, yaw));
++    out[2] = cmd[2];
++}
+diff --git a/runtime/headlook.h b/runtime/headlook.h
+index 581a6c5..ce162b3 100644
+--- a/runtime/headlook.h
++++ b/runtime/headlook.h
+@@ -90,4 +90,16 @@ double rt_headlook_diff(double a, double b);
+ /* Into -180..180. */
+ double rt_headlook_wrap(double a);
+ 
++/* Hand aim: the command's angles turned from where the head looks to
++   where the aiming hand points, so a shot follows the hand while the view
++   stays the head's. cmd (pitch, yaw, roll) stands for the head at
++   head_yaw and head_pitch (ARKit); aim is the hand's column-major
++   transform from its aim location to ARKit's origin, forward -Z. out
++   gets the command's angles with the hand's offset from the head added,
++   the pitch clamped to the game's limits and the roll kept. */
++void rt_headlook_hand_aim(const float cmd[3], float head_yaw, float head_pitch, const float aim[16], float out[3]);
++/* A transform's heading and elevation, the head's convention: yaw
++   positive turning left from -Z, pitch positive up, degrees. */
++void rt_headlook_yaw_pitch(const float m[16], float *yaw_deg, float *pitch_deg);
++
+ #endif
+diff --git a/runtime/host.h b/runtime/host.h
+index d360f19..2bb90d0 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -104,8 +104,9 @@ void rt_host_head_recentre(void);
+  * are column-major 4x4 transforms from the location to ARKit's origin,
+  * in metres; velocity in metres a second and angular velocity in
+  * radians a second, both in the origin's axes; time in seconds on
+- * ARKit's clock. Nothing reads them yet: they are kept, and counted for
+- * the log, for hand aim, swings and the arm HUD to come. Any thread.
++ * ARKit's clock. Hand aim reads the aiming side's aim transform
++ * (handaim.c); the rest are kept, and counted for the log, for swings
++ * and the arm HUD to come. Any thread.
+  * rt_host_aim_hand says which hand aims: 0 right, 1 left, from hand= in
+  * controls.txt (RT_PAD_HAND).
+  */
+diff --git a/runtime/input.c b/runtime/input.c
+index 637ce40..aea35e7 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1406,7 +1406,8 @@ void rt_host_head_recentre(void) { __atomic_fetch_add(&s_head_host_recentres, 1,
+ 
+ /* The host's latest tracked hand poses, one slot per side. A sequence
+    word around each write lets a reader that comes later take a whole
+-   pose: odd while a write is under way. Nothing reads them yet. */
++   pose: odd while a write is under way. Hand aim reads the aiming one
++   (rt_input_hand_aim_pose). */
+ typedef struct {
+     uint32_t seq;
+     int state;
+@@ -1434,6 +1435,39 @@ void rt_host_hand_pose(int side, int state, const float grip[16], const float ai
+ 
+ int rt_host_aim_hand(void) { return __atomic_load_n(&s_padv.pad.aim_left, __ATOMIC_RELAXED) ? 1 : 0; }
+ 
++/* Read at the game's CreateMove (handaim.c), on the game thread. The pump
++   that steps s_head runs on the main thread inside a hop the game thread
++   waits on, so its fields are settled here. The pose is the one the
++   angles CreateMove copied into the command were written for; a hold, a
++   pause or no head pose leaves the command the game's. The hand's slot is
++   written from the compositor's thread, so it is copied under its
++   sequence word and a write caught under way is tried again. */
++int rt_input_hand_aim_pose(float *head_yaw, float *head_pitch, float aim[16])
++{
++    if (!s_head_init || !s_head.on || !s_head.playing || s_head.holding || !s_head.pose_valid) return 0;
++    pthread_mutex_lock(&s_mu);
++    int mode = rt_input_head_mode(&S);
++    pthread_mutex_unlock(&s_mu);
++    if (mode != RT_HEAD_FULL) return 0;
++    /* rt_host_aim_hand is 1 for the left, and the left is slot 0. */
++    const rt_hand_slot *h = &s_hands[rt_host_aim_hand() ? 0 : 1];
++    for (int tries = 0; tries < 4; tries++) {
++        uint32_t a = __atomic_load_n(&h->seq, __ATOMIC_ACQUIRE);
++        if (a & 1) continue;
++        int state = h->state;
++        float m[16];
++        memcpy(m, h->aim, sizeof m);
++        __atomic_thread_fence(__ATOMIC_ACQUIRE);
++        if (__atomic_load_n(&h->seq, __ATOMIC_RELAXED) != a) continue;
++        if (state < 1) return 0;
++        *head_yaw = s_head.pose_yaw;
++        *head_pitch = s_head.pose_pitch;
++        memcpy(aim, m, sizeof m);
++        return 1;
++    }
++    return 0;
++}
++
+ /* Whether the pad's right stick should turn the body this poll: the host
+    gives a pose, the game's angles are there to write, and the head drives
+    the view. Held (third person), the stick looks as it does flat. */
+@@ -1730,8 +1764,9 @@ void rt_input_report(void)
+         uint32_t hm = H.moves, hb = H.buttons, hw = H.wheels;
+         pthread_mutex_unlock(&s_mu);
+         rt_log("input host moves %u buttons %u wheels %u claim %s", hm, hb, hw, host_claimed() ? "on" : "off");
+-        rt_log("input head look starts %u writes %u pauses %u recentres %u kept game turns %u pitch clamps %u", s_head.starts,
+-               s_head.writes, s_head.pauses, s_head.recentres, s_head.absorbed, s_head.clamps);
++        rt_log("input head look starts %u writes %u pauses %u recentres %u kept game turns %u pitch clamps %u hand aimed %u",
++               s_head.starts, s_head.writes, s_head.pauses, s_head.recentres, s_head.absorbed, s_head.clamps,
++               rt_hand_aim_commands());
+     }
+ #endif
+     if (!armed) return;
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 0d5066b..c85355a 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -2848,6 +2848,63 @@ static void head_hold(void)
+     check(rt_input_head_mode(&s) == RT_HEAD_NONE, "head look off by hand is off", "%d", rt_input_head_mode(&s));
+ }
+ 
++/* An aim transform pointing at yaw and pitch (ARKit: yaw positive left
++   from -Z, pitch up), built as the backend's mtl_view_rotation builds a
++   head's, with a translation the angles must ignore. */
++static void aim_at(float yaw_deg, float pitch_deg, float m[16])
++{
++    const double rad = 0.017453292519943295;
++    double cy = cos(yaw_deg * rad), sy = sin(yaw_deg * rad), cp = cos(pitch_deg * rad), sp = sin(pitch_deg * rad);
++    float r[16] = {(float)cy, 0, (float)-sy, 0, (float)(sy * sp), (float)cp, (float)(cy * sp), 0,
++                   (float)(sy * cp), (float)-sp, (float)(cy * cp), 0, 0.2f, 1.1f, -0.4f, 1};
++    memcpy(m, r, sizeof r);
++}
++
++/* Hand aim's angles (headlook.c): the command stands for the head's pose,
++   and the hand's offset from it turns the command alone. */
++static void hand_aim(void)
++{
++    float aim[16], out[3];
++    const float cmd[3] = {5, 100, 0};
++    float y, p;
++    aim_at(37, -12, aim);
++    rt_headlook_yaw_pitch(aim, &y, &p);
++    check(fabsf(y - 37) < 1e-3f && fabsf(p + 12) < 1e-3f, "hand aim reads a hand's yaw and pitch as the head's are read",
++          "yaw %.4f pitch %.4f", y, p);
++
++    aim_at(20, -5, aim);
++    rt_headlook_hand_aim(cmd, 20, -5, aim, out);
++    check(fabsf(out[0] - 5) < 1e-3f && fabsf(out[1] - 100) < 1e-3f && out[2] == 0,
++          "a hand pointing where the head looks leaves the command's angles", "%.4f %.4f %.4f", out[0], out[1], out[2]);
++
++    aim_at(50, -5, aim);
++    rt_headlook_hand_aim(cmd, 20, -5, aim, out);
++    check(fabsf(out[1] - 130) < 1e-3f && fabsf(out[0] - 5) < 1e-3f, "a hand 30 degrees left of the head turns the command 30 left",
++          "pitch %.4f yaw %.4f", out[0], out[1]);
++
++    aim_at(20, 15, aim);
++    rt_headlook_hand_aim(cmd, 20, -5, aim, out);
++    check(fabsf(out[0] - (5 - 20)) < 1e-3f && fabsf(out[1] - 100) < 1e-3f,
++          "a hand 20 degrees above the head raises the command 20 (the game's pitch is down positive)", "pitch %.4f yaw %.4f",
++          out[0], out[1]);
++
++    const float low[3] = {80, 0, 0}, high[3] = {-80, 0, 0};
++    aim_at(0, -30, aim);
++    rt_headlook_hand_aim(low, 0, 0, aim, out);
++    float down = out[0];
++    aim_at(0, 30, aim);
++    rt_headlook_hand_aim(high, 0, 0, aim, out);
++    check(down == RT_HEADLOOK_PITCH_DOWN && out[0] == -RT_HEADLOOK_PITCH_UP, "hand aim clamps the pitch at the game's 89 degrees",
++          "down %.4f up %.4f", down, out[0]);
++
++    const float back[3] = {0, 170, 3};
++    aim_at(-150, 0, aim);
++    rt_headlook_hand_aim(back, 160, 0, aim, out);
++    check(fabsf(out[1] - (-140)) < 1e-3f && out[2] == 3,
++          "hand aim wraps the yaw through 180 (head 160, hand -150 is 50 left: 170 turns to -140) and keeps the roll",
++          "yaw %.4f roll %.4f", out[1], out[2]);
++}
++
+ /* The right stick under head look: it turns the body, smoothly or in
+    snaps, and sends no mouse look. */
+ static void pad_turn(void)
+@@ -2984,6 +3041,7 @@ int rt_input_selftest(void)
+     head_hold();
+     head_look_drift();
+     head_look_write();
++    hand_aim();
+     pad_turn();
+     pad_recentre();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+diff --git a/runtime/main.c b/runtime/main.c
+index d2dc9f9..876cbcd 100644
+--- a/runtime/main.c
++++ b/runtime/main.c
+@@ -408,6 +408,7 @@ static int run(int argc, char **argv)
+     int lw, lh;
+     rt_aspect_launch_size(&lw, &lh);
+     rt_aspect_engine_init(lw, lh);
++    rt_hand_aim_init();
+     mprotect(rt_host(RT_EXE_BASE), 0x4000, PROT_READ);
+     for (uint32_t m = 0; m < rt_nmodules; m++)
+         if (rt_modules[m]->tls_end > rt_modules[m]->tls_start) MEM32(rt_modules[m]->tls_index) = 0;
+diff --git a/runtime/rt.h b/runtime/rt.h
+index 42ab449..a32cbaf 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -363,6 +363,10 @@ int rt_input_main_shown(void);
+ int rt_input_script_load(const char *path);
+ void rt_input_script_step(void);
+ int rt_input_selftest(void);
++/* Hand aim (visionOS): the head pose the game's angles last written
++   stand for and the aiming hand's aim transform, 1 only while the head
++   drives yaw and pitch in play and that hand is tracked. */
++int rt_input_hand_aim_pose(float *head_yaw, float *head_pitch, float aim[16]);
+ void rt_input_report(void);
+ 
+ typedef struct rt_wav rt_wav;
+@@ -478,5 +482,7 @@ void rt_up_fixes_selftest(const char *dir);
+ int rt_up_default_clan(const char *in, size_t n, char *out, size_t outn);
+ void rt_aspect_engine_init(int w, int h);
+ void rt_aspect_engine_set(int w, int h, int on);
++void rt_hand_aim_init(void);
++uint32_t rt_hand_aim_commands(void);
+ 
+ #endif
+diff --git a/runtime/sources.txt b/runtime/sources.txt
+index 19e0f19..3b7cdd7 100644
+--- a/runtime/sources.txt
++++ b/runtime/sources.txt
+@@ -13,6 +13,7 @@ runtime/devmenu.c
+ runtime/toggles.c
+ runtime/aspect.c
+ runtime/g2b_engine.c
++runtime/handaim.c
+ runtime/hud.m
+ runtime/fx.m
+ runtime/m9_selftest.c
+diff --git a/runtime/sources_visionos.txt b/runtime/sources_visionos.txt
+index 9c18441..f29e8b4 100644
+--- a/runtime/sources_visionos.txt
++++ b/runtime/sources_visionos.txt
+@@ -13,6 +13,7 @@ runtime/devmenu.c
+ runtime/toggles.c
+ runtime/aspect.c
+ runtime/g2b_engine.c
++runtime/handaim.c
+ runtime/hud_vision.c
+ runtime/fx_vision.c
+ runtime/m9_selftest.c
+diff --git a/tools/m9/handaim.toml b/tools/m9/handaim.toml
+new file mode 100644
+index 0000000..553311e
+--- /dev/null
++++ b/tools/m9/handaim.toml
+@@ -0,0 +1,13 @@
++[[row]]
++id = "hand_aim_cmd"
++owner = "m9-g2b"
++switch = ["M9/Hand Aim"]
++module = "client"
++rva = 0x1037a6
++kind = "jmp"
++old = "8987bc010000"
++cell = 57
++pop = 1
++thunk = "{disp}5056{call}58{resume}"
++guard = [0x1037a6, 6]
++asm = "CInput::CreateMove 0x10603320 (client+0x103320, ecx = this kept in edi; esi = the usercmd in the ring at [edi+0x1c0]): +0x103724 mov eax,[0x102bd928] (the switch between the engine's angles and the ones held at 0x104d33c4); +0x10372b lea eax,[esi+0x14] (viewangles: pitch, yaw, roll); +0x103787 call [edx+0xc8] (SetViewAngles(&cmd+0x14)); +0x10379b call [eax+0x58] (ClientMode CreateMove(frametime, cmd)); +0x10379e fld [esi+0x20]; call 0x106d0ed4 (ftol); +0x1037a6 mov [edi+0x1bc],eax; +0x1037ac mov ecx,[0x104a57e4]; mov eax,[ecx]: ecx and eax are reloaded and edx is not read before +0x1037fa. From here to the ret 0x18 at +0x103a4c nothing writes cmd+0x14..+0x1c. new: jmp to a thunk that does the displaced store, then push eax; push esi; call [cell 57] (HandAim, pops its one argument); pop eax; jmp +0x1037ac"
+diff --git a/tools/recomp/build_all.py b/tools/recomp/build_all.py
+index 129784e..a8335d6 100644
+--- a/tools/recomp/build_all.py
++++ b/tools/recomp/build_all.py
+@@ -23,6 +23,7 @@ ALLOWED = {"simd-trap", "fault-as-original", "hint"}
+ FALLBACK_PINNED = os.path.join(HERE, "xflags_fallbacks.txt")
+ RUN_OUTPUTS = {"summary.json", "stubs.tsv", "build.log", "ccache.txt"}
+ ASPECT_SET = os.path.join(REPO, "tools", "m9", "aspect.toml")
++HANDAIM_SET = os.path.join(REPO, "tools", "m9", "handaim.toml")
+ 
+ 
+ def run(cmd, **kw):
+@@ -390,7 +391,7 @@ def main(argv=None):
+     t1 = time.time()
+     patched = ()
+     clear_patch_state(out, plan["modules"])
+-    sets = ([] if a.no_engine_aspect else [ASPECT_SET]) + ([os.path.abspath(a.patch_set)] if a.patch_set else [])
++    sets = ([] if a.no_engine_aspect else [ASPECT_SET]) + [HANDAIM_SET] + ([os.path.abspath(a.patch_set)] if a.patch_set else [])
+     if sets:
+         cmd =PY + [os.path.join(HERE, "uppatch.py")] + [x for s in sets for x in ("--patch-set", s)] + ["--game", GAME,
+                     "--layout", a.layout, "--out", out]
+diff --git a/tools/recomp/test_uppatch.py b/tools/recomp/test_uppatch.py
+index b585497..1140e29 100644
+--- a/tools/recomp/test_uppatch.py
++++ b/tools/recomp/test_uppatch.py
+@@ -22,6 +22,8 @@ PATCHES = os.path.join(REPO, "tools", "up", "patches.toml")
+ FIXES_C = os.path.join(REPO, "runtime", "up_fixes.c")
+ ASPECT = os.path.join(REPO, "tools", "m9", "aspect.toml")
+ G2B_C = os.path.join(REPO, "runtime", "g2b_engine.c")
++HANDAIM = os.path.join(REPO, "tools", "m9", "handaim.toml")
++HANDAIM_C = os.path.join(REPO, "runtime", "handaim.c")
+ G2B_ROW = re.compile(r'\{"(g2b_\w+)",\s*"(\w+)",\s*(0x[0-9a-f]+),\s*G_(\w+),\s*"([0-9a-f]*)",\s*"([0-9a-f]*)",\s*(\d+),\s*(-?\d+),\s*&?(\w+),'
+                      r'\s*(0x[0-9a-f]+),\s*(0x[0-9a-f]+|\d+)\},')
+ G2B_SHIM = re.compile(r'static const rt_shim (\w+) = \{"m9", "\w+", (\d+),')
+@@ -315,6 +317,34 @@ def aspect_parity(rows):
+           "aspect rows use cells 32, 34 to 38, 40 to 47 and 50 to 56", "")
+ 
+ 
++def handaim_parity():
++    rows = uppatch.load_rows(HANDAIM)
++    src = open(HANDAIM_C).read()
++    r = rows[0] if len(rows) == 1 else {}
++    site = re.search(r"#define SITE_RVA (0x[0-9a-f]+)u", src)
++    cell = re.search(r"#define CELL (\d+)u", src)
++    old = re.search(r"static const uint8_t old\[\d+\] = \{([^}]*)\}", src)
++    pop = re.search(r'static const rt_shim k_hand_aim = \{"m9", "HandAim", (\d+),', src)
++    ok = (r.get("owner") == uppatch.G2B and r.get("kind") == "jmp" and r.get("module") == "client" and "asm" in r
++          and site and int(site[1], 16) == r["rva"] and cell and int(cell[1]) == r["cell"]
++          and old and bytes(int(x, 16) for x in old[1].split(",")) == bytes.fromhex(r["old"])
++          and pop and int(pop[1]) == r["pop"] and r["guard"] == [r["rva"], len(bytes.fromhex(r["old"]))])
++    check(ok, "handaim.toml has one m9-g2b row and it matches handaim.c's site, bytes, cell and shim pop", f"toml {r}")
++    t = r.get("thunk", "")
++    pre, post = t.split("{call}") if "{call}" in t else ("", "")
++    pre, post = re.sub(r"\{[^}]*\}", "", pre), re.sub(r"\{[^}]*\}", "", post)
++    pushes = sum(1 for i in range(0, len(pre), 2) if pre[i:i + 2] in ("50", "56"))
++    pops = sum(1 for i in range(0, len(post), 2) if post[i:i + 2] == "58")
++    check(t.startswith("{disp}") and t.endswith("{resume}") and pushes - r.get("pop", 0) - pops == 0,
++          "the hand aim thunk does the displaced store first and leaves the stack balanced", t)
++    try:
++        both = uppatch.load_rows([PATCHES, ASPECT, HANDAIM])
++        check(len(both) == len({x["id"] for x in both}), "handaim.toml loads beside patches.toml and aspect.toml", "")
++    except uppatch.PatchError as e:
++        check(False, "handaim.toml loads beside patches.toml and aspect.toml", str(e))
++    check(HANDAIM == build_all.HANDAIM_SET, "build_all.py adds the hand aim set", build_all.HANDAIM_SET)
++
++
+ def mode_filter(path, modes, requests):
+     try:
+         import unicorn
+@@ -619,6 +649,7 @@ def main():
+     aspect = uppatch.load_rows(ASPECT)
+     check(len(aspect) == 24 and all(r["owner"] == uppatch.G2B for r in aspect), "aspect.toml has twenty-four m9-g2b rows", len(aspect))
+     aspect_parity(aspect)
++    handaim_parity()
+     real_dll_cases(uppatch.load_rows([PATCHES, ASPECT]))
+     aspect_cases(rows, aspect)
+     print(f"test_uppatch: {fails} FAIL")
+-- 
+2.54.0 (Apple Git-157)
+

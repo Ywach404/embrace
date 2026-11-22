@@ -1,0 +1,8 @@
+// The game, the runtime, the Metal backend and their middleware come from
+// scripts/visionos-tree.sh, which writes the paths and system libraries per
+// SDK into the file included here. Optional, so the project still opens
+// before that script has run; the link then fails on rt_host_start.
+#include? "../../build/s3-visionos/link.xcconfig"
+
+OTHER_LDFLAGS = $(inherited) $(VTMB_LDFLAGS)
+HEADER_SEARCH_PATHS = $(inherited) $(VTMB_INCLUDE)

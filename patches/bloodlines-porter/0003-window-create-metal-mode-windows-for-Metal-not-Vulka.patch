@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:18:25 -0600
+Subject: [PATCH 3/4] window: create metal mode windows for Metal, not Vulkan
+
+rt_gfx_flags_for returns SDL_WINDOW_METAL in metal mode, keeping the
+high pixel density flag as dxvk does, since the backend attaches its
+layer through SDL_Metal_CreateView. A device window the guest destroys
+stays alive and hidden in metal mode too, because the layer lives on it.
+---
+ runtime/window.c    | 5 +++--
+ shims/d3d9_bridge.c | 6 +++++-
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/window.c b/runtime/window.c
+index 4ffd75d..209f219 100644
+--- a/runtime/window.c
++++ b/runtime/window.c
+@@ -207,9 +207,10 @@ void rt_win_free(rt_win *w)
+         rt_input_main_window(0, NULL);
+         rt_gfx_window_gone();
+     }
+-    if (w->sdl && rt_gfx_mode() == RT_GFX_DXVK && w->sdl == rt_gfx_device_window()) {
++    if (w->sdl && rt_gfx_mode() != RT_GFX_NULL && w->sdl == rt_gfx_device_window()) {
+         SDL_HideWindow(w->sdl);
+-        rt_log("window 0x%08X destroyed by the guest; its SDL window stays alive, hidden, for the dxvk swapchain", w->hwnd);
++        rt_log("window 0x%08X destroyed by the guest; its SDL window stays alive, hidden, for the %s swapchain", w->hwnd,
++               rt_gfx_mode() == RT_GFX_METAL ? "metal" : "dxvk");
+     } else if (w->sdl) {
+         SDL_DestroyWindow(w->sdl);
+     }
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index fbbe564..e21eb8b 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -2384,8 +2384,12 @@ int rt_gfx_mode(void) { return s_mode; }
+ 
+ uint64_t rt_gfx_flags_for(int mode, int native)
+ {
++    uint64_t density = native ? (uint64_t)SDL_WINDOW_HIGH_PIXEL_DENSITY : 0;
++    /* The metal backend attaches its CAMetalLayer with SDL_Metal_CreateView,
++       which expects a window created for Metal rather than Vulkan. */
++    if (mode == RT_GFX_METAL) return (uint64_t)SDL_WINDOW_METAL | density;
+     if (mode != RT_GFX_DXVK) return 0;
+-    return (uint64_t)SDL_WINDOW_VULKAN | (native ? (uint64_t)SDL_WINDOW_HIGH_PIXEL_DENSITY : 0);
++    return (uint64_t)SDL_WINDOW_VULKAN | density;
+ }
+ 
+ uint64_t rt_gfx_window_flags(void) { return rt_gfx_flags_for(s_mode, rt_aspect_launch_native()); }

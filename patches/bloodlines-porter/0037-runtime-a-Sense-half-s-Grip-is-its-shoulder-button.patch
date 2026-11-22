@@ -1,0 +1,86 @@
+From 2d50c1964396cf525bc8776eeb449fee126a3ca3 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:02:06 -0600
+Subject: [PATCH] runtime: a Sense half's Grip is its shoulder button
+
+Declared as spatial controllers, the Sense halves come apart and each reports only Grip where the merged pad had L1 and R1; SDL's GameController driver leaves Grip unmapped, so the shoulders, and with them cycling the disciplines, did nothing. The host reads each half's Grip and gives it to the pad (rt_host_pad_grip), which takes it as that half's shoulder.
+---
+ runtime/host.h |  6 ++++++
+ runtime/pad.c  | 26 ++++++++++++++++++++++++--
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 7e9a548..0d5c80a 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -112,6 +112,12 @@ void rt_host_head_recentre(void);
+ void rt_host_hand_pose(int side, int state, const float grip[16], const float aim[16], const float velocity[3],
+                        const float angular_velocity[3], double time);
+ int rt_host_aim_hand(void);
++/* A Sense half's Grip, which SDL's GameController driver leaves unmapped:
++ * the merged pad called the grips L1 and R1, and the halves, each a
++ * spatial controller of its own, report only Grip. The host reads it and
++ * the pad takes it as that half's shoulder button. side: 0 left, 1 right.
++ * Any thread. */
++void rt_host_pad_grip(int side, int down);
+ 
+ /*
+  * Writes one line from the host to the runtime's log, after "host: ", so
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 5477d58..4ac9d83 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -1,5 +1,6 @@
+ #include "pad.h"
+ 
++#include "host.h"
+ #include "input.h"
+ 
+ #include <math.h>
+@@ -904,11 +905,24 @@ static const char *slot_name(const rt_pad_dev *d, int i)
+    resting stick that drifts past the dead zone cannot steal the drive
+    back. Each half keeps its own bits; a fresh bit on either takes the
+    drive for both. */
++static atomic_int s_grip[2];
++
++void rt_host_pad_grip(int side, int down) { atomic_store(&s_grip[side ? 1 : 0], down != 0); }
++
+ static uint32_t live(SDL_Gamepad *gp)
+ {
+     uint32_t b = 0;
+     for (int i = 0; i < RT_PAD_NBTN; i++)
+         if (k_sdl[i] >= 0 && SDL_GetGamepadButton(gp, (SDL_GamepadButton)k_sdl[i])) b |= 1u << i;
++    /* A Sense half's Grip, given by the host (rt_host_pad_grip), is its
++       shoulder button. */
++    int half = rt_pad_half(SDL_GetGamepadName(gp));
++    if (half == RT_PAD_HALF_L || half == RT_PAD_HALF_R) {
++        SDL_GamepadButton sb = half == RT_PAD_HALF_L ? SDL_GAMEPAD_BUTTON_LEFT_SHOULDER : SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER;
++        if (atomic_load(&s_grip[half == RT_PAD_HALF_R]))
++            for (int i = 0; i < RT_PAD_NBTN; i++)
++                if (k_sdl[i] == (int)sb) b |= 1u << i;
++    }
+     if (SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > RT_PAD_TRIGGER) b |= 1u << RT_PAD_LT;
+     if (SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > RT_PAD_TRIGGER) b |= 1u << RT_PAD_RT;
+     for (int a = 0; a < 4; a++) {
+@@ -926,8 +940,16 @@ static uint32_t live(SDL_Gamepad *gp)
+    which SDL button each half's face buttons land on. */
+ static int group_button(const rt_pad_dev *d, int drv, SDL_GamepadButton b)
+ {
+-    for (int i = 0; i < d->nslots; i++)
+-        if (grouped(d, i, drv) && SDL_GetGamepadButton(d->slot[i].gp, b)) return 1;
++    for (int i = 0; i < d->nslots; i++) {
++        if (!grouped(d, i, drv)) continue;
++        if (SDL_GetGamepadButton(d->slot[i].gp, b)) return 1;
++        /* A half's Grip from the host is its shoulder here too: the group
++           reads SDL itself, not live(). */
++        int half = d->slot[i].half;
++        if ((half == RT_PAD_HALF_L && b == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER && atomic_load(&s_grip[0])) ||
++            (half == RT_PAD_HALF_R && b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER && atomic_load(&s_grip[1])))
++            return 1;
++    }
+     return 0;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

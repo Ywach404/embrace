@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Embrace</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<!-- The immersive space is a second scene beside the window. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
+		<string>UIWindowSceneSessionRoleApplication</string>
+		<key>UISceneConfigurations</key>
+		<dict/>
+	</dict>
+	<!-- visionOS sends gamepad input only to apps that declare it; SDL's
+	     gamepad layer reads it through GameController. -->
+	<!-- ARKit's accessory tracking places the spatial controllers in the
+	     room; the system asks the user once with this text. -->
+	<key>NSAccessoryTrackingUsageDescription</key>
+	<string>Tracks your controllers so they can point and aim in the scene.</string>
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+	<!-- SpatialGamepad first: with only ExtendedGamepad, visionOS hands
+	     the app the two Sense halves merged into one "(L/R)" pad when both
+	     are on at launch, which cannot be tracked, and only the right half
+	     when they come on later. Declared, each half comes as its own
+	     spatial controller in any order. ExtendedGamepad keeps a DualSense
+	     or any other whole pad. -->
+	<key>GCSupportedGameControllers</key>
+	<array>
+		<dict>
+			<key>ProfileName</key>
+			<string>SpatialGamepad</string>
+		</dict>
+		<dict>
+			<key>ProfileName</key>
+			<string>ExtendedGamepad</string>
+		</dict>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:45:13 -0600
+Subject: [PATCH 14/14] runtime: let a visionOS host app move the game's window
+ between scenes
+
+In an immersive space the host now dismisses its own window scene once
+the game is on the virtual screen: on visionOS a game controller's input
+goes to the system while the user looks at one of the app's windows, and
+the black window SDL draws into sat about a metre away. SDL never moves
+its UIWindow to another scene, so when the space closes and the host
+opens a new window scene, the host has to move the game's window into
+it. rt_host_game_window hands the host SDL's UIWindow for that; it is
+cached when the game's main window is set, so any thread may ask.
+
+The pump now logs SDL's background and foreground app events on
+visionOS, which it ignored silently before, and does nothing else with
+them: the moments around the space opening or closing can make the app
+briefly inactive, and the game must not pause, minimise or go quiet for
+that. Focus is the only thing the game hears of it, and the host's input
+claim already holds focus through it.
+---
+ runtime/host.h   | 13 +++++++++++++
+ runtime/input.c  |  7 +++++++
+ runtime/window.c | 19 +++++++++++++++++++
+ 3 files changed, 39 insertions(+)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index b30552f..86d02ba 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -63,4 +63,17 @@ void rt_host_mouse_button(int button, int down);
+ void rt_host_mouse_wheel(float dy);
+ int rt_host_cursor(float *u, float *v);
+ 
++/*
++ * The game window's UIWindow (SDL's), borrowed, or NULL before the game's
++ * window exists. In an immersive space the host dismisses its own window
++ * scene, so no window sits under the user's gaze: on visionOS a game
++ * controller's input goes to the system while the user looks at one of the
++ * app's windows. SDL never moves its UIWindow to another scene, so when the
++ * space closes and the host opens a new window scene, the host moves this
++ * window into it (UIWindow.windowScene, then makeKeyAndVisible) on the main
++ * thread. Any thread may ask for the pointer; only the main thread may use
++ * it.
++ */
++void *rt_host_game_window(void);
++
+ #endif
+diff --git a/runtime/input.c b/runtime/input.c
+index 3a29df4..7f8c357 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -529,6 +529,8 @@ static SDL_Cursor *s_cursors[SDL_SYSTEM_CURSOR_COUNT];
+ 
+ static int s_host_claim, s_host_ever, s_host_regain, s_host_seed;
+ static uint32_t s_host_win;
++/* SDL's UIWindow for the game's window, for the host (rt_host_game_window). */
++static void *s_host_uiwindow;
+ /* Only the pump touches this: whether SDL's window was last asked for
+    relative mode, so a claim that skipped the call can be squared after. */
+ static int s_sdl_rel;
+@@ -729,6 +731,9 @@ void rt_input_main_window(uint32_t hwnd, void *sdl)
+     /* Cached for the host's threads, which push events for this window and
+        must not call into SDL's window list to find its id. */
+     __atomic_store_n(&s_host_win, sdl ? (uint32_t)SDL_GetWindowID(sdl) : 0u, __ATOMIC_RELEASE);
++    void *uiw = sdl ? SDL_GetPointerProperty(SDL_GetWindowProperties(sdl), SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL)
++                    : NULL;
++    __atomic_store_n(&s_host_uiwindow, uiw, __ATOMIC_RELEASE);
+ #endif
+     if (start) {
+         const char *dir = rt_settings_dir();
+@@ -1144,6 +1149,8 @@ void rt_host_mouse_wheel(float dy)
+     SDL_PushEvent(&e);
+ }
+ 
++void *rt_host_game_window(void) { return __atomic_load_n(&s_host_uiwindow, __ATOMIC_ACQUIRE); }
++
+ int rt_host_cursor(float *u, float *v)
+ {
+     pthread_mutex_lock(&s_mu);
+diff --git a/runtime/window.c b/runtime/window.c
+index df28da6..9299c40 100644
+--- a/runtime/window.c
++++ b/runtime/window.c
+@@ -691,6 +691,25 @@ static void pump(uint64_t now)
+                 rt_input_post(w->hwnd, 0x0006, (uint32_t)on, 0);
+             }
+             break;
++#if TARGET_OS_VISION
++        /* The app's lifecycle, logged and nothing more. In an immersive
++           space the host dismisses its window scene while the game plays
++           on, and the moments around the space opening or closing can make
++           the app briefly inactive; the game must not pause, minimise or
++           lose its sound for that. Focus is the only thing the game hears
++           of it, and the host's input claim holds focus through it. */
++        case SDL_EVENT_WILL_ENTER_BACKGROUND:
++        case SDL_EVENT_DID_ENTER_BACKGROUND:
++        case SDL_EVENT_WILL_ENTER_FOREGROUND:
++        case SDL_EVENT_DID_ENTER_FOREGROUND:
++            rt_log("app event %s%s",
++                   e.type == SDL_EVENT_WILL_ENTER_BACKGROUND   ? "will enter background"
++                   : e.type == SDL_EVENT_DID_ENTER_BACKGROUND  ? "entered background"
++                   : e.type == SDL_EVENT_WILL_ENTER_FOREGROUND ? "will enter foreground"
++                                                               : "entered foreground",
++                   rt_input_host_claimed() ? ", host holds input" : "");
++            break;
++#endif
+         case SDL_EVENT_WINDOW_SHOWN:
+             if (w) rt_input_post(w->hwnd, 0x0005, 0, ((uint32_t)w->h << 16) | (uint32_t)(w->w & 0xFFFF));
+             break;
+-- 
+2.54.0 (Apple Git-157)
+

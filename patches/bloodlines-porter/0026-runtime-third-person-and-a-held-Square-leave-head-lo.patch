@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 00:09:37 -0600
+Subject: [PATCH] runtime: third person and a held Square leave head look for
+ the stick and the theater screen
+
+Head look turning a camera behind the player, or the stick turning a full-field world, is disorienting. The pump now reads the game's own camera mode, the third-person byte that CInput's thirdperson, firstperson and togglecamera methods set at client+0x2EA6C8+0xF0, behind a vtable check, and Square held past the hold time switches head look off and on by hand. Either one pauses head look like a menu does, gives the right stick back as mouse look, and sends the frame to the theater plane instead of full view. The hold is remappable with hold.btn=headlook in controls.txt.
+---
+ runtime/input.c          | 38 +++++++++++++++++--
+ runtime/input.h          | 11 ++++++
+ runtime/input_selftest.c | 79 ++++++++++++++++++++++++++++++++++++++--
+ runtime/pad.c            | 19 +++++++---
+ runtime/pad.h            |  7 ++--
+ 5 files changed, 139 insertions(+), 15 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 2d2d1b4..9074731 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -757,6 +757,12 @@ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now
+             s->head_recentres++;
+             continue;
+         }
++        if (ev[i].user.code == RT_PAD_ACT_HEADLOOK) {
++            s->head_off = !s->head_off;
++            s->head_toggles++;
++            rt_log("head look switched %s by hand (%u this run)", s->head_off ? "off: stick look, theater screen" : "on", s->head_toggles);
++            continue;
++        }
+         n += sel_act(s, ev[i].user.code, now_ns, go + n, RT_PAD_EVENTS + 2 - n);
+     }
+     return rt_input_pad_apply(s, go, n, dx, dy, mode, r, density, out, cap);
+@@ -1268,6 +1274,29 @@ static void dialogue_update(void)
+     if (on != was) rt_log("dialogue %s", on ? "open" : "closed");
+ }
+ 
++/* The client's CInput (the game's input object, a static at
++   client+0x2EA6C8) keeps its camera mode in the byte at +0xF0: its
++   thirdperson and firstperson methods (vtable +0x88, +0x8C) set it to 1
++   and 0 and togglecamera (+0x90) flips it, so it is the game's own
++   answer whoever switched the camera. The vtable check keeps a read
++   before the object is built from counting. */
++#define CINPUT_RVA 0x2EA6C8u
++#define CINPUT_VTABLE_RVA 0x224D4Cu
++#define CINPUT_THIRDPERSON 0xF0u
++
++static void third_person_update(void)
++{
++    uint32_t in = rt_hook_va("client", CINPUT_RVA);
++    int on = in && panel32(in) == rt_hook_va("client", CINPUT_VTABLE_RVA) && panel8(in + CINPUT_THIRDPERSON) != 0;
++    pthread_mutex_lock(&s_mu);
++    int was = S.third_person;
++    S.third_person = on;
++    pthread_mutex_unlock(&s_mu);
++    if (on != was) rt_log("camera %s", on ? "third person: stick look, theater screen" : "first person");
++}
++
++int rt_input_head_allowed(const rt_input_state *s) { return !s->head_off && !s->third_person; }
++
+ /* The engine's view angles: one QAngle (pitch, yaw, roll, degrees) that
+    IVEngineClient's GetViewAngles and SetViewAngles (VEngineClient006,
+    vtable +0xc4 and +0xc8) copy out of and into, with no other state and
+@@ -1317,7 +1346,7 @@ void rt_host_head_recentre(void) { __atomic_fetch_add(&s_head_host_recentres, 1,
+    gives a pose and the game's angles are there to write. */
+ static int head_wanted(void)
+ {
+-    return __atomic_load_n(&s_head_on, __ATOMIC_ACQUIRE) && rt_hook_va("engine", VIEW_ANGLES_RVA) != 0;
++    return __atomic_load_n(&s_head_on, __ATOMIC_ACQUIRE) && rt_hook_va("engine", VIEW_ANGLES_RVA) != 0 && rt_input_head_allowed(&S);
+ }
+ 
+ /* Once a game frame, at the first pump after a Present: a pump can also
+@@ -1344,7 +1373,9 @@ static void head_pump(void)
+         return;
+     }
+     s_head_present = presents;
+-    in.play = S.focus && rt_input_pad_mode(&S) == RT_PAD_PLAY;
++    /* Third person or head look off by hand pauses head look like a menu
++       does, so the frame also leaves full view for the theater plane. */
++    in.play = S.focus && rt_input_pad_mode(&S) == RT_PAD_PLAY && rt_input_head_allowed(&S);
+     in.turn = rt_pad_take_turn(&s_padv.pad);
+     uint32_t rc = S.head_recentres + __atomic_load_n(&s_head_host_recentres, __ATOMIC_ACQUIRE);
+     in.recentre = rc != s_head_seen_rc;
+@@ -1359,7 +1390,7 @@ static void head_pump(void)
+     metal_d3d9_immersive_view_play(in.play);
+     if (s_head.on != was_on) rt_log("head look %s", s_head.on ? "on: the head drives the view" : "off: the game's camera");
+     else if (s_head.on && s_head.playing != was_playing)
+-        rt_log("head look %s", s_head.playing ? "resumed" : "paused (menu, dialogue or sheet)");
++        rt_log("head look %s", s_head.playing ? "resumed" : "paused (menu, dialogue, sheet, third person or switched off)");
+     if (s_head.recentres != was_rc) rt_log("head look recentred (%u this run)", s_head.recentres);
+     if (s_head.absorbed != was_abs && s_head.absorbed <= 32)
+         rt_log("head look: the game turned the view itself, kept (%u this run)%s", s_head.absorbed,
+@@ -1387,6 +1418,7 @@ void rt_input_pump_end(void)
+     rt_toggles_apply();
+     if (!s_win) return;
+     dialogue_update();
++    third_person_update();
+     if (s_pad_started) pad_pump();
+ #if TARGET_OS_VISION
+     head_pump();
+diff --git a/runtime/input.h b/runtime/input.h
+index 0f915bb..3449b89 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -112,6 +112,14 @@ typedef struct {
+     /* Recentres asked for on the pad (Create plus Options), for head look
+        to compare with the count it has acted on. */
+     uint32_t head_recentres;
++    /* Head look switched off by hand (the pad's headlook hold, counted in
++       head_toggles), and the game's camera in third person (its own flag,
++       probed each pump). Either leaves the right stick as mouse look and
++       the frame on the theater plane: a camera behind the player turned
++       by the head, or a full field turned by the stick, is the
++       disorienting case. */
++    int head_off, third_person;
++    uint32_t head_toggles;
+ } rt_input_state;
+ 
+ enum { RT_CUR_UNSET = -2, RT_CUR_HIDDEN = -1 };
+@@ -148,6 +156,9 @@ int rt_input_translate(rt_input_state *s, const SDL_Event *e, const rt_present_r
+ int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int mode, const rt_present_rects *r,
+                        float density, rt_wmsg *out, int cap);
+ int rt_input_menu(const rt_input_state *s);
++/* Whether head look may drive the view: not switched off by hand and
++   not in third person. */
++int rt_input_head_allowed(const rt_input_state *s);
+ int rt_input_pad_mode(const rt_input_state *s);
+ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now_ns, const rt_present_rects *r, float density,
+                       rt_wmsg *out, int cap);
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index bdd0071..01ebdd3 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1244,9 +1244,10 @@ static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, in
+         press(id, (int)i, 1);
+         padpump(s, d, 10);
+         snprintf(name, sizeof name, "%s %s press", mn, k_padmap[i].name);
+-        /* Options in play has a hold (the view toggle), so it waits and
+-           is a tap on the release (pad_hold). */
+-        if (mode == RT_PAD_PLAY && k_padmap[i].btn == SDL_GAMEPAD_BUTTON_START) {
++        /* Options and Square in play have holds (the view toggle and the
++           head look switch), so they wait and are a tap on the release
++           (pad_hold, pad_headlook). */
++        if (mode == RT_PAD_PLAY && (k_padmap[i].btn == SDL_GAMEPAD_BUTTON_START || k_padmap[i].btn == SDL_GAMEPAD_BUTTON_WEST)) {
+             check(s_n == 0, name, "%s", dump());
+             press(id, (int)i, 0);
+             padpump(s, d, 10);
+@@ -2369,6 +2370,77 @@ static void pad_hold(void)
+           bad, p.hold[5].kind, p.hold[0].kind, p.hold[3].kind);
+ }
+ 
++/* Square held past RT_PAD_HOLD_NS switches head look off and on by hand
++   and sends the game nothing; a Square tap is still the inventory, on
++   the release. Head look is allowed only when it is on by hand and the
++   game's camera is not in third person. */
++static void pad_headlook(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    padpump(&s, &d, 10);
++    check(rt_input_head_allowed(&s), "head look is allowed at the start", "off %d third %d", s.head_off, s.third_person);
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_WEST, 1);
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 100);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_WEST, 0);
++    padpump(&s, &d, 10);
++    check(s_n >= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x49 && s_m[s_n - 1].msg == WM_KEYUP && s.head_toggles == 0,
++          "a Square tap is the inventory on the release and leaves head look alone", "toggles %u %s", s.head_toggles, dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_WEST, 1);
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 600);
++    for (int i = 0; i < 10; i++) padpump(&s, &d, 100);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_WEST, 0);
++    padpump(&s, &d, 10);
++    check(s_n == 0 && s.head_off && s.head_toggles == 1 && !rt_input_head_allowed(&s),
++          "Square held switches head look off once, sends the game nothing, and opens no inventory", "off %d toggles %u %s", s.head_off,
++          s.head_toggles, dump());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_WEST, 1);
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 600);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_WEST, 0);
++    padpump(&s, &d, 10);
++    check(!s.head_off && s.head_toggles == 2 && rt_input_head_allowed(&s), "Square held again switches head look back on",
++          "off %d toggles %u", s.head_off, s.head_toggles);
++    s.third_person = 1;
++    check(!rt_input_head_allowed(&s), "third person keeps head look off with the hand switch on", "off %d third %d", s.head_off,
++          s.third_person);
++    s.third_person = 0;
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++
++    const char *tmp = getenv("TMPDIR");
++    char dir[512], path[600];
++    snprintf(dir, sizeof dir, "%s/rt-pad-headlook-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++    if (!mkdtemp(dir)) {
++        check(0, "head look scratch folder", "%s", dir);
++        return;
++    }
++    snprintf(path, sizeof path, "%s/controls.txt", dir);
++    FILE *f = fopen(path, "w");
++    if (!f) {
++        check(0, "head look controls file", "%s", path);
++        return;
++    }
++    fputs("hold.west=none\nhold.rightstick=headlook\n", f);
++    fclose(f);
++    rt_pad p;
++    int bad = rt_pad_load(&p, dir);
++    unlink(path);
++    rmdir(dir);
++    check(bad == 0 && p.hold[2].kind == RT_PADT_NONE && p.hold[9].kind == RT_PADT_HEADLOOK,
++          "controls.txt moves the head look hold: hold.west=none, hold.rightstick=headlook", "bad %d west %d rightstick %d", bad,
++          p.hold[2].kind, p.hold[9].kind);
++}
++
+ /* The HUD's history view, flipped by every mouse1 key event, left on
+    after a punch in play: the pump turns it off while no dialogue is
+    active, and leaves a dialogue's own alone. */
+@@ -2776,6 +2848,7 @@ int rt_input_selftest(void)
+     pad_history();
+     pad_punch();
+     pad_hold();
++    pad_headlook();
+     pad_controls();
+     head_look();
+     head_look_drift();
+diff --git a/runtime/pad.c b/runtime/pad.c
+index f6ac537..35d6686 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -79,12 +79,17 @@ static const struct {
+ };
+ 
+ /* Hold targets in play: Options held is togglecamera, the game's own
+-   first and third person switch, which its config.cfg binds to z. */
++   first and third person switch, which its config.cfg binds to z.
++   Square held switches head look off and on by hand, for the stick
++   camera in first person; its tap is still the inventory, sent on the
++   release. Square because every pad has it, its tap opens a screen so a
++   release-time open costs nothing, and no game action wants it held. */
+ static const struct {
+     int idx;
+     const char *target;
+ } k_hold_default[] = {
+     {5, "z"},
++    {2, "headlook"},
+ };
+ 
+ /* No chord is on by default. The Sense pair has no Create (visionOS
+@@ -155,7 +160,8 @@ static int parse_answer(const char *v, rt_pad_tgt *t)
+                  {"answerdown", RT_PADT_ANSWER_DOWN},
+                  {"answerclear", RT_PADT_ANSWER_CLEAR},
+                  {"answer", RT_PADT_ANSWER},
+-                 {"recentre", RT_PADT_RECENTRE}};
++                 {"recentre", RT_PADT_RECENTRE},
++                 {"headlook", RT_PADT_HEADLOOK}};
+     for (size_t i = 0; i < sizeof k_act / sizeof *k_act; i++) {
+         size_t n = strlen(k_act[i].name);
+         if (strncmp(v, k_act[i].name, n) || (v[n] && v[n] != '/')) continue;
+@@ -197,7 +203,7 @@ static const char *target_name(const rt_pad_tgt *t, char *b, size_t n)
+ {
+     const rt_key *k;
+     if (t->kind >= RT_PADT_ANSWER_UP) {
+-        static const char *const k_act[] = {"answerup", "answerdown", "answer", "answerclear", "recentre"};
++        static const char *const k_act[] = {"answerup", "answerdown", "answer", "answerclear", "recentre", "headlook"};
+         const char *a = k_act[t->kind - RT_PADT_ANSWER_UP];
+         if (t->kind < RT_PADT_ANSWER || t->alt_kind == RT_PADT_NONE) return a;
+         char ab[16];
+@@ -243,7 +249,8 @@ static int button_named(const char *name, size_t n)
+     return -1;
+ }
+ 
+-/* hold.btn=target: a key or a click, sent as a tap; =none removes it. */
++/* hold.btn=target: a key or a click, sent as a tap, or headlook; =none
++   removes it. */
+ static int load_hold(rt_pad *p, const char *name, const char *v)
+ {
+     int idx = button_named(name, strlen(name));
+@@ -252,7 +259,7 @@ static int load_hold(rt_pad *p, const char *name, const char *v)
+         rt_log("pad controls: unknown button \"hold.%s\"", name);
+         return 1;
+     }
+-    if (parse_target(v, &tg) || (tg.kind != RT_PADT_NONE && tg.kind != RT_PADT_KEY && tg.kind != RT_PADT_MOUSE)) {
++    if (parse_target(v, &tg) || (tg.kind != RT_PADT_NONE && tg.kind != RT_PADT_KEY && tg.kind != RT_PADT_MOUSE && tg.kind != RT_PADT_HEADLOOK)) {
+         rt_log("pad controls: bad target \"%s\" for hold.%s, default kept", v, name);
+         return 1;
+     }
+@@ -272,7 +279,7 @@ static int load_chord(rt_pad *p, const char *spec, const char *v)
+         rt_log("pad controls: bad chord \"%s\"", spec);
+         return 1;
+     }
+-    if (parse_target(v, &tg) || (tg.kind >= RT_PADT_ANSWER_UP && tg.kind != RT_PADT_RECENTRE)) {
++    if (parse_target(v, &tg) || (tg.kind >= RT_PADT_ANSWER_UP && tg.kind < RT_PADT_RECENTRE)) {
+         rt_log("pad controls: bad target \"%s\" for chord %s, default kept", v, spec);
+         return 1;
+     }
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 76871bb..f00fa07 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -16,12 +16,13 @@ enum { RT_PAD_WHOLE, RT_PAD_HALF_L, RT_PAD_HALF_R, RT_PAD_PAIR };
+ /* The answer kinds are the dialogue selector's own actions, not guest
+    input: the pad hands them to input.c as SDL user events, and the
+    selector there decides what the game is sent. */
+-/* Recentre is the same kind of action: head look's, not the game's. */
++/* Recentre and the head look switch are the same kind of action: head
++   look's, not the game's. */
+ enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL, RT_PADT_ANSWER_UP, RT_PADT_ANSWER_DOWN, RT_PADT_ANSWER, RT_PADT_ANSWER_CLEAR,
+-       RT_PADT_RECENTRE };
++       RT_PADT_RECENTRE, RT_PADT_HEADLOOK };
+ 
+ /* The user event code of each action, and its button in data1. */
+-enum { RT_PAD_ACT_UP = 1, RT_PAD_ACT_DOWN, RT_PAD_ACT_CONFIRM, RT_PAD_ACT_CLEAR, RT_PAD_ACT_RECENTRE };
++enum { RT_PAD_ACT_UP = 1, RT_PAD_ACT_DOWN, RT_PAD_ACT_CONFIRM, RT_PAD_ACT_CLEAR, RT_PAD_ACT_RECENTRE, RT_PAD_ACT_HEADLOOK };
+ 
+ /* The triggers keep 14 and 15 so controls.txt and the m9 rows read as
+    before; the touchpad and Xbox share button come after them. The four

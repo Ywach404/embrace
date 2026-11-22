@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 00:02:26 -0600
+Subject: [PATCH] runtime: the trigger fires with return in play, so a release
+ is never lost
+
+Every trigger release in the headset log reached the game within 3 ms, yet automatic fire ran on after it. The client's mouse handler skips button changes while either of two state flags is up but records the new state, so a release landing then is never acted on. In play the trigger now sends return, which the game binds to +attack as well, and keys do not pass that handler. Menus keep mouse1, dialogue keeps confirm.
+---
+ runtime/input_selftest.c | 34 ++++++++++++++++++----------------
+ runtime/pad.c            |  9 +++++++--
+ 2 files changed, 25 insertions(+), 18 deletions(-)
+
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index aefbde4..bdd0071 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -861,11 +861,11 @@ static void pad_drive(void)
+     s_n = 0;
+     rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
+     padpump(&s, &d, 10);
+-    check(msgs_are(WM_LBUTTONDOWN, 1, 1), "right trigger 20000 gives mouse1 down", "%s", dump());
++    check(msgs_are(WM_KEYDOWN, 0x0D, 2) && s_m[1].msg == WM_CHAR, "right trigger 20000 gives return down", "%s", dump());
+     s_n = 0;
+     rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
+     padpump(&s, &d, 10);
+-    check(s_n == 1 && s_m[0].msg == WM_LBUTTONUP, "right trigger back to rest gives mouse1 up", "%s", dump());
++    check(s_n == 1 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x0D, "right trigger back to rest gives return up", "%s", dump());
+ 
+     s_n = 0;
+     s.x = 640;
+@@ -1026,7 +1026,7 @@ static void pad_halves(void)
+           "the right half joining the left releases nothing and takes no drive", "%s slots %d", dump(), d.nslots);
+     rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
+     padpump(&s, &d, 10);
+-    check(msgs_are(WM_LBUTTONDOWN, 1, 1), "R2 on the right half fires while the left half walks", "%s", dump());
++    check(msgs_are(WM_KEYDOWN, 0x0D, 2) && s_m[1].msg == WM_CHAR, "R2 on the right half fires while the left half walks", "%s", dump());
+     s_n = 0;
+     rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 1);
+     rt_pad_test_button(l, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1);
+@@ -1048,7 +1048,7 @@ static void pad_halves(void)
+     s_n = 0;
+     rt_pad_test_detach(l);
+     padpump(&s, &d, 10);
+-    check(has_msg(WM_KEYUP, 0x44) && !has_msg(WM_LBUTTONUP, 0) && s_n <= 2 && d.id == r && d.nslots == 1,
++    check(has_msg(WM_KEYUP, 0x44) && !has_msg(WM_KEYUP, 0x0D) && s_n <= 2 && d.id == r && d.nslots == 1,
+           "the left half leaving lifts only its walk key, R2 stays held", "%s id %u", dump(), (unsigned)d.id);
+     s_n = 0;
+     l = rt_pad_test_attach(SENSE_L);
+@@ -1060,7 +1060,7 @@ static void pad_halves(void)
+     s_n = 0;
+     rt_pad_test_detach(r);
+     padpump(&s, &d, 10);
+-    check(s_n == 1 && s_m[0].msg == WM_LBUTTONUP && d.id == l && d.gp, "the right half leaving lets go of R2 and hands the drive to the left",
++    check(s_n == 1 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x0D && d.id == l && d.gp, "the right half leaving lets go of R2 and hands the drive to the left",
+           "%s", dump());
+     s_n = 0;
+     rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTY, 0);
+@@ -1075,7 +1075,7 @@ static void pad_halves(void)
+     padpump(&s, &d, 10);
+     rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
+     padpump(&s, &d, 10);
+-    check(msgs_are(WM_LBUTTONDOWN, 1, 1) && d.id == r, "a lone right half fires", "%s", dump());
++    check(msgs_are(WM_KEYDOWN, 0x0D, 2) && s_m[1].msg == WM_CHAR && d.id == r, "a lone right half fires", "%s", dump());
+     s_n = 0;
+     l = rt_pad_test_attach(SENSE_L);
+     padpump(&s, &d, 10);
+@@ -1095,7 +1095,7 @@ static void pad_halves(void)
+     rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
+     rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 1);
+     padpump(&s, &d, 10);
+-    check(s_n == 3 && has_msg(WM_RBUTTONUP, 0) && has_msg(WM_LBUTTONUP, 0) && has_msg(WM_KEYDOWN, 0x20),
++    check(s_n == 3 && has_msg(WM_RBUTTONUP, 0) && has_msg(WM_KEYUP, 0x0D) && has_msg(WM_KEYDOWN, 0x20),
+           "the halves let go of both triggers and hold Cross", "%s", dump());
+     s_n = 0;
+     SDL_JoystickID lr = rt_pad_test_attach(SENSE_LR);
+@@ -1140,7 +1140,7 @@ static void pad_halves(void)
+     s_n = 0;
+     rt_pad_test_button(ds, SDL_GAMEPAD_BUTTON_EAST, 1);
+     padpump(&s, &d, 10);
+-    check(s_n == 2 && s_m[0].msg == WM_LBUTTONUP && s_m[1].msg == WM_KEYDOWN && s_m[1].wp == 0x45 && d.id == ds,
++    check(s_n == 2 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x0D && s_m[1].msg == WM_KEYDOWN && s_m[1].wp == 0x45 && d.id == ds,
+           "a fresh DualSense press takes the drive from the halves and lifts their R2", "%s", dump());
+     s_n = 0;
+     rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
+@@ -1156,7 +1156,7 @@ static void pad_halves(void)
+     s_n = 0;
+     rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 20000);
+     padpump(&s, &d, 10);
+-    check(msgs_are(WM_LBUTTONDOWN, 1, 1) && rt_pad_half(SDL_GetJoystickName(SDL_GetGamepadJoystick(d.gp))) == RT_PAD_HALF_L,
++    check(msgs_are(WM_KEYDOWN, 0x0D, 2) && s_m[1].msg == WM_CHAR && rt_pad_half(SDL_GetJoystickName(SDL_GetGamepadJoystick(d.gp))) == RT_PAD_HALF_L,
+           "the right half's press counts as the same pad and switches nothing", "%s", dump());
+ 
+     /* A pair arriving while the DualSense drives closes the halves and
+@@ -1225,7 +1225,7 @@ static const struct {
+     {SDL_GAMEPAD_BUTTON_TOUCHPAD, -1, "touchpad", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
+     {SDL_GAMEPAD_BUTTON_MISC1, -1, "share", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
+     {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", {WM_RBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONDOWN}, {2, 2, 2}},
+-    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", {WM_LBUTTONDOWN, WM_LBUTTONDOWN, 0}, {1, 1, 0}},
++    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", {WM_KEYDOWN, WM_LBUTTONDOWN, 0}, {0x0D, 1, 0}},
+ };
+ 
+ static void press(SDL_JoystickID id, int i, int down)
+@@ -2264,9 +2264,11 @@ static void pad_chords(void)
+     padpump(&s, &d, 10);
+ }
+ 
+-/* A punch with the sticks still is a plain click: no move rides with
+-   it. On the headset a swing needs something in reach, which is why
+-   punches at a distant view seemed lost. */
++/* The trigger in play is the return key (+attack), not a click: the
++   client's mouse handler can record a release without acting on it,
++   which left automatic weapons firing after the trigger was let go.
++   Each pull must be exactly one return down and one return up, no click
++   and no move, so the release takes the key path every time. */
+ static void pad_punch(void)
+ {
+     rt_input_state s;
+@@ -2282,14 +2284,14 @@ static void pad_punch(void)
+         s_n = 0;
+         rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 32767);
+         padpump(&s, &d, 10);
+-        ok &= s_n == 1 && s_m[0].msg == WM_LBUTTONDOWN && s_m[0].wp == MK_LBUTTON;
++        ok &= s_n == 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x0D && s_m[1].msg == WM_CHAR;
+         s_n = 0;
+         rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
+         padpump(&s, &d, 10);
+-        ok &= s_n == 1 && s_m[0].msg == WM_LBUTTONUP;
++        ok &= s_n == 1 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x0D;
+     }
+     check(s.relative && ok && s.x == x0 && s.y == y0,
+-          "five trigger pulls in play with the sticks still: each a plain press and release, no move", "relative %d x %d y %d %s", s.relative,
++          "five trigger pulls in play with the sticks still: each one return down and up, no click, no move", "relative %d x %d y %d %s", s.relative,
+           s.x, s.y, dump());
+     rt_pad_test_detach(id);
+ }
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 2c14377..f6ac537 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -29,9 +29,14 @@ static const int k_sdl[RT_PAD_NBTN] = {
+    vm_feed; r is +reload. Square takes the inventory, which moves reload
+    to the touchpad and the Xbox share button. The Sense pair has neither,
+    so the quest log goes on L3 where every pad has it, and walk (lshift)
+-   is left to controls.txt; crouch on R3 matters more for stealth. */
++   is left to controls.txt; crouch on R3 matters more for stealth.
++   RT in play is return, which the game also binds to +attack, not
++   mouse1: the client's mouse handler skips button changes while either
++   of two state flags is up but records them anyway, so a release that
++   lands then is lost and an automatic weapon empties its magazine. Keys
++   skip that handler. Menus keep mouse1 below. */
+ static const char *const k_default[RT_PAD_NBTN] = {"space", "e",      "i",    "f",    "c",    "escape", "wheeldown", "wheelup",
+-                                                   "l",     "lctrl",  "1",    "3",    "4",    "2",      "mouse2",    "mouse1",
++                                                   "l",     "lctrl",  "1",    "3",    "4",    "2",      "mouse2",    "return",
+                                                    "r",     "r",      "none", "none", "none", "none"};
+ 
+ /* Where menu and dialogue modes differ. In menus Cross clicks so the

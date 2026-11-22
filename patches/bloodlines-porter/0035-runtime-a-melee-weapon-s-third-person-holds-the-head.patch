@@ -1,0 +1,52 @@
+From 8e5dc8906aebfe7040369b63abf43046de0d7d9d Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:38:22 -0600
+Subject: [PATCH] runtime: a melee weapon's third person holds the head too
+
+A melee weapon goes to third person through CInput +0x94, which sets the byte at +0xF8 and never reads camera_prefs; the runtime only read +0xF0, so a sledgehammer swing left the head driving pitch behind the player. Third person is now either byte, as the game's own test at +0x74 has it.
+---
+ runtime/input.c | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index e046896..dfe079a 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1278,11 +1278,16 @@ static void dialogue_update(void)
+    client+0x2EA6C8) keeps its camera mode in the byte at +0xF0: its
+    thirdperson and firstperson methods (vtable +0x88, +0x8C) set it to 1
+    and 0 and togglecamera (+0x90) flips it, so it is the game's own
+-   answer whoever switched the camera. The vtable check keeps a read
+-   before the object is built from counting. */
++   answer whoever switched the camera. A melee weapon (camera_class
++   melee in its script) goes to third person through +0x94 instead, which
++   sets the byte at +0xF8 and never reads camera_prefs, so the camera is
++   third person when either is set, as the game's own test (+0x74) has
++   it. The vtable check keeps a read before the object is built from
++   counting. */
+ #define CINPUT_RVA 0x2EA6C8u
+ #define CINPUT_VTABLE_RVA 0x224D4Cu
+ #define CINPUT_THIRDPERSON 0xF0u
++#define CINPUT_MELEE_THIRD 0xF8u
+ 
+ #if TARGET_OS_VISION
+ int metal_d3d9_fullview_view_model(void);
+@@ -1291,12 +1296,10 @@ int metal_d3d9_fullview_view_model(void);
+ static void third_person_update(void)
+ {
+     uint32_t in = rt_hook_va("client", CINPUT_RVA);
+-    int on = in && panel32(in) == rt_hook_va("client", CINPUT_VTABLE_RVA) && panel8(in + CINPUT_THIRDPERSON) != 0;
++    int on = in && panel32(in) == rt_hook_va("client", CINPUT_VTABLE_RVA) &&
++             (panel8(in + CINPUT_THIRDPERSON) != 0 || panel8(in + CINPUT_MELEE_THIRD) != 0);
+ #if TARGET_OS_VISION
+-    /* The game also goes to third person by itself with a melee weapon or
+-       bare fists (camera_prefs), which never touches that byte. Full view
+-       launches with camera_prefs 0, so that no longer happens there. The
+-       renderer's guess (no view model in the frames) is opt in with
++    /* The renderer's guess (no view model in the frames) is opt in with
+        RT_FULLVIEW_VM_THIRD=1: a jump, a holstered weapon and a dialogue
+        draw none either, and a headset run (2026-11-20) flipped between
+        full view and the plane 62 times on it. */
+-- 
+2.54.0 (Apple Git-157)
+

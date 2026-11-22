@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 23:12:47 -0600
+Subject: [PATCH] runtime: log when the game takes a click, against when it was
+ posted
+
+A trigger released on an automatic weapon kept it firing through the
+magazine on the headset, while the log showed the release posted. The
+log had no times, so it could not tell a release the game heard late
+from one it heard and did not act on. Posted input now carries its
+time, and a taken click logs the gap since it was posted.
+---
+ runtime/input.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index ce55f2f..9a1ae71 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1083,7 +1083,8 @@ void rt_input_post(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp)
+ {
+     if (msg != WM_MOUSEMOVE) {
+         char b[24];
+-        rt_log("input %s wp 0x%X lp 0x%X", rt_input_msg_name(msg, b, sizeof b), wp, lp);
++        rt_log("input %s wp 0x%X lp 0x%X at %u ms", rt_input_msg_name(msg, b, sizeof b), wp, lp,
++               (uint32_t)(rt_now_ns() / 1000000u));
+     }
+     rt_msg_post(hwnd, msg, wp, lp);
+ }
+@@ -1482,6 +1483,14 @@ void rt_input_minimise(int on)
+ 
+ void rt_input_taken(const uint32_t m[7])
+ {
++    /* When the game takes a click, against when it was posted: a release
++       the game hears late shows here as a gap, one it hears on time but
++       does not act on shows none. */
++    if (m[1] == WM_LBUTTONDOWN || m[1] == WM_LBUTTONUP) {
++        uint32_t now = (uint32_t)(rt_now_ns() / 1000000u);
++        rt_log("input taken %s at %u ms, %u ms after it was posted", m[1] == WM_LBUTTONDOWN ? "WM_LBUTTONDOWN" : "WM_LBUTTONUP",
++               now, now - m[4]);
++    }
+     pthread_mutex_lock(&s_mu);
+     rt_input_take(&S, m[1], m[3]);
+     pthread_mutex_unlock(&s_mu);

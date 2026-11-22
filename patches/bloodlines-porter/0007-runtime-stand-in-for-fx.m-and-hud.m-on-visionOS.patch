@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:45:07 -0600
+Subject: [PATCH 07/10] runtime: stand in for fx.m and hud.m on visionOS
+
+fx.m and hud.m are AppKit only (NSWindow, NSScreen, CGDisplay modes, a
+Mac display link, MetalFX on a swizzled layer, an NSView HUD and the menu
+bar) and do not compile for visionOS. fx_vision.c and hud_vision.c define
+the same 27 functions with the answers the Mac build gives when fx is off,
+which is how metal mode already runs there.
+
+sources_visionos.txt is sources.txt with the two files swapped, for a
+visionOS build to read. sources.txt and the Mac build are unchanged, and
+both new files are empty outside TARGET_OS_VISION.
+---
+ runtime/fx_vision.c          | 110 +++++++++++++++++++++++++++++++++++
+ runtime/hud_vision.c         |  37 ++++++++++++
+ runtime/sources_visionos.txt |  46 +++++++++++++++
+ 3 files changed, 193 insertions(+)
+ create mode 100644 runtime/fx_vision.c
+ create mode 100644 runtime/hud_vision.c
+ create mode 100644 runtime/sources_visionos.txt
+
+diff --git a/runtime/fx_vision.c b/runtime/fx_vision.c
+new file mode 100644
+index 0000000..1c30ccb
+--- /dev/null
++++ b/runtime/fx_vision.c
+@@ -0,0 +1,110 @@
++/*
++ * visionOS stand-in for fx.m. fx.m is AppKit through and through (NSWindow,
++ * NSScreen, CGDisplay modes, a CAMetalDisplayLink on a Mac screen, MetalFX
++ * on a layer it swizzles process wide), and none of it exists on visionOS.
++ * The metal mode turns that whole path off on the Mac as well (patch
++ * 0004), so every entry here answers the way the Mac build does with fx
++ * off: nothing probed, nothing attached, nothing paced by a display link.
++ * Pacing on the headset belongs to the system compositor.
++ */
++#include <TargetConditionals.h>
++
++#if TARGET_OS_VISION
++
++#include "recomp_types.h"
++#include "rt.h"
++#include "fx.h"
++
++int rt_fx_probe(void) { return 0; }
++
++void rt_fx_support(int *spatial, int *temporal, int *interp, int *m4)
++{
++    *spatial = 0;
++    *temporal = 0;
++    *interp = 0;
++    *m4 = 0;
++}
++
++int rt_fx_attach(void *sdl_window)
++{
++    (void)sdl_window;
++    return -1;
++}
++
++int rt_gfx_layer_fit(void *sdl_window)
++{
++    (void)sdl_window;
++    return 0;
++}
++
++void rt_gfx_layer_counts(void *sdl_window, int *layers, int *unfit)
++{
++    (void)sdl_window;
++    *layers = 0;
++    *unfit = 0;
++}
++
++void rt_gfx_pace_reset(void) {}
++
++void rt_gfx_pace_report(void) {}
++
++void rt_gfx_present_trace_dump(void) {}
++
++void rt_gfx_link_report(void) {}
++
++int rt_gfx_link_paced(void) { return 0; }
++
++/* 0 leaves the game's presentation interval as it asked, which is what the
++   Mac metal runs get with RT_PACE=0. */
++int rt_gfx_vsync(void *sdl_window)
++{
++    (void)sdl_window;
++    return 0;
++}
++
++void rt_gfx_window_gone(void) {}
++
++void rt_gfx_vsync_set(int on) { (void)on; }
++
++void rt_gfx_cfg_counts(uint64_t *n, uint64_t *linked)
++{
++    *n = 0;
++    *linked = 0;
++}
++
++uint64_t rt_gfx_link_starved(void) { return 0; }
++
++int rt_gfx_link_layer(void) { return 0; }
++
++int rt_fx_frame(int pw, int ph, const int r[4])
++{
++    (void)pw;
++    (void)ph;
++    (void)r;
++    return 0;
++}
++
++int rt_fx_wanted(void) { return 0; }
++
++int rt_fx_mode_on(void) { return 0; }
++
++void rt_fx_drain(void) {}
++
++void rt_fx_report(void) {}
++
++/* -1 is fx.m's own answer when no spatial scaler is supported. */
++int rt_fx_upscale_sync(const void *bgra, uint32_t w, uint32_t h, uint32_t pitch, uint32_t ow, uint32_t oh, void *out,
++                       double *gpu_ms)
++{
++    (void)bgra;
++    (void)w;
++    (void)h;
++    (void)pitch;
++    (void)ow;
++    (void)oh;
++    (void)out;
++    if (gpu_ms) *gpu_ms = 0;
++    return -1;
++}
++
++#endif
+diff --git a/runtime/hud_vision.c b/runtime/hud_vision.c
+new file mode 100644
+index 0000000..3fae4dc
+--- /dev/null
++++ b/runtime/hud_vision.c
+@@ -0,0 +1,37 @@
++/*
++ * visionOS stand-in for hud.m. hud.m draws its overlay into an NSView and
++ * adds its items to the Mac menu bar, neither of which exists on visionOS.
++ * Without them there is no HUD and no menu: the HUD toggles stay where
++ * they are and draw nothing, and the two render-to-file self checks report
++ * failure rather than pass without having drawn.
++ */
++#include <TargetConditionals.h>
++
++#if TARGET_OS_VISION
++
++#include "recomp_types.h"
++#include "rt.h"
++#include "toggles.h"
++
++void rt_hud_init(void) {}
++
++void rt_hud_menu_add(void *menu) { (void)menu; }
++
++int rt_hud_dump_menu(const char *tsv)
++{
++    (void)tsv;
++    return -1;
++}
++
++int rt_hud_live_lines(void) { return 0; }
++
++int rt_hud_render(int state, const rt_hud_info *info, const char *png, const char *tsv)
++{
++    (void)state;
++    (void)info;
++    (void)png;
++    (void)tsv;
++    return -1;
++}
++
++#endif
+diff --git a/runtime/sources_visionos.txt b/runtime/sources_visionos.txt
+new file mode 100644
+index 0000000..cc53eff
+--- /dev/null
++++ b/runtime/sources_visionos.txt
+@@ -0,0 +1,46 @@
++runtime/rt.c
++runtime/heap.c
++runtime/thread.c
++runtime/trace.c
++runtime/vfs.c
++runtime/window.c
++runtime/input.c
++runtime/input_script.c
++runtime/pad.c
++runtime/input_selftest.c
++runtime/devmenu.c
++runtime/toggles.c
++runtime/aspect.c
++runtime/g2b_engine.c
++runtime/hud_vision.c
++runtime/fx_vision.c
++runtime/m9_selftest.c
++runtime/up.c
++runtime/up_switches.c
++runtime/hook.c
++runtime/up_fixes.c
++runtime/up_plugins.c
++runtime/up_plugins_model.c
++runtime/up_plugins_console.c
++runtime/up_plugins_tweaks.c
++runtime/up_plugins_container.c
++runtime/py21_selftest.c
++shims/index.c
++shims/kernel32.c
++shims/kernel32_file.c
++shims/kernel32_sync.c
++shims/kernel32_module.c
++shims/advapi32.c
++shims/user32.c
++shims/winmm.c
++shims/audio_sdl.c
++shims/dsound.c
++shims/mss32_asi.c
++shims/bink.c
++shims/fail.c
++shims/tier0.c
++shims/misc.c
++shims/d3d9_null.c
++shims/d3d9_bridge.c
++shims/d3d9_selftest.c
++shims/dinput8_null.c

@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 15:23:20 -0600
+Subject: [PATCH 5/5] bridge: give the metal backend a shader cache under the
+ overlay
+
+The metal backend translates D3D9 shaders through DXVK's front end and
+SPIRV-Cross at runtime and keeps the result on disk, keyed by bytecode
+hash. dxvk mode already makes cache/dxvk and cache/mesa under the
+overlay; metal mode now makes cache/metal and passes its path in
+RT_METAL_CACHE_DIR, unless the caller set one, so the backend needs no
+new export.
+---
+ shims/d3d9_bridge.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index ddb6009..f6c2c05 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -2541,6 +2541,16 @@ static int metal_init(const char *overlay)
+         for (int i = 0; i < 16 && zero; i++) zero = !id[i];
+         if (zero) rt_log("gfx deleted %s (null device ID): %s", path, unlink(path) ? "failed" : "ok");
+     }
++    /* The backend keeps its translated shaders here, beside the dxvk and
++       mesa caches dxvk mode makes. It is passed in the environment and
++       read when the device is created, so the backend's exports stay
++       the two the bridge already resolves. */
++    snprintf(path, sizeof path, "%s/cache", overlay);
++    mkdir(path, 0755);
++    snprintf(path, sizeof path, "%s/cache/metal", overlay);
++    mkdir(path, 0755);
++    setenv("RT_METAL_CACHE_DIR", path, 0);
++    rt_log("gfx metal shader cache %s", getenv("RT_METAL_CACHE_DIR"));
+     s_lib = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+     if (!s_lib) {
+         rt_log("gfx missing %s: %s; --gfx null runs without it", lib, dlerror());
+-- 
+2.54.0 (Apple Git-157)
+

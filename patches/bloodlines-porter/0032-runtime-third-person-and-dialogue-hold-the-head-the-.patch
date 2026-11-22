@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:14:06 -0600
+Subject: [PATCH] runtime: third person and dialogue hold the head, the stick
+ looks
+
+Third person and a dialogue no longer let the head drive the camera.
+The head writes nothing, the right stick looks with yaw and pitch in
+third person, a dialogue's close up is the game's own, and the frame
+is drawn for a reference fixed when the hold began, so in full view the
+world holds still in the room. A head driven camera there was
+disorientating on headset runs (2026-11-20 and 2026-11-21).
+
+Looking up and down read as inverted in dialogue: the game re-aims the
+view every frame there (32 turns of its own in one run), and only yaw
+was compared, so the frame was recorded with the head's pitch over a
+pitch the game had set. The eyes then undid a tilt the image never had
+and the world moved with the head. A pitch the game set since the last
+write is now kept and recorded for that frame.
+---
+ runtime/headlook.c       |  58 +++++++++++++++-------
+ runtime/headlook.h       |  21 +++++---
+ runtime/input.c          |  54 ++++++++++++---------
+ runtime/input.h          |   8 +--
+ runtime/input_selftest.c | 102 +++++++++++++++++++++++++++------------
+ 5 files changed, 159 insertions(+), 84 deletions(-)
+
+diff --git a/runtime/headlook.c b/runtime/headlook.c
+index cd02742..922734f 100644
+--- a/runtime/headlook.c
++++ b/runtime/headlook.c
+@@ -45,12 +45,49 @@ int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3])
+         h->body = in->game[1];
+         h->wrote = 0;
+     }
++    if (in->hold) {
++        /* The head drives nothing: the game's angles stand, turned by the
++           stick or by the game. On the way in the head's facing becomes
++           the reference, and the frames are drawn for it and for the
++           pitch the game held then, so the world holds still in the room
++           while the head looks across it. The body follows the game's yaw
++           and written[] what the game holds, so on the way back the head's
++           offset from the reference turns the view and nothing jumps. */
++        if (!h->holding) {
++            h->ref = in->head_yaw;
++            h->hold_pitch = -in->game[0];
++            h->holds++;
++        }
++        h->holding = 1;
++        h->body = rt_headlook_wrap(in->game[1]);
++        h->written[0] = in->game[0];
++        h->written[1] = in->game[1];
++        h->wrote = 1;
++        h->pose_valid = 1;
++        h->pose_yaw = (float)h->ref;
++        h->pose_pitch = h->hold_pitch;
++        return 0;
++    }
++    h->holding = 0;
++    /* What the game did to the angles since the last write: a turn of the
++       yaw is taken into the body, so it stands and the head turns on from
++       there. A change of pitch means the game steered it (a scripted look,
++       a recoil): the frame is drawn with the game's pitch, so that is the
++       one written and recorded this frame. Recording the head's pitch over
++       a pitch the game set made the eyes undo a tilt the image never had,
++       and looking up moved the world up with the head (2026-11-21 headset
++       run, a dialogue re-aiming each frame). */
++    int pitch_game = 0;
+     if (h->wrote) {
+         double d = rt_headlook_diff(h->written[1], in->game[1]);
+         if (fabs(d) > RT_HEADLOOK_EPS_DEG) {
+             h->body += d;
+             h->absorbed++;
+         }
++        if (fabs(in->game[0] - h->written[0]) > RT_HEADLOOK_EPS_DEG) {
++            pitch_game = 1;
++            h->pitch_taken++;
++        }
+     }
+     h->body = rt_headlook_wrap(h->body + in->turn);
+     double head = rt_headlook_diff(h->ref, in->head_yaw);
+@@ -62,24 +99,9 @@ int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3])
+         head = 0;
+         h->recentres++;
+     }
+-    if (in->pitch_only) {
+-        /* On the way in the body takes the view's heading and the head's
+-           facing then becomes the reference, so the view's yaw holds where
+-           it was. After that the head's yaw adds nothing to the view, and
+-           the reference stays put: the frame is drawn for it, so in full
+-           view the world holds still in the room while the head looks
+-           across it. On the way back to full head look the head's offset
+-           from the reference turns the view, which keeps the world still. */
+-        if (!h->pitch_only) {
+-            h->body = rt_headlook_wrap(h->body + head);
+-            h->ref = in->head_yaw;
+-        }
+-        head = 0;
+-        h->pitch_only_steps++;
+-    }
+-    h->pitch_only = in->pitch_only != 0;
+     float yaw = (float)rt_headlook_wrap(h->body + head);
+-    float pitch = -in->head_pitch;
++    /* ARKit's pitch is up positive, the game's down positive. */
++    float pitch = pitch_game ? in->game[0] : -in->head_pitch;
+     if (pitch > h->pitch_down || pitch < -h->pitch_up) {
+         pitch = pitch > h->pitch_down ? h->pitch_down : -h->pitch_up;
+         h->clamps++;
+@@ -95,7 +117,7 @@ int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3])
+        written: past a limit the image stays at the limit, and the late
+        rotation then shows it there rather than where the head is. */
+     h->pose_valid = 1;
+-    h->pose_yaw = h->pitch_only ? h->ref : in->head_yaw;
++    h->pose_yaw = in->head_yaw;
+     h->pose_pitch = -pitch;
+     return 1;
+ }
+diff --git a/runtime/headlook.h b/runtime/headlook.h
+index c38e9cd..581a6c5 100644
+--- a/runtime/headlook.h
++++ b/runtime/headlook.h
+@@ -46,11 +46,14 @@ typedef struct {
+     int host_on;           /* the host gives a head pose: stereo is shown and the head is tracked */
+     float head_yaw, head_pitch;
+     int play;              /* in play: no menu, dialogue or character sheet */
+-    /* Third person: the head drives pitch only. The camera behind the
+-       player swings with every head turn otherwise, which moved the whole
+-       level on a headset run (2026-11-20); yaw is the body's alone, turned
+-       by the stick. */
+-    int pitch_only;
++    /* Held: the head drives nothing and the game's camera is its own,
++       turned by the stick (third person) or by the game (a dialogue's
++       turn toward the speaker). The frame is drawn for a reference fixed
++       when the hold began, so in full view the world holds still in the
++       room while the head looks across it. A head driven camera behind
++       the player or in a close up was disorientating on headset runs
++       (2026-11-20 and 2026-11-21). */
++    int hold;
+     double turn;           /* body turn from the stick since the last step, degrees, positive left */
+     int recentre;          /* a recentre was asked since the last step */
+     int have_angles;       /* the game's angles were read into game[] */
+@@ -65,7 +68,8 @@ typedef struct {
+        the anchoring; the host switching off ends it. playing: the last
+        step was in play. */
+     int on, anchored, playing;
+-    int pitch_only;        /* the last step drove pitch only */
++    int holding;           /* the last step held */
++    float hold_pitch;      /* the pitch (ARKit, up positive) the hold's frames are drawn for */
+     double body, ref;      /* body yaw (game degrees) and the head yaw at which the head adds nothing */
+     int wrote;             /* written[] holds what was last written */
+     float written[2];      /* pitch, yaw */
+@@ -73,12 +77,13 @@ typedef struct {
+        record (immersive.h): valid, yaw, pitch up. */
+     int pose_valid;
+     float pose_yaw, pose_pitch;
+-    uint32_t starts, absorbed, recentres, writes, pauses, clamps, pitch_only_steps;
++    uint32_t starts, absorbed, recentres, writes, pauses, clamps, holds, pitch_taken;
+ } rt_headlook;
+ 
+ void rt_headlook_init(rt_headlook *h);
+ /* One game frame. Returns 1 with out[] (pitch, yaw, roll) to be written
+-   as the game's view angles, else 0 and nothing to write. */
++   as the game's view angles, else 0 and nothing to write. A hold returns
++   0 too, with the pose still valid. */
+ int rt_headlook_step(rt_headlook *h, const rt_headlook_in *in, float out[3]);
+ /* b - a, wrapped into -180..180. */
+ double rt_headlook_diff(double a, double b);
+diff --git a/runtime/input.c b/runtime/input.c
+index 627cbef..e046896 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1311,28 +1311,32 @@ static void third_person_update(void)
+     int was = S.third_person;
+     S.third_person = on;
+     pthread_mutex_unlock(&s_mu);
+-    if (on != was) rt_log("camera %s", on ? "third person: head pitch, stick turn, full view" : "first person");
++    if (on != was) rt_log("camera %s", on ? "third person: stick look, full view, the world held still" : "first person");
+ }
+ 
+ int rt_input_head_allowed(const rt_input_state *s) { return !s->head_off && !s->third_person; }
+ 
+-/* Third person keeps the head for pitch alone: the camera behind the
+-   player tilts with the head and the stick turns the body. In full view
+-   it stays a full view frame (2026-11-20 headset run: the theater plane
+-   for a held Start read as dropping to a window, while the game's own
+-   third person in a melee swing stayed in the world and felt right). */
++/* Third person and a dialogue hold the head: it writes nothing, the
++   right stick looks (yaw and pitch) in third person, and a dialogue's
++   camera is the game's, its turn toward the speaker included. The frame
++   is drawn for a reference fixed when the hold began, so in full view
++   the world holds still in the room. A head driven camera behind the
++   player, and in a close up, was disorientating on headset runs
++   (2026-11-20 and 2026-11-21); in full view both stay full view frames,
++   the world kept around the player. */
+ int rt_input_head_mode(const rt_input_state *s)
+ {
+     if (s->head_off) return RT_HEAD_NONE;
+-    return s->third_person ? RT_HEAD_PITCH : RT_HEAD_FULL;
++    if (s->third_person || rt_input_pad_mode(s) == RT_PAD_DIALOGUE) return RT_HEAD_HOLD;
++    return RT_HEAD_FULL;
+ }
+ 
+ /* Whether a frame is play for head look and full view. A dialogue counts
+    in full view: dropping to the plane took the world away for every line
+-   spoken (2026-11-20 headset run), and head look staying on there keeps
+-   the NPC still while the head turns, the game's turn toward the speaker
+-   kept as the body's. On the theater screen it pauses head look as
+-   before, so the game's close up holds. */
++   spoken (2026-11-20 headset run). Head look holds there
++   (rt_input_head_mode), so the close up is the game's and the world
++   stays still in the room. On the theater screen it pauses head look as
++   before. */
+ int rt_input_view_play(int focus, int pad_mode, int head_allowed, int full_view)
+ {
+     if (!focus || !head_allowed) return 0;
+@@ -1416,11 +1420,12 @@ void rt_host_hand_pose(int side, int state, const float grip[16], const float ai
+ int rt_host_aim_hand(void) { return __atomic_load_n(&s_padv.pad.aim_left, __ATOMIC_RELAXED) ? 1 : 0; }
+ 
+ /* Whether the pad's right stick should turn the body this poll: the host
+-   gives a pose and the game's angles are there to write. */
++   gives a pose, the game's angles are there to write, and the head drives
++   the view. Held (third person), the stick looks as it does flat. */
+ static int head_wanted(void)
+ {
+     return __atomic_load_n(&s_head_on, __ATOMIC_ACQUIRE) && rt_hook_va("engine", VIEW_ANGLES_RVA) != 0 &&
+-           rt_input_head_mode(&S) != RT_HEAD_NONE;
++           rt_input_head_mode(&S) == RT_HEAD_FULL;
+ }
+ 
+ /* Once a game frame, at the first pump after a Present: a pump can also
+@@ -1448,33 +1453,34 @@ static void head_pump(void)
+     }
+     s_head_present = presents;
+     /* Head look off by hand pauses it like a menu does, so the frame
+-       leaves full view for the theater plane. Third person keeps the head
+-       for pitch and stays in full view, as a dialogue does when full view
+-       is on (rt_input_view_play). */
++       leaves full view for the theater plane. Third person and a dialogue
++       hold it and stay full view frames (rt_input_view_play). */
+     int mode = rt_input_head_mode(&S);
+     in.play = rt_input_view_play(S.focus, rt_input_pad_mode(&S), mode != RT_HEAD_NONE, metal_d3d9_fullview_enabled());
+-    in.pitch_only = mode == RT_HEAD_PITCH;
+-    /* The frame is full view whenever the head drives it, wholly or for
+-       pitch alone in third person. */
+-    int view_play = rt_input_view_play(S.focus, rt_input_pad_mode(&S), mode != RT_HEAD_NONE, metal_d3d9_fullview_enabled());
++    in.hold = mode == RT_HEAD_HOLD;
++    int view_play = in.play;
+     in.turn = rt_pad_take_turn(&s_padv.pad);
+     uint32_t rc = S.head_recentres + __atomic_load_n(&s_head_host_recentres, __ATOMIC_ACQUIRE);
+     in.recentre = rc != s_head_seen_rc;
+     s_head_seen_rc = rc;
+     pthread_mutex_unlock(&s_mu);
+-    int was_on = s_head.on, was_playing = s_head.playing, was_pitch = s_head.pitch_only;
+-    uint32_t was_rc = s_head.recentres, was_abs = s_head.absorbed;
++    int was_on = s_head.on, was_playing = s_head.playing, was_hold = s_head.holding;
++    uint32_t was_rc = s_head.recentres, was_abs = s_head.absorbed, was_pt = s_head.pitch_taken;
+     rt_input_head_apply(&s_head, &in, rt_hook_va("engine", VIEW_ANGLES_RVA));
+     metal_d3d9_immersive_view_pose(s_head.pose_valid, s_head.pose_yaw, s_head.pose_pitch);
+     /* Whether the next frame is play, for full view: its field of view
+        (g2b_engine.c) and its replay into the eyes' views both follow it. */
+     metal_d3d9_immersive_view_play(view_play);
+-    if (s_head.on && s_head.playing && s_head.pitch_only != was_pitch)
+-        rt_log("head look %s", s_head.pitch_only ? "pitch only (third person): the stick turns" : "drives yaw and pitch again");
++    if (s_head.on && s_head.playing && s_head.holding != was_hold)
++        rt_log("head look %s", s_head.holding ? "holds (third person or dialogue): the game's camera, the world held still"
++                                              : "drives yaw and pitch again");
+     if (s_head.on != was_on) rt_log("head look %s", s_head.on ? "on: the head drives the view" : "off: the game's camera");
+     else if (s_head.on && s_head.playing != was_playing)
+         rt_log("head look %s", s_head.playing ? "resumed" : "paused (menu, dialogue, sheet, third person or switched off)");
+     if (s_head.recentres != was_rc) rt_log("head look recentred (%u this run)", s_head.recentres);
++    if (s_head.pitch_taken != was_pt && s_head.pitch_taken <= 32)
++        rt_log("head look: the game set the pitch itself, drawn and recorded with it (%u this run)%s", s_head.pitch_taken,
++               s_head.pitch_taken == 32 ? "; no more of these" : "");
+     if (s_head.absorbed != was_abs && s_head.absorbed <= 32)
+         rt_log("head look: the game turned the view itself, kept (%u this run)%s", s_head.absorbed,
+                s_head.absorbed == 32 ? "; no more of these" : "");
+diff --git a/runtime/input.h b/runtime/input.h
+index 037b438..8a98361 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -159,9 +159,11 @@ int rt_input_menu(const rt_input_state *s);
+ /* Whether head look may drive the view: not switched off by hand and
+    not in third person. */
+ int rt_input_head_allowed(const rt_input_state *s);
+-/* How much of the head drives the view: none (switched off by hand), full
+-   (yaw and pitch, first person), or pitch alone (third person). */
+-enum { RT_HEAD_NONE, RT_HEAD_FULL, RT_HEAD_PITCH };
++/* How the head drives the view: none (switched off by hand), full (yaw
++   and pitch, first person), or held (third person and dialogue: the
++   head writes nothing, the stick or the game turns the camera, and the
++   frame is drawn for a reference fixed when the hold began). */
++enum { RT_HEAD_NONE, RT_HEAD_FULL, RT_HEAD_HOLD };
+ int rt_input_head_mode(const rt_input_state *s);
+ /* Whether a frame is play for head look and full view: in focus, head
+    look allowed, and the pad in play, or in a dialogue when full view is
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index ae7e462..95f4a2a 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -2755,56 +2755,96 @@ static void head_look_write(void)
+     check(!w0 && !h.pose_valid, "no angle store, nothing written", "w %d", w0);
+ }
+ 
+-/* Third person: the head drives pitch alone and the stick turns. */
+-static void head_pitch_only(void)
++/* Third person and a dialogue hold the head: the head writes nothing,
++   the game's camera stands, and the frame is drawn for a reference fixed
++   when the hold began. First person keeps the head's pitch, sign and
++   all, unless the game set the pitch itself. */
++static void head_hold(void)
+ {
+     rt_headlook h;
+     rt_headlook_init(&h);
+     rt_headlook_in in = {.host_on = 1, .head_yaw = 0, .head_pitch = 0, .play = 1, .have_angles = 1};
+     float game[3] = {0, 30, 0};
+     hl_step(&h, &in, game);
++    in.head_pitch = 10;
++    hl_step(&h, &in, game);
++    check(fabsf(game[0] + 10.0f) < 1e-3f && fabsf(h.pose_pitch - 10.0f) < 1e-3f,
++          "first person: the head looking up looks the view up (the game's pitch is down positive) and the frame records it up",
++          "pitch %.3f pose %.3f", game[0], h.pose_pitch);
++    in.head_pitch = -20;
++    hl_step(&h, &in, game);
++    check(fabsf(game[0] - 20.0f) < 1e-3f && fabsf(h.pose_pitch + 20.0f) < 1e-3f,
++          "first person: the head looking down looks the view down", "pitch %.3f pose %.3f", game[0], h.pose_pitch);
+     in.head_yaw = 40;
+     hl_step(&h, &in, game);
+     check(near_deg(game[1], 70, 1e-3), "first person: a head turn turns the view", "yaw %.3f", game[1]);
+-    in.pitch_only = 1;
+-    in.head_yaw = 40;
++
++    /* The game steers the pitch (a scripted look): drawn and recorded with
++       the game's pitch, not the head's. */
++    game[0] = 5;
++    int w = hl_step(&h, &in, game);
++    check(w && fabsf(game[0] - 5.0f) < 1e-3f && fabsf(h.pose_pitch + 5.0f) < 1e-3f && h.pitch_taken == 1,
++          "first person: a pitch the game set is kept and the frame recorded with it", "pitch %.3f pose %.3f taken %u", game[0],
++          h.pose_pitch, h.pitch_taken);
+     hl_step(&h, &in, game);
+-    check(near_deg(game[1], 70, 1e-3), "into third person the view keeps its heading", "yaw %.3f", game[1]);
++    check(fabsf(game[0] - 20.0f) < 1e-3f && fabsf(h.pose_pitch + 20.0f) < 1e-3f,
++          "first person: once the game lets go the head has the pitch again", "pitch %.3f pose %.3f", game[0], h.pose_pitch);
++
++    /* Into third person: nothing written, the reference fixed. */
++    in.hold = 1;
++    float before[3] = {game[0], game[1], game[2]};
++    w = hl_step(&h, &in, game);
++    check(!w && game[0] == before[0] && game[1] == before[1], "held: the head writes nothing", "w %d pitch %.3f yaw %.3f", w,
++          game[0], game[1]);
++    check(h.pose_valid && h.pose_yaw == 40 && fabsf(h.pose_pitch + 20.0f) < 1e-3f,
++          "held: the frame is drawn for the head's facing and the game's pitch when the hold began", "pose %d %.3f %.3f",
++          h.pose_valid, h.pose_yaw, h.pose_pitch);
+     in.head_yaw = -20;
+-    in.head_pitch = -15;
+-    hl_step(&h, &in, game);
+-    check(near_deg(game[1], 70, 1e-3) && fabsf(game[0] - 15.0f) < 1e-3f, "third person: head yaw does nothing, head pitch tilts the camera",
+-          "pitch %.3f yaw %.3f", game[0], game[1]);
+-    check(h.pose_valid && h.pose_yaw == 40, "third person: the frame is drawn for the reference, so the world holds still",
+-          "pose %d %.3f", h.pose_valid, h.pose_yaw);
+-    in.turn = 10;
+-    hl_step(&h, &in, game);
+-    check(near_deg(game[1], 80, 1e-3), "third person: the stick turns the body", "yaw %.3f", game[1]);
++    in.head_pitch = 30;
++    w = hl_step(&h, &in, game);
++    check(!w && game[0] == before[0] && game[1] == before[1] && h.pose_yaw == 40 && fabsf(h.pose_pitch + 20.0f) < 1e-3f,
++          "held: head yaw and pitch move nothing, and the reference stays put", "w %d pose %.3f %.3f", w, h.pose_yaw,
++          h.pose_pitch);
++    /* The stick looks: the game turns its own angles. */
++    game[0] = -15;
++    game[1] = 100;
++    w = hl_step(&h, &in, game);
++    check(!w && game[0] == -15.0f && game[1] == 100.0f && h.pose_yaw == 40 && h.absorbed == 0,
++          "held: the stick's look stands and is not fought", "w %d pitch %.3f yaw %.3f absorbed %u", w, game[0], game[1],
++          h.absorbed);
++
++    /* Back to first person: the head's offset from the reference turns
++       the view, so the world holds still; the game's yaw stands. */
++    in.hold = 0;
+     in.head_yaw = 40;
++    in.head_pitch = 0;
+     hl_step(&h, &in, game);
+-    check(near_deg(game[1], 80, 1e-3) && h.pose_yaw == 40, "third person: the reference stays where third person began",
+-          "yaw %.3f pose %.3f", game[1], h.pose_yaw);
+-    in.head_yaw = -20;
+-    hl_step(&h, &in, game);
+-    in.pitch_only = 0;
+-    hl_step(&h, &in, game);
+-    check(near_deg(game[1], 20, 1e-3) && h.pose_yaw == -20,
+-          "back to first person the head's offset from the reference turns the view, so the world holds still",
+-          "yaw %.3f pose %.3f", game[1], h.pose_yaw);
+-    in.head_yaw = 0;
++    check(near_deg(game[1], 100, 1e-3) && h.pose_yaw == 40 && h.absorbed == 0 && h.pitch_taken == 1,
++          "back to first person the stick's heading stands, and nothing reads as a game turn", "yaw %.3f absorbed %u taken %u",
++          game[1], h.absorbed, h.pitch_taken);
++    in.head_yaw = 10;
+     hl_step(&h, &in, game);
+-    check(near_deg(game[1], 40, 1e-3), "and the head turns it again from there", "yaw %.3f", game[1]);
++    check(near_deg(game[1], 70, 1e-3), "and the head turns it again from there", "yaw %.3f", game[1]);
++    check(h.holds == 1, "one hold counted", "%u", h.holds);
+ 
+     rt_input_state s;
+     memset(&s, 0, sizeof s);
++    s.focus = 1;
+     check(rt_input_head_mode(&s) == RT_HEAD_FULL, "first person is full head look", "%d", rt_input_head_mode(&s));
+     s.third_person = 1;
+-    check(rt_input_head_mode(&s) == RT_HEAD_PITCH && !rt_input_head_allowed(&s),
+-          "third person is pitch only", "%d %d", rt_input_head_mode(&s), rt_input_head_allowed(&s));
+-    check(rt_input_view_play(1, RT_PAD_PLAY, rt_input_head_mode(&s) != RT_HEAD_NONE, 1),
+-          "third person stays a full view frame", "%d", rt_input_head_mode(&s));
++    check(rt_input_head_mode(&s) == RT_HEAD_HOLD && !rt_input_head_allowed(&s), "third person holds the head", "%d %d",
++          rt_input_head_mode(&s), rt_input_head_allowed(&s));
++    check(rt_input_view_play(1, RT_PAD_PLAY, rt_input_head_mode(&s) != RT_HEAD_NONE, 1), "third person stays a full view frame",
++          "%d", rt_input_head_mode(&s));
++    s.third_person = 0;
++    s.dialogue = 1;
++    check(rt_input_pad_mode(&s) == RT_PAD_DIALOGUE && rt_input_head_mode(&s) == RT_HEAD_HOLD, "a dialogue holds the head",
++          "pad %d head %d", rt_input_pad_mode(&s), rt_input_head_mode(&s));
++    check(rt_input_view_play(1, RT_PAD_DIALOGUE, 1, 1) && !rt_input_view_play(1, RT_PAD_DIALOGUE, 1, 0),
++          "a dialogue is a full view frame in full view and pauses on the theater screen", "");
++    s.dialogue = 0;
+     s.head_off = 1;
+-    check(rt_input_head_mode(&s) == RT_HEAD_NONE, "head look off by hand is off in third person too", "%d", rt_input_head_mode(&s));
++    check(rt_input_head_mode(&s) == RT_HEAD_NONE, "head look off by hand is off", "%d", rt_input_head_mode(&s));
+ }
+ 
+ /* The right stick under head look: it turns the body, smoothly or in
+@@ -2922,7 +2962,7 @@ int rt_input_selftest(void)
+     pad_headlook();
+     pad_controls();
+     head_look();
+-    head_pitch_only();
++    head_hold();
+     head_look_drift();
+     head_look_write();
+     pad_turn();

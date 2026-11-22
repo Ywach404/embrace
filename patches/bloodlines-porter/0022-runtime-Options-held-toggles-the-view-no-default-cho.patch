@@ -1,0 +1,673 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:42:13 -0600
+Subject: [PATCH] runtime: Options held toggles the view, no default chords,
+ and the history view off
+
+No chord is on by default. The PSVR2 Sense pair has no Create
+(visionOS gives the pair 32 elements and none is the one SDL maps to
+Create), so Create plus L1 and Create plus Options never fired there,
+and a held modifier delays the button it rides on. controls.txt can
+still add a chord with chord.mod+btn=target, and recentre is head
+look's, which is now off unless asked for.
+
+The view toggle moves to a hold. A button can carry a hold target in
+play: pressed, it waits; let go within half a second its own target
+goes out as a tap, held past that the hold target goes out once as a
+tap and the release sends nothing. Options holds togglecamera (z, the
+game's own bind) by default, as one button on the right Sense half or
+a DualSense, and a tap is still the game's menu, on the release.
+controls.txt takes hold.btn=target for a key or a click, and =none
+gives a button its press back. Each hold fired is logged with its
+count.
+
+The dialogue mark never showed after punching. The dialogue HUD's
+Key_Event (sub_10555260) flips its history view on every mouse1 key
+event (key 0xF1, through sub_10554B60), and the HUD hears every key, in
+play as well as in a dialogue. With no dialogue active the pump now
+turns that view off as the HUD's own setter does (the flag cleared, the
+relayout flag at +0x190 raised), and in a dialogue a step closes it
+before it marks. Single-line mode is the server's and is left alone. A
+refused step logs why, once a dialogue.
+
+Clicks stay plain presses and releases. Punches that seemed lost on the
+headset were swings at nothing in reach, not dropped clicks.
+
+The input self test covers five trigger pulls in play as plain clicks;
+an Options tap as the menu on release and a hold as one z and no menu,
+on the Sense pair and a DualSense, with hold.btn lines in controls.txt;
+no chord by default, with the chord and recentre tests adding theirs as
+controls.txt would; a history view left on outside a dialogue turned
+off; and a step closing a dialogue's history and marking.
+---
+ runtime/input.c          |  54 +++++++++-
+ runtime/input.h          |   5 +
+ runtime/input_selftest.c | 219 +++++++++++++++++++++++++++++++++++----
+ runtime/pad.c            |  82 +++++++++++----
+ runtime/pad.h            |  23 +++-
+ 5 files changed, 330 insertions(+), 53 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 16d7441..ce55f2f 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -344,6 +344,9 @@ int rt_input_translate(rt_input_state *s, const SDL_Event *e, const rt_present_r
+ #define DIALOGUE_TYPE 0x322Cu
+ #define DIALOGUE_FLAGS 0x323Cu
+ #define DIALOGUE_PICK_TIME 0x5A80u
++/* The HUD's own relayout flag: its setters for history (sub_10554BD0)
++   and single-line mode raise it when the value changes. */
++#define DIALOGUE_DIRTY 0x190u
+ 
+ /* Host time since the last pick before a confirm is sent. The game's
+    own guard is 0.5 s on its clock; a pick it makes is seen here a pump
+@@ -473,6 +476,30 @@ static int sel_ready(uint32_t va)
+     return va && panel8(va + DIALOGUE_ACTIVE) && !panel8(va + DIALOGUE_HISTORY) && !panel8(va + DIALOGUE_SINGLE);
+ }
+ 
++/* The history view off, as the HUD's own setter turns it off: the flag
++   cleared and the relayout raised. The HUD's Key_Event (sub_10555260)
++   flips the view on every mouse1 key event (key 0xF1, through
++   sub_10554B60), and the HUD hears every key in play as well as in a
++   dialogue, so the trigger's punches leave it on or off at random. A
++   dialogue that opens with it on shows the past lines over the answers,
++   and the selector would refuse every step there. */
++static void history_off(uint32_t va)
++{
++    *(uint8_t *)rt_host(va + DIALOGUE_HISTORY) = 0;
++    *(uint8_t *)rt_host(va + DIALOGUE_DIRTY) = 1;
++}
++
++/* Why a step was refused, once a dialogue, so a run log tells it. */
++static void sel_refused(rt_dialogue_sel *g, uint32_t va, int32_t count)
++{
++    if (g->refused) return;
++    g->refused = 1;
++    if (!va) rt_log("dialogue step refused: no dialogue panel");
++    else
++        rt_log("dialogue step refused: active %d history %d single %d count %d", panel8(va + DIALOGUE_ACTIVE),
++               panel8(va + DIALOGUE_HISTORY), panel8(va + DIALOGUE_SINGLE), (int)count);
++}
++
+ /* Anything that changes the answers other than our own edit ends the
+    highlight, so a confirm can never send the number of an answer the
+    player did not see marked. A slot rewritten to the same text it had
+@@ -544,7 +571,7 @@ static void sel_check(rt_dialogue_sel *g, uint32_t va, uint64_t now)
+    a dialogue: a keyboard player sees the game's own text. */
+ static void sel_auto(rt_dialogue_sel *g, uint32_t va, uint64_t now, int can_auto)
+ {
+-    if (!va || !panel8(va + DIALOGUE_ACTIVE)) g->skip_on = g->await_on = 0;
++    if (!va || !panel8(va + DIALOGUE_ACTIVE)) g->skip_on = g->await_on = g->refused = 0;
+     if (g->lit || !sel_ready(va)) return;
+     int32_t count = (int32_t)panel32(va + DIALOGUE_COUNT);
+     uint32_t key = set_key(va, count);
+@@ -570,6 +597,14 @@ static void sel_sync(rt_input_state *s, uint64_t now, int can_auto)
+         g->pick_bits = bits;
+     }
+     if (g->lit) sel_check(g, va, now);
++    /* With no dialogue the history view is nobody's: a punch left it on.
++       Off now, so the next dialogue opens on its answers. */
++    if (va && !panel8(va + DIALOGUE_ACTIVE) && panel8(va + DIALOGUE_HISTORY)) {
++        history_off(va);
++        if (++g->history_cleared <= 8)
++            rt_log("dialogue history view was on outside a dialogue (mouse1 flips it), turned off (%u this run)%s", g->history_cleared,
++                   g->history_cleared == 8 ? "; no more of these" : "");
++    }
+     sel_auto(g, va, now, can_auto);
+ }
+ 
+@@ -593,9 +628,20 @@ static int sel_act(rt_input_state *s, int act, uint64_t now, SDL_Event *out, int
+     switch (act) {
+     case RT_PAD_ACT_UP:
+     case RT_PAD_ACT_DOWN: {
+-        if (!sel_ready(va)) return 0;
+-        int32_t count = (int32_t)panel32(va + DIALOGUE_COUNT);
+-        if (count <= 0 || count > DIALOGUE_COUNT_MAX) return 0;
++        int32_t count = va ? (int32_t)panel32(va + DIALOGUE_COUNT) : 0;
++        /* A step is the player asking for the answers, so a history view
++           over them is closed first; single-line mode shows none, and is
++           the server's to end. */
++        if (va && panel8(va + DIALOGUE_ACTIVE) && panel8(va + DIALOGUE_HISTORY) && !panel8(va + DIALOGUE_SINGLE) && count > 0 &&
++            count <= DIALOGUE_COUNT_MAX) {
++            history_off(va);
++            g->history_closes++;
++            rt_log("dialogue history view closed for the answers (%u this run)", g->history_closes);
++        }
++        if (!sel_ready(va) || count <= 0 || count > DIALOGUE_COUNT_MAX) {
++            sel_refused(g, va, count);
++            return 0;
++        }
+         /* The first move marks the first answer whichever way it goes:
+            nothing is marked, so there is no "next" to go to. */
+         int idx = !g->lit ? 0 : g->idx + (act == RT_PAD_ACT_UP ? -1 : 1);
+diff --git a/runtime/input.h b/runtime/input.h
+index 9fa55a5..0f915bb 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -76,6 +76,11 @@ typedef struct {
+     int log_dirty;
+     uint64_t log_ns, reapply_log_ns;
+     uint32_t steps, confirms, resets, reapplies, held;
++    /* The HUD's history view turned off: by a step in a dialogue
++       (history_closes), or found on with no dialogue (history_cleared).
++       refused is set once a dialogue's refused step is logged. */
++    uint32_t history_closes, history_cleared;
++    int refused;
+     char saved[RT_DLG_TEXT], written[RT_DLG_TEXT];
+ } rt_dialogue_sel;
+ 
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 390e958..aefbde4 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -713,7 +713,8 @@ static void relative(void)
+     s.y = 512;
+     button(&s, 1, 1, 100.0f, 100.0f);
+     check(s.x == 640 && s.y == 512 && s_n == 1 && s_m[0].msg == WM_LBUTTONDOWN && s_m[0].lp == (640u | 512u << 16),
+-          "a button while relative keeps the guest cursor, not the host position", "%d,%d %s", s.x, s.y, dump());
++          "a button while relative keeps the guest cursor, not the host position", "%d,%d %s", s.x,
++          s.y, dump());
+     st(&s);
+     s.x = 640;
+     s.y = 512;
+@@ -777,6 +778,8 @@ static void waitmap(void)
+ 
+ static uint64_t s_pad_t;
+ 
++static uint32_t lp_of(int32_t x, int32_t y) { return (uint32_t)(uint16_t)x | (uint32_t)(uint16_t)y << 16; }
++
+ static void padpump(rt_input_state *s, rt_pad_dev *d, int ms)
+ {
+     s_pad_t += (uint64_t)ms * 1000000u;
+@@ -1241,21 +1244,20 @@ static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, in
+         press(id, (int)i, 1);
+         padpump(s, d, 10);
+         snprintf(name, sizeof name, "%s %s press", mn, k_padmap[i].name);
+-        if (!msg) {
++        /* Options in play has a hold (the view toggle), so it waits and
++           is a tap on the release (pad_hold). */
++        if (mode == RT_PAD_PLAY && k_padmap[i].btn == SDL_GAMEPAD_BUTTON_START) {
+             check(s_n == 0, name, "%s", dump());
+             press(id, (int)i, 0);
+             padpump(s, d, 10);
++            snprintf(name, sizeof name, "%s %s release", mn, k_padmap[i].name);
++            check(s_n >= 2 && s_m[0].msg == msg && s_m[0].wp == wp && s_m[s_n - 1].msg == msg + 1, name, "%s", dump());
+             continue;
+         }
+-        /* Create is the view toggle chord's modifier in play: alone it is
+-           a tap on release (pad_chords). */
+-        if (mode == RT_PAD_PLAY && k_padmap[i].btn == SDL_GAMEPAD_BUTTON_BACK) {
++        if (!msg) {
+             check(s_n == 0, name, "%s", dump());
+-            s_n = 0;
+             press(id, (int)i, 0);
+             padpump(s, d, 10);
+-            snprintf(name, sizeof name, "%s %s release taps it", mn, k_padmap[i].name);
+-            check(s_n == 2 && s_m[0].msg == msg && s_m[0].wp == wp && s_m[1].msg == msg + 1 && s_m[1].wp == wp, name, "%s", dump());
+             continue;
+         }
+         /* Escape also gives its WM_CHAR, so only the first message is held to. */
+@@ -1736,10 +1738,25 @@ static void pad_answers(void)
+     padpump(&s, &d, 10);
+     check(marked() == -1 && fake_clean_except(-1) && !s.sel.lit, "opening the history clears the mark and restores the text", "slot %d",
+           marked());
++    /* A step is the player asking for the answers: the history view is
++       closed as the HUD's own setter closes it, and the step marks. A
++       punch in play flips that view, so a dialogue can open with it on
++       (the 2026-11-18 headset run: no mark in a whole dialogue). */
++    fake8(0x190u, 0);
++    uint32_t closes = s.sel.history_closes;
+     dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+-    check(marked() == -1 && !s.sel.lit, "nothing is marked while the history shows", "slot %d", marked());
+-    fake8(DIALOGUE_HISTORY_OFF, 0);
++    check(marked() == 0 && s.sel.lit && *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF) == 0 &&
++              *(uint8_t *)rt_host(FAKE_VA + 0x190u) == 1 && s.sel.history_closes == closes + 1,
++          "a step with the history showing closes it, raises the relayout and marks the first answer", "slot %d history %d",
++          marked(), *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF));
++    tap(&s, &d, id, PM_CIRCLE);
++    padpump(&s, &d, 10);
+     fake8(DIALOGUE_SINGLE_OFF, 1);
++    fake8(DIALOGUE_HISTORY_OFF, 1);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == -1 && !s.sel.lit && *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF) == 1,
++          "in single-line mode a step leaves the history alone and marks nothing", "slot %d", marked());
++    fake8(DIALOGUE_HISTORY_OFF, 0);
+     dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+     check(marked() == -1 && !s.sel.lit, "nothing is marked in single-line mode", "slot %d", marked());
+     fake8(DIALOGUE_SINGLE_OFF, 0);
+@@ -2143,6 +2160,13 @@ static void pad_curve(void)
+     check(rt_pad_tune(&p, "south", "space") == -1, "a button is not a tunable", "");
+ }
+ 
++/* A chord as controls.txt's chord.mod+btn=target line makes it: none is
++   on by default any more. */
++static void add_chord(rt_pad *p, int mod, int btn, int kind, int arg)
++{
++    p->chord[p->nchord++] = (rt_pad_chord){mod, btn, {kind, arg, RT_PADT_NONE, 0}};
++}
++
+ /* Create plus L1 in play is the game's togglecamera bind (z): once per
+    press, L1's own wheel step and Create's character sheet both held back;
+    Create alone still opens the sheet, on release; L1 alone still steps;
+@@ -2158,8 +2182,9 @@ static void pad_chords(void)
+     rt_pad_dev_init(&d, NULL);
+     SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
+     padpump(&s, &d, 10);
+-    check(d.pad.mode == RT_PAD_PLAY && d.pad.nchord == 2, "the view toggle and recentre chords are there by default", "mode %d chords %d",
+-          d.pad.mode, d.pad.nchord);
++    check(d.pad.mode == RT_PAD_PLAY && d.pad.nchord == 0, "no chord is there by default", "mode %d chords %d", d.pad.mode,
++          d.pad.nchord);
++    add_chord(&d.pad, 4, 6, RT_PADT_KEY, SDL_SCANCODE_Z);
+     for (int round = 0; round < 2; round++) {
+         char name[96];
+         s_n = 0;
+@@ -2239,6 +2264,151 @@ static void pad_chords(void)
+     padpump(&s, &d, 10);
+ }
+ 
++/* A punch with the sticks still is a plain click: no move rides with
++   it. On the headset a swing needs something in reach, which is why
++   punches at a distant view seemed lost. */
++static void pad_punch(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    padpump(&s, &d, 10);
++    int ok = 1, x0 = s.x, y0 = s.y;
++    for (int i = 0; i < 5; i++) {
++        s_n = 0;
++        rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 32767);
++        padpump(&s, &d, 10);
++        ok &= s_n == 1 && s_m[0].msg == WM_LBUTTONDOWN && s_m[0].wp == MK_LBUTTON;
++        s_n = 0;
++        rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
++        padpump(&s, &d, 10);
++        ok &= s_n == 1 && s_m[0].msg == WM_LBUTTONUP;
++    }
++    check(s.relative && ok && s.x == x0 && s.y == y0,
++          "five trigger pulls in play with the sticks still: each a plain press and release, no move", "relative %d x %d y %d %s", s.relative,
++          s.x, s.y, dump());
++    rt_pad_test_detach(id);
++}
++
++/* Options in play: a tap is the game's menu on the release, a hold past
++   RT_PAD_HOLD_NS is one z (togglecamera) and no menu, however long it is
++   held. On the Sense pair, whose Options is on the right half, and on a
++   DualSense. hold.start=none in controls.txt gives Options its press
++   back. */
++static void pad_hold_one(const char *pad)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    char name[160];
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach(pad);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 1);
++    padpump(&s, &d, 10);
++    snprintf(name, sizeof name, "%s: Options pressed sends nothing yet", pad);
++    check(s_n == 0, name, "%s", dump());
++    padpump(&s, &d, 100);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 0);
++    padpump(&s, &d, 10);
++    snprintf(name, sizeof name, "%s: an Options tap is Escape on the release", pad);
++    check(s_n >= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x1B && s_m[s_n - 1].msg == WM_KEYUP && s_m[s_n - 1].wp == 0x1B, name, "%s",
++          dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 1);
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 600);
++    int toggled = s_n == 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x5A && s_m[1].msg == WM_KEYUP && s_m[1].wp == 0x5A;
++    s_n = 0;
++    for (int i = 0; i < 20; i++) padpump(&s, &d, 100);
++    int quiet = s_n == 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 0);
++    padpump(&s, &d, 10);
++    snprintf(name, sizeof name, "%s: Options held is one z, held on it sends no more, and its release no menu", pad);
++    check(toggled && quiet && s_n == 0 && d.pad.holds_fired == 1, name, "toggled %d quiet %d holds %u %s", toggled, quiet,
++          d.pad.holds_fired, dump());
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
++static void pad_hold(void)
++{
++    pad_hold_one("PlayStation VR2 Sense Controllers (L/R)");
++    pad_hold_one("DualSense Wireless Controller");
++    const char *tmp = getenv("TMPDIR");
++    char dir[512], path[600];
++    snprintf(dir, sizeof dir, "%s/rt-pad-hold-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++    if (!mkdtemp(dir)) {
++        check(0, "hold scratch folder", "%s", dir);
++        return;
++    }
++    snprintf(path, sizeof path, "%s/controls.txt", dir);
++    FILE *f = fopen(path, "w");
++    if (!f) {
++        check(0, "hold controls file", "%s", path);
++        return;
++    }
++    fputs("hold.start=none\nhold.south=e\nhold.north=answerup\nhold.bogus=z\n", f);
++    fclose(f);
++    rt_pad p;
++    int bad = rt_pad_load(&p, dir);
++    unlink(path);
++    rmdir(dir);
++    check(bad == 2 && p.hold[5].kind == RT_PADT_NONE && p.hold[0].kind == RT_PADT_KEY && p.hold[0].arg == SDL_SCANCODE_E &&
++              p.hold[3].kind == RT_PADT_NONE,
++          "controls.txt hold.btn=target sets or removes a hold, and refuses an action or an unknown button", "bad %d start %d south %d north %d",
++          bad, p.hold[5].kind, p.hold[0].kind, p.hold[3].kind);
++}
++
++/* The HUD's history view, flipped by every mouse1 key event, left on
++   after a punch in play: the pump turns it off while no dialogue is
++   active, and leaves a dialogue's own alone. */
++static void pad_history(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    fake_open(3);
++    fake8(DIALOGUE_ACTIVE_OFF, 0);
++    fake8(DIALOGUE_HISTORY_OFF, 1);
++    s.dialogue_va = FAKE_VA;
++    padpump(&s, &d, 10);
++    check(*(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF) == 0 && *(uint8_t *)rt_host(FAKE_VA + 0x190u) == 1 &&
++              s.sel.history_cleared == 1,
++          "a history view on with no dialogue is turned off", "history %d cleared %u", *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF),
++          s.sel.history_cleared);
++    fake8(DIALOGUE_ACTIVE_OFF, 1);
++    s.dialogue = 1;
++    fake8(DIALOGUE_HISTORY_OFF, 1);
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(*(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF) == 1 && s.sel.history_cleared == 1,
++          "a dialogue's own history view is left until a step", "history %d", *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF));
++    padpump(&s, &d, 10);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, 32767);
++    padpump(&s, &d, 10);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, 0);
++    padpump(&s, &d, 10);
++    check(marked() == 0 && *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF) == 0, "a stick step closes it and marks the first answer",
++          "slot %d history %d", marked(), *(uint8_t *)rt_host(FAKE_VA + DIALOGUE_HISTORY_OFF));
++    tap(&s, &d, id, PM_CIRCLE);
++    s.dialogue = 0;
++    s.dialogue_va = 0;
++    padpump(&s, &d, 10);
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
+ static void pad_controls(void)
+ {
+     const char *tmp = getenv("TMPDIR");
+@@ -2267,13 +2437,12 @@ static void pad_controls(void)
+     rmdir(dir);
+     const rt_pad_tgt *t = rt_pad_target(&p, 0, 1);
+     check(bad == 8, "eight bad controls lines are counted, a fallback on a step and four chords among them", "%d", bad);
+-    /* Removing a chord moves the last into its place, so the recentre
+-       default is first and the new one second. */
+-    check(p.nchord == 2 && p.chord[0].mod == 4 && p.chord[0].btn == 5 && p.chord[0].target.kind == RT_PADT_RECENTRE &&
+-              p.chord[1].mod == 3 && p.chord[1].btn == 10 && p.chord[1].target.kind == RT_PADT_KEY &&
+-              p.chord[1].target.arg == SDL_SCANCODE_Z,
+-          "chord.back+leftshoulder=none removes the view toggle, chord.north+dpup=z moves it, recentre stays", "%d chords, %d+%d",
+-          p.nchord, p.chord[0].mod, p.chord[0].btn);
++    /* With no chord by default, removing one that is not there changes
++       nothing, and the line that adds one is the only chord. */
++    check(p.nchord == 1 && p.chord[0].mod == 3 && p.chord[0].btn == 10 && p.chord[0].target.kind == RT_PADT_KEY &&
++              p.chord[0].target.arg == SDL_SCANCODE_Z,
++          "chord.back+leftshoulder=none removes nothing, chord.north+dpup=z adds the only chord", "%d chords, %d+%d", p.nchord,
++          p.chord[0].mod, p.chord[0].btn);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "menu.south remaps Cross in menus only", "%d %d", t->kind, t->arg);
+     t = rt_pad_target(&p, 0, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
+@@ -2536,8 +2705,10 @@ static void pad_turn(void)
+           "snap_angle and turn_speed are tunable within range", "%.1f", p.snap_deg);
+ }
+ 
+-/* Create plus Options recentres, in play; Options alone is still the
+-   game's menu, and the chord opens no character sheet. */
++/* Create plus Options recentres, in play, once controls.txt asks for it;
++   Options alone is still the game's menu (a tap, as Options has a
++   hold), and the chord opens no
++   character sheet. */
+ static void pad_recentre(void)
+ {
+     rt_input_state s;
+@@ -2548,6 +2719,7 @@ static void pad_recentre(void)
+     rt_pad_dev_init(&d, NULL);
+     SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
+     padpump(&s, &d, 10);
++    add_chord(&d.pad, 4, 5, RT_PADT_RECENTRE, 0);
+     s_n = 0;
+     rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 1);
+     padpump(&s, &d, 10);
+@@ -2562,9 +2734,9 @@ static void pad_recentre(void)
+     check(s_n == 0 && s.head_recentres == 1, "letting go opens neither the menu nor the character sheet", "%s", dump());
+     rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 1);
+     padpump(&s, &d, 10);
+-    check(s_n >= 1 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x1B, "Options alone is still Escape, on its press", "%s", dump());
+     rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_START, 0);
+     padpump(&s, &d, 10);
++    check(s_n >= 1 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x1B, "Options alone is still Escape, as a tap on its release", "%s", dump());
+     rt_pad_test_detach(id);
+     padpump(&s, &d, 10);
+ }
+@@ -2599,6 +2771,9 @@ int rt_input_selftest(void)
+     pad_left();
+     pad_lone();
+     pad_chords();
++    pad_history();
++    pad_punch();
++    pad_hold();
+     pad_controls();
+     head_look();
+     head_look_drift();
+diff --git a/runtime/pad.c b/runtime/pad.c
+index e832b8a..2c14377 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -73,22 +73,21 @@ static const struct {
+     {RT_PAD_DIALOGUE, RT_PAD_FLICK_DOWN, "answerdown"},
+ };
+ 
+-/* Create plus L1, in play, is the game's own togglecamera, bound to z in
+-   its config.cfg: first and third person. Both are on the left Sense
+-   half, so one hand does it, and neither stick is clicked, which both
+-   L3 (quest log) and R3 (crouch) and the two together (stereo) take.
+-   Create is the character sheet, which then opens on release when no
+-   chord was made; L1 alone still steps the weapon down. */
+-/* Create plus Options recentres head look: the body's heading becomes
+-   the view's, and the head's facing now becomes straight ahead
+-   (headlook.h). Options alone opens the game's menu on its press, so it
+-   cannot be held for this; behind Create, which already waits for its
+-   release in play, it costs nothing. */
++/* Hold targets in play: Options held is togglecamera, the game's own
++   first and third person switch, which its config.cfg binds to z. */
+ static const struct {
+-    int mod, btn;
++    int idx;
+     const char *target;
+-} k_chord_default[] = {{4, 6, "z"}, {4, 5, "recentre"}};
++} k_hold_default[] = {
++    {5, "z"},
++};
+ 
++/* No chord is on by default. The Sense pair has no Create (visionOS
++   gives it 32 elements and none is the one SDL maps to Create), and a
++   held modifier delays the button it rides on, so Options or Create in
++   play stay plain presses. controls.txt can still add one with
++   chord.mod+btn=target: togglecamera is z, and recentre is the head
++   look's, which is off unless asked for (headlook.h). */
+ static const char *const k_mode_names[RT_PAD_NMODES] = {"play", "menu", "dialogue"};
+ 
+ static const int k_dir_key[4] = {SDL_SCANCODE_W, SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_D};
+@@ -223,17 +222,13 @@ void rt_pad_defaults(rt_pad *p)
+     p->cursor_dead = RT_PAD_CURSOR_DEAD;
+     p->cursor_left = RT_PAD_CURSOR_LEFT;
+     for (int i = 0; i < RT_PAD_NBTN; i++) parse_target(k_default[i], &p->map[i]);
++    for (size_t i = 0; i < sizeof k_hold_default / sizeof *k_hold_default; i++)
++        parse_target(k_hold_default[i].target, &p->hold[k_hold_default[i].idx]);
+     for (size_t i = 0; i < sizeof k_mode_default / sizeof *k_mode_default; i++) {
+         int m = k_mode_default[i].mode - 1, idx = k_mode_default[i].idx;
+         parse_target(k_mode_default[i].target, &p->over[m][idx]);
+         p->over_set[m][idx] = 1;
+     }
+-    for (size_t i = 0; i < sizeof k_chord_default / sizeof *k_chord_default; i++) {
+-        rt_pad_chord *c = &p->chord[p->nchord++];
+-        c->mod = k_chord_default[i].mod;
+-        c->btn = k_chord_default[i].btn;
+-        parse_target(k_chord_default[i].target, &c->target);
+-    }
+ }
+ 
+ static int button_named(const char *name, size_t n)
+@@ -243,6 +238,23 @@ static int button_named(const char *name, size_t n)
+     return -1;
+ }
+ 
++/* hold.btn=target: a key or a click, sent as a tap; =none removes it. */
++static int load_hold(rt_pad *p, const char *name, const char *v)
++{
++    int idx = button_named(name, strlen(name));
++    rt_pad_tgt tg;
++    if (idx < 0) {
++        rt_log("pad controls: unknown button \"hold.%s\"", name);
++        return 1;
++    }
++    if (parse_target(v, &tg) || (tg.kind != RT_PADT_NONE && tg.kind != RT_PADT_KEY && tg.kind != RT_PADT_MOUSE)) {
++        rt_log("pad controls: bad target \"%s\" for hold.%s, default kept", v, name);
++        return 1;
++    }
++    p->hold[idx] = tg;
++    return 0;
++}
++
+ /* chord.mod+btn=target: a new pair is added, a known one changed, and
+    =none removes it. Flicks are not chord buttons: they are a dialogue's
+    and chords are play's. 0 when taken, 1 for a bad line. */
+@@ -345,6 +357,7 @@ static int load_line(rt_pad *p, char *line)
+     }
+     if (!t) return 0;
+     if (!strncmp(line, "chord.", 6)) return load_chord(p, line + 6, v);
++    if (!strncmp(line, "hold.", 5)) return load_hold(p, line + 5, v);
+     int mode = !strncmp(line, "menu.", 5) ? RT_PAD_MENU : !strncmp(line, "dialogue.", 9) ? RT_PAD_DIALOGUE : RT_PAD_PLAY;
+     const char *name = mode == RT_PAD_MENU ? line + 5 : mode == RT_PAD_DIALOGUE ? line + 9 : line;
+     int idx = -1;
+@@ -521,18 +534,42 @@ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, in
+     p->held[idx] = t;
+     p->step_at[idx] = p->now_ns + RT_PAD_STEP_DELAY_NS;
+     log_first(p, idx, &p->held[idx]);
+-    /* A chord's modifier in play waits to see whether it is one. Only a
+-       key or click waits: a wheel step has no release to defer to. */
+-    if (p->mode == RT_PAD_PLAY && (t.kind == RT_PADT_KEY || t.kind == RT_PADT_MOUSE))
++    /* A chord's modifier or a button with a hold in play waits to see
++       which it is. Only a key or click waits: a wheel step has no release
++       to defer to. */
++    if (p->mode == RT_PAD_PLAY && (t.kind == RT_PADT_KEY || t.kind == RT_PADT_MOUSE)) {
++        if (p->hold[idx].kind != RT_PADT_NONE) {
++            p->deferred[idx] = 1;
++            p->chorded[idx] = 0;
++            p->hold_at[idx] = p->now_ns + RT_PAD_HOLD_NS;
++            return 0;
++        }
+         for (int i = 0; i < p->nchord; i++)
+             if (p->chord[i].mod == idx) {
+                 p->deferred[idx] = 1;
+                 p->chorded[idx] = 0;
+                 return 0;
+             }
++    }
+     return emit(&p->held[idx], 1, pt, out, cap);
+ }
+ 
++/* A button with a hold target held long enough: the hold goes out once
++   as a tap, and the release then sends nothing. */
++int rt_pad_hold(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
++{
++    int n = 0;
++    for (int i = 0; i < RT_PAD_NBTN && cap - n >= 2; i++) {
++        if (!p->down[i] || !p->deferred[i] || p->chorded[i] || p->hold[i].kind == RT_PADT_NONE || p->now_ns < p->hold_at[i]) continue;
++        p->chorded[i] = 1;
++        char tb[40];
++        rt_log("pad hold %s -> %s (%u this run)", k_names[i], target_name(&p->hold[i], tb, sizeof tb), ++p->holds_fired);
++        n += emit(&p->hold[i], 1, pt, out + n, cap - n);
++        n += emit(&p->hold[i], 0, pt, out + n, cap - n);
++    }
++    return n;
++}
++
+ /* A held step, stick or d-pad, repeats after a pause. Each repeat is
+    timed from the pump that sent it, not from the schedule, so a hitch
+    does not release a burst of steps at once. Only in a dialogue: a
+@@ -1033,6 +1070,7 @@ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_
+     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++) n += rt_pad_axis(&d->pad, a, group_axis(d, drv, (SDL_GamepadAxis)a), pt, out + n, cap - n);
+     n += rt_pad_flick(&d->pad, pt, out + n, cap - n);
+     n += rt_pad_repeat(&d->pad, out + n, cap - n);
++    n += rt_pad_hold(&d->pad, pt, out + n, cap - n);
+     /* Real elapsed time, not whole milliseconds: at 120 Hz truncating to
+        8 ms would run the cursor 4% slow. Long stalls are capped so a
+        hitch does not fling it. */
+diff --git a/runtime/pad.h b/runtime/pad.h
+index db27579..76871bb 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -84,21 +84,33 @@ typedef struct {
+ 
+ /* A chord: btn pressed while mod is held, in play, sends target instead
+    of btn's own. mod's own target then waits for its release and is sent
+-   as a tap only if no chord used it, so holding Create for the view
+-   toggle does not open the character sheet first. Up to RT_PAD_NCHORD,
+-   as controls.txt's chord.mod+btn=target lines say. */
++   as a tap only if no chord used it, so holding a modifier for its
++   chord does not send its own target first. None by default; up to
++   RT_PAD_NCHORD, as controls.txt's chord.mod+btn=target lines say. */
+ #define RT_PAD_NCHORD 4
+ typedef struct {
+     int mod, btn;
+     rt_pad_tgt target;
+ } rt_pad_chord;
+ 
++/* A button held past RT_PAD_HOLD_NS in play sends its hold target as one
++   tap and not its own; let go sooner, its own goes out as a tap on the
++   release. Options held is the view toggle by default, as a pad has no
++   button left for it and the Sense pair no Create to chord with. */
++#define RT_PAD_HOLD_NS 500000000ull
++
+ typedef struct {
+     rt_pad_tgt map[RT_PAD_NBTN];
++    /* Hold targets (kind none for a button without one) and when the
++       hold of a button now waiting fires. */
++    rt_pad_tgt hold[RT_PAD_NBTN];
++    uint64_t hold_at[RT_PAD_NBTN];
++    uint32_t holds_fired;
+     rt_pad_chord chord[RT_PAD_NCHORD];
+     int nchord;
+-    /* A chord's modifier held with its own target waiting (deferred), and
+-       whether a chord has used this hold (chorded). */
++    /* A chord's modifier or a button with a hold target held with its own
++       target waiting (deferred), and whether a chord or the hold has used
++       this press (chorded). */
+     uint8_t deferred[RT_PAD_NBTN], chorded[RT_PAD_NBTN];
+     uint32_t chords_fired;
+     /* Menu and dialogue overrides, indexed by mode minus one. */
+@@ -166,6 +178,7 @@ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, in
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_flick(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_repeat(rt_pad *p, SDL_Event *out, int cap);
++int rt_pad_hold(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy);

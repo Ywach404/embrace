@@ -1,0 +1,51 @@
+From 95fb928e397fc6530cfe090e4f77f2fee7e816ab Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:35:35 -0600
+Subject: [PATCH] runtime: a host fault logs its native stack
+
+A host fault, an abort above all, logged only its signal address, which for SIGABRT is no code address, and the handler keeps the system from writing a crash report, so a Swift trap in the host app left nothing to go on. The stack now goes to the log first, each frame's image and nearest symbol.
+---
+ runtime/rt.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/runtime/rt.c b/runtime/rt.c
+index f92ad3c..ae1f7cd 100644
+--- a/runtime/rt.c
++++ b/runtime/rt.c
+@@ -1,6 +1,8 @@
+ #include "recomp_types.h"
+ #include "rt.h"
+ 
++#include <dlfcn.h>
++#include <execinfo.h>
+ #include <math.h>
+ #include <pthread.h>
+ #include <signal.h>
+@@ -47,6 +49,24 @@ static void on_fault(int sig, siginfo_t *si, void *uap)
+                         (unsigned)off, off);
+             rt_stop(4, 0, "guest memory fault past arena end (arena offset 0x%09llX)", off);
+         }
++    /* A host fault, an abort above all, says nothing by its address (for
++       SIGABRT it is no code address at all), and the handler keeps the
++       system from writing a crash report: the stack goes to the log, each
++       frame's image and nearest symbol, before the stop. Not signal safe,
++       and the process is ending either way. */
++    void *frames[48];
++    int n = backtrace(frames, 48);
++    for (int i = 0; i < n; i++) {
++        Dl_info info;
++        if (dladdr(frames[i], &info) && info.dli_fname) {
++            const char *image = strrchr(info.dli_fname, '/');
++            rt_log("host fault frame %2d: %s+0x%lx %s+0x%lx", i, image ? image + 1 : info.dli_fname,
++                   (unsigned long)((char *)frames[i] - (char *)info.dli_fbase), info.dli_sname ? info.dli_sname : "?",
++                   info.dli_saddr ? (unsigned long)((char *)frames[i] - (char *)info.dli_saddr) : 0ul);
++        } else {
++            rt_log("host fault frame %2d: %p", i, frames[i]);
++        }
++    }
+     rt_stop(6, 0, "host fault, signal %d at host address %p", sig, (void *)a);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

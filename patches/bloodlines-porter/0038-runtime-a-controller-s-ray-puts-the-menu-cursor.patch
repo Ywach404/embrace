@@ -1,0 +1,89 @@
+From b73ceb021f45f3d3959ed0870f3d0c465800980b Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:48:11 -0600
+Subject: [PATCH] runtime: a controller's ray puts the menu cursor
+
+The host gives the point where a Sense controller's ray meets a menu's screen (rt_host_cursor_to), and the cursor goes there through the host's virtual pointer. For a quarter second after, the pad's stick leaves the cursor alone, so the Sense controllers point and a pad without a ray moves it with its stick as before.
+---
+ runtime/host.h  |  4 ++++
+ runtime/input.c | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 0d5c80a..d360f19 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -118,6 +118,10 @@ int rt_host_aim_hand(void);
+  * the pad takes it as that half's shoulder button. side: 0 left, 1 right.
+  * Any thread. */
+ void rt_host_pad_grip(int side, int down);
++/* Puts the guest's cursor at (u, v), 0 to 1 across its client area, where
++ * a controller's ray meets the menu's screen; the pad's stick leaves the
++ * cursor alone for a quarter second after. Any thread. */
++void rt_host_cursor_to(float u, float v);
+ 
+ /*
+  * Writes one line from the host to the runtime's log, after "host: ", so
+diff --git a/runtime/input.c b/runtime/input.c
+index dfe079a..637ce40 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -13,6 +13,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ const rt_key rt_keys[] = {
+     {0x04, 0x1E, 0, 0x41, "a"},           {0x05, 0x30, 0, 0x42, "b"},          {0x06, 0x2E, 0, 0x43, "c"},
+@@ -690,6 +691,14 @@ static int sel_act(rt_input_state *s, int act, uint64_t now, SDL_Event *out, int
+     }
+ }
+ 
++/* When a controller's ray last put the cursor (rt_host_cursor_to), so the
++   pad's stick leaves it alone meanwhile: the Sense controllers point, and
++   a pad without a ray (a DualSense, a Bluetooth pad) moves it with its
++   stick as before. */
++#if TARGET_OS_VISION
++static uint64_t s_ray_ns;
++#endif
++
+ static rt_pad_pt pad_point(const rt_input_state *s, const rt_present_rects *r, float density)
+ {
+     rt_pad_pt p;
+@@ -745,6 +754,9 @@ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now
+     sel_sync(s, now_ns, active && d->gp && mode == RT_PAD_DIALOGUE);
+     d->pad.lit = s->sel.lit;
+     int k = rt_pad_poll(d, active, mode, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
++#if TARGET_OS_VISION
++    if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - __atomic_load_n(&s_ray_ns, __ATOMIC_ACQUIRE) < 250000000ull) dx = dy = 0;
++#endif
+     /* Answer actions become what the selector sends, in their place in
+        the stream, so a key pressed before a confirm still lands first. */
+     for (int i = 0; i < k; i++) {
+@@ -1849,4 +1861,22 @@ int rt_host_cursor(float *u, float *v)
+     *v = y < 0 ? 0 : y > 1 ? 1 : y;
+     return 1;
+ }
++
++void rt_host_cursor_to(float u, float v)
++{
++    if (!(u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f)) return;
++    pthread_mutex_lock(&s_mu);
++    int cw = S.client_w, ch = S.client_h;
++    pthread_mutex_unlock(&s_mu);
++    if (cw <= 0 || ch <= 0) return;
++    rt_present_rects r;
++    float d, x, y;
++    rt_input_geometry(&r, &d);
++    rt_input_unmap(&r, d, (int32_t)(u * (float)cw), (int32_t)(v * (float)ch), &x, &y);
++    pthread_mutex_lock(&s_mu);
++    float dx = x - H.vx, dy = y - H.vy;
++    pthread_mutex_unlock(&s_mu);
++    __atomic_store_n(&s_ray_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELEASE);
++    if (fabsf(dx) + fabsf(dy) >= 0.5f) rt_host_mouse_motion(dx, dy);
++}
+ #endif
+-- 
+2.54.0 (Apple Git-157)
+

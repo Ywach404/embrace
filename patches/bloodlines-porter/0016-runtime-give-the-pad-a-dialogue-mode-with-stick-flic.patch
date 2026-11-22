@@ -1,0 +1,914 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 23:48:10 -0600
+Subject: [PATCH] runtime: give the pad a dialogue mode with stick flicks for
+ answers
+
+The dialogue HUD (client CHudDialog) shows no cursor, keeps the pointer
+relative and handles only the mouse wheel (history scroll), the left
+button (history toggle) and the number keys 1 to 4, picking on
+release. It has four answer slots and no arrow keys or highlight. So
+dialogue never reached menu mode, and answers were only on the d-pad,
+which the PSVR2 Sense pair does not have. Mouse aim cannot help here,
+and stepping through answers would have nothing to show.
+
+The pump now reads the HUD's own state each frame. The HUD stores
+itself at client+0x3EE138, its vtable is checked so a stale pointer
+cannot read as a dialogue, and the active flag at +0x1B4 is written
+only by SetActive (the server's DialogCtrl) and Init. The game's
+IsDialogActive reads the same pair. Changes are logged as "dialogue
+open" and "dialogue closed".
+
+While the flag is set and no cursor is shown, the pad is in dialogue
+mode. A right stick flick sends 1 (up), 2 (right), 3 (down) or 4
+(left), the d-pad's own layout. A flick fires past half tilt on the
+axis that is further out, lets go under the dead zone, and does not
+repeat. It is judged after both axes are read. A dialogue starts
+unarmed, so a stick that was looking as it opened must centre before
+it can pick. Cross stays space, which is +jump, the game's continue in
+a dialogue. Circle is Escape, which the HUD ignores; only the server
+closes a dialogue. Both sticks stop looking and walking, held
+movement keys are lifted on entry, and a held flick's key is lifted
+on exit. A shown cursor still wins, so a menu opened over a dialogue
+works with the cursor as before. The d-pad keeps 1 to 4 everywhere.
+controls.txt takes dialogue.<button>= overrides, including flickup,
+flickright, flickdown and flickleft, and the log reports "pad mode
+dialogue" and each first press in it.
+---
+ runtime/input.c          |  65 +++++++++--
+ runtime/input.h          |   6 +-
+ runtime/input_selftest.c | 226 +++++++++++++++++++++++++++++++++------
+ runtime/pad.c            | 170 +++++++++++++++++++++--------
+ runtime/pad.h            |  36 +++++--
+ 5 files changed, 405 insertions(+), 98 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 68493c4..a60dbde 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -333,7 +333,7 @@ static rt_pad_pt pad_point(const rt_input_state *s, const rt_present_rects *r, f
+     return p;
+ }
+ 
+-int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int menu, const rt_present_rects *r,
++int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int mode, const rt_present_rects *r,
+                        float density, rt_wmsg *out, int cap)
+ {
+     int n = 0;
+@@ -347,7 +347,7 @@ int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, in
+        screen, which is where the slow end of the curve lives. It then
+        goes out as a warp, so the Mac pointer and the host's virtual
+        pointer follow the cursor the pad moved. */
+-    if (menu) {
++    if (mode == RT_PAD_MENU) {
+         if (!s->focus || s->relative) return n < cap ? n : cap;
+         int32_t x = s->x + dx, y = s->y + dy;
+         x = x < 0 ? 0 : x >= s->client_w ? s->client_w - 1 : x;
+@@ -377,16 +377,16 @@ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now
+                       rt_wmsg *out, int cap)
+ {
+     SDL_Event ev[RT_PAD_EVENTS];
+-    int dx, dy, menu = rt_input_menu(s);
+-    int k = rt_pad_poll(d, active, menu, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
+-    return rt_input_pad_apply(s, ev, k, dx, dy, menu, r, density, out, cap);
++    int dx, dy, mode = rt_input_pad_mode(s);
++    int k = rt_pad_poll(d, active, mode, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
++    return rt_input_pad_apply(s, ev, k, dx, dy, mode, r, density, out, cap);
+ }
+ 
+ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *r, float density, rt_wmsg *out, int cap)
+ {
+     SDL_Event ev[RT_PAD_EVENTS];
+     int k = rt_pad_release(&d->pad, pad_point(s, r, density), ev, RT_PAD_EVENTS);
+-    return rt_input_pad_apply(s, ev, k, 0, 0, 0, r, density, out, cap);
++    return rt_input_pad_apply(s, ev, k, 0, 0, RT_PAD_PLAY, r, density, out, cap);
+ }
+ 
+ int rt_input_release_all(rt_input_state *s, rt_wmsg *out, int cap)
+@@ -462,10 +462,20 @@ static int guest_shape(const rt_input_state *s)
+ }
+ 
+ /* The game shows its cursor exactly when a screen of its own is up:
+-   menus, dialogue, the inventory and the character sheet. The pad's
+-   menu mode and the host's cursor ring both key off this one test. */
++   menus, the inventory and the character sheet. Not dialogue: its HUD
++   keeps the cursor hidden and the pointer relative (imm3 device log),
++   and takes only number keys. The pad's menu mode and the host's cursor
++   ring both key off this one test. */
+ int rt_input_menu(const rt_input_state *s) { return s->focus && guest_shape(s) != RT_CUR_HIDDEN; }
+ 
++/* A shown cursor wins: a menu opened over a dialogue (Escape) is worked
++   with the cursor, and the dialogue's flicks come back when it closes. */
++int rt_input_pad_mode(const rt_input_state *s)
++{
++    if (rt_input_menu(s)) return RT_PAD_MENU;
++    return s->focus && s->dialogue ? RT_PAD_DIALOGUE : RT_PAD_PLAY;
++}
++
+ int rt_input_relative_wanted(const rt_input_state *s)
+ {
+     return s->focus && s->host_focus && guest_shape(s) == RT_CUR_HIDDEN;
+@@ -844,6 +854,44 @@ void rt_input_focus(int on)
+     post_all(m, n, RT_KEYIDX + 8);
+ }
+ 
++/* The dialogue HUD (client CHudDialog) stores itself at client+0x3EE138
++   when constructed, and its active flag at +0x1B4 is written only by its
++   SetActive, which the server's DialogCtrl message drives, and by its
++   Init at level start; the game's own IsDialogActive reads the same
++   pair. Reading it each pump is exact where the cursor, the font binding
++   and relative mode are not: none of them change in a dialogue. The
++   vtable check keeps a pointer left behind by a torn down HUD from
++   reading as a dialogue. */
++#define DIALOGUE_PTR_RVA 0x3EE138u
++#define DIALOGUE_VTABLE_RVA 0x228FDCu
++#define DIALOGUE_ACTIVE 0x1B4u
++
++static uint32_t guest32(uint32_t va)
++{
++    uint32_t v;
++    memcpy(&v, rt_host(va), sizeof v);
++    return v;
++}
++
++static int dialogue_probe(void)
++{
++    uint32_t slot = rt_hook_va("client", DIALOGUE_PTR_RVA);
++    if (!slot) return 0;
++    uint32_t hud = guest32(slot);
++    if (!hud || guest32(hud) != rt_hook_va("client", DIALOGUE_VTABLE_RVA)) return 0;
++    return *(const uint8_t *)rt_host(hud + DIALOGUE_ACTIVE) != 0;
++}
++
++static void dialogue_update(void)
++{
++    int on = dialogue_probe();
++    pthread_mutex_lock(&s_mu);
++    int was = S.dialogue;
++    S.dialogue = on;
++    pthread_mutex_unlock(&s_mu);
++    if (on != was) rt_log("dialogue %s", on ? "open" : "closed");
++}
++
+ static void pad_pump(void)
+ {
+     rt_present_rects r;
+@@ -860,6 +908,7 @@ void rt_input_pump_end(void)
+ {
+     rt_toggles_apply();
+     if (!s_win) return;
++    dialogue_update();
+     if (s_pad_started) pad_pump();
+     rt_wmsg m[1];
+     int warp = 0, shape, rel_changed;
+diff --git a/runtime/input.h b/runtime/input.h
+index 5195588..dcab80a 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -57,6 +57,9 @@ typedef struct {
+     double fx, fy;
+     uint32_t rel_switches, recentres, looks;
+     uint32_t capture, last_lp;
++    /* The game's dialogue HUD is active: set by the pump's probe of the
++       guest's own flag, or directly by the self test. */
++    int dialogue;
+     uint32_t cursor;
+     int show_count;
+     int applied;
+@@ -97,9 +100,10 @@ void rt_input_map(const rt_present_rects *r, float density, float x, float y, in
+ void rt_input_unmap(const rt_present_rects *r, float density, int32_t cx, int32_t cy, float *x, float *y);
+ int rt_input_translate(rt_input_state *s, const SDL_Event *e, const rt_present_rects *r, float density, rt_wmsg *out,
+                        int cap);
+-int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int menu, const rt_present_rects *r,
++int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int mode, const rt_present_rects *r,
+                        float density, rt_wmsg *out, int cap);
+ int rt_input_menu(const rt_input_state *s);
++int rt_input_pad_mode(const rt_input_state *s);
+ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now_ns, const rt_present_rects *r, float density,
+                       rt_wmsg *out, int cap);
+ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *r, float density, rt_wmsg *out, int cap);
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 3f0b4a8..806e3d3 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -960,31 +960,32 @@ static void padpump_ns(rt_input_state *s, rt_pad_dev *d, uint64_t ns)
+     s_n += rt_input_pad_pump(s, d, s->focus, s_pad_t, &R1, 1.0f, s_m + s_n, 256 - s_n);
+ }
+ 
+-/* SDL button, or -1 with the trigger axis; then what menu and play send:
+-   the message and, for keys and clicks, its wparam (0 skips it). */
++/* SDL button, or -1 with the trigger axis; then what play, menu and
++   dialogue send: the message and, for keys and clicks, its wparam (0
++   skips it). */
+ static const struct {
+     int btn, axis;
+     const char *name;
+-    uint32_t menu_msg, menu_wp, play_msg, play_wp;
++    uint32_t msg[RT_PAD_NMODES], wp[RT_PAD_NMODES];
+ } k_padmap[] = {
+-    {SDL_GAMEPAD_BUTTON_SOUTH, -1, "Cross", WM_LBUTTONDOWN, 1, WM_KEYDOWN, 0x20},
+-    {SDL_GAMEPAD_BUTTON_EAST, -1, "Circle", WM_KEYDOWN, 0x1B, WM_KEYDOWN, 0x45},
+-    {SDL_GAMEPAD_BUTTON_WEST, -1, "Square", WM_KEYDOWN, 0x49, WM_KEYDOWN, 0x49},
+-    {SDL_GAMEPAD_BUTTON_NORTH, -1, "Triangle", WM_KEYDOWN, 0x46, WM_KEYDOWN, 0x46},
+-    {SDL_GAMEPAD_BUTTON_BACK, -1, "Create", WM_KEYDOWN, 0x43, WM_KEYDOWN, 0x43},
+-    {SDL_GAMEPAD_BUTTON_START, -1, "Options", WM_KEYDOWN, 0x1B, WM_KEYDOWN, 0x1B},
+-    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, -1, "L1", WM_MOUSEWHEEL, 0, WM_MOUSEWHEEL, 0},
+-    {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, -1, "R1", WM_MOUSEWHEEL, 0, WM_MOUSEWHEEL, 0},
+-    {SDL_GAMEPAD_BUTTON_LEFT_STICK, -1, "L3", WM_KEYDOWN, 0x4C, WM_KEYDOWN, 0x4C},
+-    {SDL_GAMEPAD_BUTTON_RIGHT_STICK, -1, "R3", WM_KEYDOWN, 0x11, WM_KEYDOWN, 0x11},
+-    {SDL_GAMEPAD_BUTTON_DPAD_UP, -1, "d-pad up", WM_KEYDOWN, 0x31, WM_KEYDOWN, 0x31},
+-    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1, "d-pad down", WM_KEYDOWN, 0x33, WM_KEYDOWN, 0x33},
+-    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1, "d-pad left", WM_KEYDOWN, 0x34, WM_KEYDOWN, 0x34},
+-    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1, "d-pad right", WM_KEYDOWN, 0x32, WM_KEYDOWN, 0x32},
+-    {SDL_GAMEPAD_BUTTON_TOUCHPAD, -1, "touchpad", WM_KEYDOWN, 0x52, WM_KEYDOWN, 0x52},
+-    {SDL_GAMEPAD_BUTTON_MISC1, -1, "share", WM_KEYDOWN, 0x52, WM_KEYDOWN, 0x52},
+-    {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", WM_RBUTTONDOWN, 2, WM_RBUTTONDOWN, 2},
+-    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", WM_LBUTTONDOWN, 1, WM_LBUTTONDOWN, 1},
++    {SDL_GAMEPAD_BUTTON_SOUTH, -1, "Cross", {WM_KEYDOWN, WM_LBUTTONDOWN, WM_KEYDOWN}, {0x20, 1, 0x20}},
++    {SDL_GAMEPAD_BUTTON_EAST, -1, "Circle", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x45, 0x1B, 0x1B}},
++    {SDL_GAMEPAD_BUTTON_WEST, -1, "Square", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x49, 0x49, 0x49}},
++    {SDL_GAMEPAD_BUTTON_NORTH, -1, "Triangle", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x46, 0x46, 0x46}},
++    {SDL_GAMEPAD_BUTTON_BACK, -1, "Create", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x43, 0x43, 0x43}},
++    {SDL_GAMEPAD_BUTTON_START, -1, "Options", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x1B, 0x1B, 0x1B}},
++    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, -1, "L1", {WM_MOUSEWHEEL, WM_MOUSEWHEEL, WM_MOUSEWHEEL}, {0, 0, 0}},
++    {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, -1, "R1", {WM_MOUSEWHEEL, WM_MOUSEWHEEL, WM_MOUSEWHEEL}, {0, 0, 0}},
++    {SDL_GAMEPAD_BUTTON_LEFT_STICK, -1, "L3", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x4C, 0x4C, 0x4C}},
++    {SDL_GAMEPAD_BUTTON_RIGHT_STICK, -1, "R3", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x11, 0x11, 0x11}},
++    {SDL_GAMEPAD_BUTTON_DPAD_UP, -1, "d-pad up", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x31, 0x31, 0x31}},
++    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1, "d-pad down", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x33, 0x33, 0x33}},
++    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1, "d-pad left", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x34, 0x34, 0x34}},
++    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1, "d-pad right", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x32, 0x32, 0x32}},
++    {SDL_GAMEPAD_BUTTON_TOUCHPAD, -1, "touchpad", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
++    {SDL_GAMEPAD_BUTTON_MISC1, -1, "share", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
++    {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", {WM_RBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONDOWN}, {2, 2, 2}},
++    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", {WM_LBUTTONDOWN, WM_LBUTTONDOWN, WM_LBUTTONDOWN}, {1, 1, 1}},
+ };
+ 
+ static void press(SDL_JoystickID id, int i, int down)
+@@ -993,22 +994,22 @@ static void press(SDL_JoystickID id, int i, int down)
+     else rt_pad_test_axis(id, k_padmap[i].axis, down ? 32767 : 0);
+ }
+ 
+-static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int menu)
++static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int mode)
+ {
+     char name[96];
++    const char *mn = rt_pad_mode_name(mode);
+     for (size_t i = 0; i < sizeof k_padmap / sizeof *k_padmap; i++) {
+-        uint32_t msg = menu ? k_padmap[i].menu_msg : k_padmap[i].play_msg;
+-        uint32_t wp = menu ? k_padmap[i].menu_wp : k_padmap[i].play_wp;
++        uint32_t msg = k_padmap[i].msg[mode], wp = k_padmap[i].wp[mode];
+         s_n = 0;
+         press(id, (int)i, 1);
+         padpump(s, d, 10);
+-        snprintf(name, sizeof name, "%s %s press", menu ? "menu" : "play", k_padmap[i].name);
++        snprintf(name, sizeof name, "%s %s press", mn, k_padmap[i].name);
+         /* Escape also gives its WM_CHAR, so only the first message is held to. */
+         check(s_n >= 1 && s_n <= 2 && s_m[0].msg == msg && (msg == WM_MOUSEWHEEL || s_m[0].wp == wp), name, "%s", dump());
+         s_n = 0;
+         press(id, (int)i, 0);
+         padpump(s, d, 10);
+-        snprintf(name, sizeof name, "%s %s release", menu ? "menu" : "play", k_padmap[i].name);
++        snprintf(name, sizeof name, "%s %s release", mn, k_padmap[i].name);
+         check(msg == WM_MOUSEWHEEL ? s_n == 0 : s_n == 1 && s_m[0].msg == msg + 1 && (s_m[0].wp == wp || msg != WM_KEYDOWN), name, "%s",
+               dump());
+     }
+@@ -1024,8 +1025,8 @@ static void pad_modes(void)
+     rt_pad_dev_init(&d, NULL);
+     SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
+     padpump(&s, &d, 10);
+-    check(rt_input_menu(&s) && d.pad.menu == RT_PAD_MENU && s_n == 0, "a shown cursor is menu mode", "menu %d %s", d.pad.menu, dump());
+-    pad_map_mode(&s, &d, id, 1);
++    check(rt_input_menu(&s) && d.pad.mode == RT_PAD_MENU && s_n == 0, "a shown cursor is menu mode", "menu %d %s", d.pad.mode, dump());
++    pad_map_mode(&s, &d, id, RT_PAD_MENU);
+     check((d.pad.logged[RT_PAD_MENU] & 1u) && !(d.pad.logged[RT_PAD_PLAY] & 1u), "a press is logged once for its mode", "%X %X",
+           d.pad.logged[RT_PAD_MENU], d.pad.logged[RT_PAD_PLAY]);
+ 
+@@ -1033,8 +1034,8 @@ static void pad_modes(void)
+     rt_input_relative_update(&s);
+     s_n = 0;
+     padpump(&s, &d, 10);
+-    check(!rt_input_menu(&s) && d.pad.menu == RT_PAD_PLAY && s_n == 0, "a hidden cursor is play mode", "menu %d %s", d.pad.menu, dump());
+-    pad_map_mode(&s, &d, id, 0);
++    check(!rt_input_menu(&s) && d.pad.mode == RT_PAD_PLAY && s_n == 0, "a hidden cursor is play mode", "menu %d %s", d.pad.mode, dump());
++    pad_map_mode(&s, &d, id, RT_PAD_PLAY);
+ 
+     /* Across a mode change a release sends what its press sent. */
+     s_n = 0;
+@@ -1098,6 +1099,154 @@ static void pad_modes(void)
+     padpump(&s, &d, 10);
+ }
+ 
++/* A right stick push for one pump, then where it is left. */
++static void rstick(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int x, int y)
++{
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTX, x);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTY, y);
++    padpump(s, d, 10);
++}
++
++static void pad_dialogue(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.x = 640;
++    s.y = 512;
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    padpump(&s, &d, 10);
++    check(d.pad.mode == RT_PAD_PLAY && s_n == 0, "no dialogue and a hidden cursor is play", "mode %d %s", d.pad.mode, dump());
++
++    /* Entry from the probe's flag; a stick already looking, and the left
++       stick walking, as the dialogue opens. */
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, -32767);
++    rstick(&s, &d, id, 0, -32767);
++    s_n = 0;
++    s.dialogue = 1;
++    padpump(&s, &d, 10);
++    check(rt_input_pad_mode(&s) == RT_PAD_DIALOGUE && d.pad.mode == RT_PAD_DIALOGUE, "the dialogue flag enters dialogue mode", "mode %d",
++          d.pad.mode);
++    /* The last look's move is flushed ahead of the key. */
++    int k1 = s_n == 2 && s_m[0].msg == WM_MOUSEMOVE;
++    check((s_n == 1 || k1) && s_m[k1].msg == WM_KEYUP && s_m[k1].wp == 0x57,
++          "entering a dialogue lifts the walk key and picks nothing for a stick already pushed", "%s", dump());
++    s_n = 0;
++    int32_t lx = s.x, ly = s.y;
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(s_n == 0 && s.x == lx && s.y == ly, "a stick held since before the dialogue never picks, and neither stick looks or walks",
++          "%s at %d,%d", dump(), s.x, s.y);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, 0);
++    rstick(&s, &d, id, 0, 0);
++    check(s_n == 0, "centring the stick sends nothing", "%s", dump());
++
++    /* Each flick is its number key, laid out as the d-pad, once per push:
++       held for half a second it neither repeats nor moves anything. */
++    static const struct {
++        int x, y;
++        uint32_t vk;
++        const char *name;
++    } k_flick[] = {{0, -32767, 0x31, "up is 1"},     {32767, 0, 0x32, "right is 2"}, {0, 32767, 0x33, "down is 3"},
++                   {-32767, 0, 0x34, "left is 4"},   {9000, -30000, 0x31, "a diagonal goes to the axis further out (1)"},
++                   {20000, -30000, 0x31, "a diagonal past half tilt on both axes still goes to the further (1)"},
++                   {-30000, 20000, 0x34, "a diagonal goes to the axis further out (4)"}};
++    char name[96];
++    for (size_t i = 0; i < sizeof k_flick / sizeof *k_flick; i++) {
++        s_n = 0;
++        rstick(&s, &d, id, k_flick[i].x, k_flick[i].y);
++        snprintf(name, sizeof name, "dialogue flick %s", k_flick[i].name);
++        check(s_n >= 1 && s_n <= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == k_flick[i].vk, name, "%s", dump());
++        s_n = 0;
++        for (int f = 0; f < 50; f++) padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "dialogue flick %s, held, does not repeat", k_flick[i].name);
++        check(s_n == 0, name, "%s", dump());
++        rstick(&s, &d, id, 0, 0);
++        snprintf(name, sizeof name, "dialogue flick %s, released, lifts the key the game picks on", k_flick[i].name);
++        check(msgs_are(WM_KEYUP, k_flick[i].vk, 1), name, "%s", dump());
++    }
++    check((d.pad.logged[RT_PAD_DIALOGUE] >> RT_PAD_FLICK_UP & 0xFu) == 0xFu && !(d.pad.logged[RT_PAD_PLAY] >> RT_PAD_FLICK_UP & 0xFu),
++          "each flick's first press is logged in dialogue", "%X", d.pad.logged[RT_PAD_DIALOGUE]);
++
++    /* Hysteresis: past half tilt fires, easing back to a third holds, and
++       only under the dead zone lets go. */
++    s_n = 0;
++    rstick(&s, &d, id, 0, -14000);
++    check(s_n == 0, "a flick short of half tilt does not fire", "%s", dump());
++    rstick(&s, &d, id, 0, -20000);
++    check(s_n >= 1 && s_m[0].wp == 0x31, "past half tilt it fires", "%s", dump());
++    s_n = 0;
++    rstick(&s, &d, id, 0, -11000);
++    check(s_n == 0, "easing back above the release mark holds the key", "%s", dump());
++    rstick(&s, &d, id, 0, -5000);
++    check(msgs_are(WM_KEYUP, 0x31, 1), "under the release mark it lets go", "%s", dump());
++    rstick(&s, &d, id, 0, 0);
++
++    /* Swinging from one flick to the next without centring picks once:
++       the second answer needs the stick back first. */
++    s_n = 0;
++    rstick(&s, &d, id, 0, -32767);
++    rstick(&s, &d, id, 32767, -4000);
++    rstick(&s, &d, id, 32767, 0);
++    check(s_n == 2 + (s_m[1].msg == WM_CHAR) && s_m[0].wp == 0x31 && s_m[s_n - 1].msg == WM_KEYUP && s_m[s_n - 1].wp == 0x31,
++          "a swing from up to right without centring picks only 1", "%s", dump());
++    s_n = 0;
++    rstick(&s, &d, id, 0, 0);
++    rstick(&s, &d, id, 32767, 0);
++    check(s_n >= 1 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x32, "after centring the next flick picks", "%s", dump());
++    s_n = 0;
++    rstick(&s, &d, id, 0, 0);
++
++    /* The buttons in a dialogue. */
++    pad_map_mode(&s, &d, id, RT_PAD_DIALOGUE);
++
++    /* A menu opened over a dialogue takes the cursor; its close gives the
++       flicks back. */
++    s.cursor = 0x00007F00u;
++    rt_input_relative_update(&s);
++    s_n = 0;
++    padpump(&s, &d, 10);
++    check(rt_input_pad_mode(&s) == RT_PAD_MENU && d.pad.mode == RT_PAD_MENU, "a shown cursor beats the dialogue flag", "mode %d",
++          d.pad.mode);
++    int32_t x0 = s.x;
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTY, -32767);
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(s.y < 512 && x0 == s.x, "over a dialogue the right stick moves the menu cursor", "%d,%d", s.x, s.y);
++    int keyed = 0;
++    for (int i = 0; i < s_n; i++) keyed |= s_m[i].msg == WM_KEYDOWN;
++    check(!keyed, "and sends no number key", "%s", dump());
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    s_n = 0;
++    padpump(&s, &d, 10);
++    check(d.pad.mode == RT_PAD_DIALOGUE && s_n == 0, "the menu closing returns to dialogue, unarmed", "mode %d %s", d.pad.mode, dump());
++    rstick(&s, &d, id, 0, 0);
++
++    /* Exit with a flick held lifts its key, and play looks again. */
++    rstick(&s, &d, id, -32767, 0);
++    s_n = 0;
++    s.dialogue = 0;
++    padpump(&s, &d, 10);
++    check(d.pad.mode == RT_PAD_PLAY && s_n >= 1 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x34,
++          "the dialogue closing lifts a held flick's key", "mode %d %s", d.pad.mode, dump());
++    s_n = 0;
++    int32_t px = s.x;
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(s.x < px && s_n == 0, "after the dialogue the right stick looks again and picks nothing", "%d -> %d %s", px, s.x, dump());
++    rstick(&s, &d, id, 0, 0);
++
++    /* Lost focus is not a dialogue. */
++    s.dialogue = 1;
++    s.focus = 0;
++    check(rt_input_pad_mode(&s) == RT_PAD_PLAY, "without focus the dialogue flag is ignored", "%d", rt_input_pad_mode(&s));
++    s.focus = 1;
++    s.dialogue = 0;
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
+ static void pad_curve(void)
+ {
+     rt_pad p;
+@@ -1132,7 +1281,7 @@ static void pad_curve(void)
+         sum += dx;
+     }
+     check(sum == 120, "play look stays linear and separate: 10 x 10 ms at 1200 px/s is 120 px", "%d", sum);
+-    p.menu = RT_PAD_MENU;
++    p.mode = RT_PAD_MENU;
+     sum = 0;
+     for (int i = 0; i < 10; i++) {
+         rt_pad_move(&p, 0.01, &dx, &dy);
+@@ -1165,7 +1314,7 @@ static void pad_controls(void)
+         return;
+     }
+     fputs("# test\nmenu.south=space\nmenu.east=play\nwest=r\nmenu.dpup=up\ntouchpad=none\ncursor_speed=800\ncursor_power=2\n"
+-          "menu.bogus=x\nmenu.north=notakey\n",
++          "menu.bogus=x\nmenu.north=notakey\ndialogue.flickleft=5\ndialogue.east=play\ndialogue.flickup=nokey\n",
+           f);
+     fclose(f);
+     rt_pad p;
+@@ -1173,7 +1322,7 @@ static void pad_controls(void)
+     unlink(path);
+     rmdir(dir);
+     const rt_pad_tgt *t = rt_pad_target(&p, 0, 1);
+-    check(bad == 2, "two bad controls lines are counted", "%d", bad);
++    check(bad == 3, "three bad controls lines are counted", "%d", bad);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "menu.south remaps Cross in menus only", "%d %d", t->kind, t->arg);
+     t = rt_pad_target(&p, 0, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
+@@ -1190,6 +1339,16 @@ static void pad_controls(void)
+     t = rt_pad_target(&p, 3, 1);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_F, "a bad menu target falls through to play", "%d", t->arg);
+     check(p.cursor_speed == 800 && p.cursor_power == 2, "controls.txt sets the cursor curve", "%d %f", p.cursor_speed, p.cursor_power);
++    t = rt_pad_target(&p, RT_PAD_FLICK_LEFT, RT_PAD_DIALOGUE);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_5, "dialogue.flickleft remaps a flick", "%d %d", t->kind, t->arg);
++    t = rt_pad_target(&p, 1, RT_PAD_DIALOGUE);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "dialogue.east=play hands Circle back to its play key there", "%d", t->arg);
++    t = rt_pad_target(&p, 1, RT_PAD_MENU);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "menu.east=play still holds in menus", "%d", t->arg);
++    t = rt_pad_target(&p, RT_PAD_FLICK_UP, RT_PAD_DIALOGUE);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_1, "a bad dialogue target keeps the default flick", "%d", t->arg);
++    t = rt_pad_target(&p, RT_PAD_FLICK_UP, RT_PAD_PLAY);
++    check(t->kind == RT_PADT_NONE, "a flick is nothing outside a dialogue", "%d", t->kind);
+ }
+ 
+ int rt_input_selftest(void)
+@@ -1213,6 +1372,7 @@ int rt_input_selftest(void)
+     pad_drive();
+     pad_curve();
+     pad_modes();
++    pad_dialogue();
+     pad_controls();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 9ce0262..2ae7fdd 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -12,7 +12,7 @@
+ 
+ static const char *const k_names[RT_PAD_NBTN] = {"south", "east", "west", "north", "back", "start", "leftshoulder", "rightshoulder",
+                                                  "leftstick", "rightstick", "dpup", "dpdown", "dpleft", "dpright", "lefttrigger",
+-                                                 "righttrigger", "touchpad", "misc1"};
++                                                 "righttrigger", "touchpad", "misc1", "flickup", "flickright", "flickdown", "flickleft"};
+ 
+ /* -1 for the triggers, which are axes in SDL and buttons here. */
+ static const int k_sdl[RT_PAD_NBTN] = {
+@@ -20,7 +20,8 @@ static const int k_sdl[RT_PAD_NBTN] = {
+     SDL_GAMEPAD_BUTTON_BACK,       SDL_GAMEPAD_BUTTON_START,      SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+     SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_DPAD_UP,   SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+     SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SDL_GAMEPAD_BUTTON_DPAD_RIGHT,  -1,                           -1,
+-    SDL_GAMEPAD_BUTTON_TOUCHPAD,   SDL_GAMEPAD_BUTTON_MISC1,
++    SDL_GAMEPAD_BUTTON_TOUCHPAD,   SDL_GAMEPAD_BUTTON_MISC1,      -1,                           -1,
++    -1,                            -1,
+ };
+ 
+ /* Keys are the game's own binds (cfg/config.cfg): i is slot6, the
+@@ -29,22 +30,44 @@ static const int k_sdl[RT_PAD_NBTN] = {
+    to the touchpad and the Xbox share button. The Sense pair has neither,
+    so the quest log goes on L3 where every pad has it, and walk (lshift)
+    is left to controls.txt; crouch on R3 matters more for stealth. */
+-static const char *const k_default[RT_PAD_NBTN] = {"space", "e", "i",  "f", "c", "escape", "wheeldown", "wheelup", "l",
+-                                                   "lctrl", "1", "3",  "4", "2", "mouse2", "mouse1",    "r",       "r"};
+-
+-/* Where menu mode differs. Cross clicks so the Sense pair's thumb can
+-   work a screen without the trigger, Circle backs out, and the triggers
+-   are pinned to the mouse so a play remap cannot take clicking away.
+-   The d-pad stays on 1 to 4: dialogue answers are number keys, and the
+-   game binds the arrows to movement, which would walk the player behind
+-   the inventory panel. Anything not listed falls through to play. */
++static const char *const k_default[RT_PAD_NBTN] = {"space", "e",      "i",    "f",    "c",    "escape", "wheeldown", "wheelup",
++                                                   "l",     "lctrl",  "1",    "3",    "4",    "2",      "mouse2",    "mouse1",
++                                                   "r",     "r",      "none", "none", "none", "none"};
++
++/* Where menu and dialogue modes differ. In menus Cross clicks so the
++   Sense pair's thumb can work a screen without the trigger, Circle backs
++   out, and the triggers are pinned to the mouse so a play remap cannot
++   take clicking away. The d-pad stays on 1 to 4 in every mode: dialogue
++   answers are number keys, and the game binds the arrows to movement,
++   which would walk the player behind the inventory panel. Anything not
++   listed falls through to play. */
+ static const struct {
+-    int idx;
++    int mode, idx;
+     const char *target;
+-} k_menu_default[] = {
+-    {0, "mouse1"}, {1, "escape"}, {2, "i"}, {RT_PAD_LT, "mouse2"}, {RT_PAD_RT, "mouse1"},
++} k_mode_default[] = {
++    {RT_PAD_MENU, 0, "mouse1"},
++    {RT_PAD_MENU, 1, "escape"},
++    {RT_PAD_MENU, 2, "i"},
++    {RT_PAD_MENU, RT_PAD_LT, "mouse2"},
++    {RT_PAD_MENU, RT_PAD_RT, "mouse1"},
++    /* The dialogue HUD (client CHudDialog::Key_Event) answers only to the
++       number keys 1 to 4, picking on release, and has four answer slots;
++       it takes no cursor, no hover and no arrows, so there is nothing to
++       aim and no highlight to step. The right stick's four flicks send
++       the keys directly, laid out as the d-pad already is, so a Sense
++       pair and a gamepad read the same. Cross stays space: +jump is the
++       game's own "continue" in a dialogue. Circle is Escape as in menus;
++       the HUD ignores it and only the server's DialogCtrl closes a
++       dialogue, so it cannot cut one short. */
++    {RT_PAD_DIALOGUE, 1, "escape"},
++    {RT_PAD_DIALOGUE, RT_PAD_FLICK_UP, "1"},
++    {RT_PAD_DIALOGUE, RT_PAD_FLICK_RIGHT, "2"},
++    {RT_PAD_DIALOGUE, RT_PAD_FLICK_DOWN, "3"},
++    {RT_PAD_DIALOGUE, RT_PAD_FLICK_LEFT, "4"},
+ };
+ 
++static const char *const k_mode_names[RT_PAD_NMODES] = {"play", "menu", "dialogue"};
++
+ static const int k_dir_key[4] = {SDL_SCANCODE_W, SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_D};
+ 
+ static const char *const k_face[2][4] = {{"A", "B", "X", "Y"}, {"Cross", "Circle", "Square", "Triangle"}};
+@@ -73,6 +96,8 @@ const char *rt_pad_type_name(int kind) { return kind == RT_PAD_PLAYSTATION ? "pl
+ 
+ const char *rt_pad_button_name(int idx) { return idx >= 0 && idx < RT_PAD_NBTN ? k_names[idx] : ""; }
+ 
++const char *rt_pad_mode_name(int mode) { return mode >= 0 && mode < RT_PAD_NMODES ? k_mode_names[mode] : "?"; }
++
+ static int parse_target(const char *v, rt_pad_tgt *t)
+ {
+     if (!strcmp(v, "none")) {
+@@ -107,21 +132,24 @@ static const char *target_name(const rt_pad_tgt *t, char *b, size_t n)
+ void rt_pad_defaults(rt_pad *p)
+ {
+     memset(p, 0, sizeof *p);
++    p->flick = -1;
+     p->look_speed = RT_PAD_LOOK_SPEED;
+     p->cursor_speed = RT_PAD_CURSOR_SPEED;
+     p->cursor_power = RT_PAD_CURSOR_POWER;
+     p->cursor_dead = RT_PAD_CURSOR_DEAD;
+     p->cursor_left = RT_PAD_CURSOR_LEFT;
+     for (int i = 0; i < RT_PAD_NBTN; i++) parse_target(k_default[i], &p->map[i]);
+-    for (size_t i = 0; i < sizeof k_menu_default / sizeof *k_menu_default; i++) {
+-        parse_target(k_menu_default[i].target, &p->menu_map[k_menu_default[i].idx]);
+-        p->menu_set[k_menu_default[i].idx] = 1;
++    for (size_t i = 0; i < sizeof k_mode_default / sizeof *k_mode_default; i++) {
++        int m = k_mode_default[i].mode - 1, idx = k_mode_default[i].idx;
++        parse_target(k_mode_default[i].target, &p->over[m][idx]);
++        p->over_set[m][idx] = 1;
+     }
+ }
+ 
+-const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int menu)
++const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int mode)
+ {
+-    return menu && p->menu_set[idx] ? &p->menu_map[idx] : &p->map[idx];
++    if (mode > RT_PAD_PLAY && mode < RT_PAD_NMODES && p->over_set[mode - 1][idx]) return &p->over[mode - 1][idx];
++    return &p->map[idx];
+ }
+ 
+ static int number(const char *v, double lo, double hi, double *out)
+@@ -175,8 +203,8 @@ static int load_line(rt_pad *p, char *line)
+         return 1;
+     }
+     if (!t) return 0;
+-    int menu = !strncmp(line, "menu.", 5);
+-    const char *name = menu ? line + 5 : line;
++    int mode = !strncmp(line, "menu.", 5) ? RT_PAD_MENU : !strncmp(line, "dialogue.", 9) ? RT_PAD_DIALOGUE : RT_PAD_PLAY;
++    const char *name = mode == RT_PAD_MENU ? line + 5 : mode == RT_PAD_DIALOGUE ? line + 9 : line;
+     int idx = -1;
+     for (int i = 0; i < RT_PAD_NBTN; i++)
+         if (!strcmp(name, k_names[i])) idx = i;
+@@ -184,9 +212,10 @@ static int load_line(rt_pad *p, char *line)
+         rt_log("pad controls: unknown button \"%s\"", line);
+         return 1;
+     }
+-    /* menu.X=play hands a button back to its play target in menus. */
+-    if (menu && !strcmp(v, "play")) {
+-        p->menu_set[idx] = 0;
++    /* menu.X=play (or dialogue.X=play) hands a button back to its play
++       target in that mode. */
++    if (mode && !strcmp(v, "play")) {
++        p->over_set[mode - 1][idx] = 0;
+         return 0;
+     }
+     rt_pad_tgt tg;
+@@ -194,9 +223,9 @@ static int load_line(rt_pad *p, char *line)
+         rt_log("pad controls: bad target \"%s\" for %s, default kept", v, line);
+         return 1;
+     }
+-    if (menu) {
+-        p->menu_map[idx] = tg;
+-        p->menu_set[idx] = 1;
++    if (mode) {
++        p->over[mode - 1][idx] = tg;
++        p->over_set[mode - 1][idx] = 1;
+     } else {
+         p->map[idx] = tg;
+     }
+@@ -295,8 +324,8 @@ static int emit(const rt_pad_tgt *t, int down, rt_pad_pt pt, SDL_Event *out, int
+ static void log_first(rt_pad *p, int idx, const rt_pad_tgt *t)
+ {
+     uint32_t bit = 1u << idx;
+-    if (p->logged[p->menu] & bit) return;
+-    p->logged[p->menu] |= bit;
++    if (p->logged[p->mode] & bit) return;
++    p->logged[p->mode] |= bit;
+     char lab[24] = "", tb[16];
+     if (k_sdl[idx] >= 0) {
+         int kind = rt_pad_kind();
+@@ -305,7 +334,7 @@ static void log_first(rt_pad *p, int idx, const rt_pad_tgt *t)
+         if (l >= SDL_GAMEPAD_BUTTON_LABEL_A && l <= SDL_GAMEPAD_BUTTON_LABEL_Y) snprintf(lab, sizeof lab, " (%s)", k_face[0][l - SDL_GAMEPAD_BUTTON_LABEL_A]);
+         else if (l >= SDL_GAMEPAD_BUTTON_LABEL_CROSS) snprintf(lab, sizeof lab, " (%s)", k_face[1][l - SDL_GAMEPAD_BUTTON_LABEL_CROSS]);
+     }
+-    rt_log("pad first %s%s in %s -> %s", k_names[idx], lab, p->menu ? "menu" : "play", target_name(t, tb, sizeof tb));
++    rt_log("pad first %s%s in %s -> %s", k_names[idx], lab, k_mode_names[p->mode], target_name(t, tb, sizeof tb));
+ }
+ 
+ /* A release sends what the press sent: Cross held as space when a menu
+@@ -315,7 +344,7 @@ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, in
+     if (idx < 0 || idx >= RT_PAD_NBTN || p->down[idx] == (down != 0)) return 0;
+     p->down[idx] = down != 0;
+     if (!down) return emit(&p->held[idx], 0, pt, out, cap);
+-    p->held[idx] = *rt_pad_target(p, idx, p->menu);
++    p->held[idx] = *rt_pad_target(p, idx, p->mode);
+     log_first(p, idx, &p->held[idx]);
+     return emit(&p->held[idx], 1, pt, out, cap);
+ }
+@@ -327,11 +356,47 @@ static int dir_key(rt_pad *p, int d, int on, rt_pad_pt pt, SDL_Event *out, int c
+     return emit(&(rt_pad_tgt){RT_PADT_KEY, k_dir_key[d]}, on, pt, out, cap);
+ }
+ 
++/* Which flick the right stick holds, as a button index or -1. The axis
++   that is further out wins, a held flick lets go only when its own axis
++   comes back under the release mark, and after entering a dialogue
++   nothing fires until the stick has been back to the centre: a player
++   looking around as the dialogue opens must not pick an answer. */
++static int flick_of(rt_pad *p)
++{
++    int ax = abs(p->rx), ay = abs(p->ry);
++    if (ax <= RT_PAD_FLICK_OFF && ay <= RT_PAD_FLICK_OFF) p->flick_armed = 1;
++    if (p->flick >= 0) {
++        int v = p->flick == RT_PAD_FLICK_UP ? -p->ry : p->flick == RT_PAD_FLICK_DOWN ? p->ry : p->flick == RT_PAD_FLICK_LEFT ? -p->rx : p->rx;
++        if (v > RT_PAD_FLICK_OFF) return p->flick;
++    }
++    if (!p->flick_armed) return -1;
++    if (ay >= ax && ay > RT_PAD_FLICK_ON) return p->ry < 0 ? RT_PAD_FLICK_UP : RT_PAD_FLICK_DOWN;
++    if (ax > ay && ax > RT_PAD_FLICK_ON) return p->rx < 0 ? RT_PAD_FLICK_LEFT : RT_PAD_FLICK_RIGHT;
++    return -1;
++}
++
++/* One press per flick and no repeat: the game picks on the key's
++   release, so a held stick picks once, and a second answer needs the
++   stick to come back first. Called once both axes are read, so a
++   diagonal is judged whole rather than by whichever axis came first. */
++int rt_pad_flick(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
++{
++    int f = p->mode == RT_PAD_DIALOGUE ? flick_of(p) : -1, n = 0;
++    if (f == p->flick) return 0;
++    if (p->flick >= 0) n += rt_pad_button(p, p->flick, 0, pt, out, cap);
++    p->flick = f;
++    if (f >= 0) {
++        p->flick_armed = 0;
++        n += rt_pad_button(p, f, 1, pt, out + n, cap - n);
++    }
++    return n;
++}
++
+ /* In menus the left stick is a second, finer cursor, so it holds no
+-   movement keys there. */
++   movement keys there; nor in a dialogue, where the player stands. */
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+-    int n = 0, walk = !p->menu;
++    int n = 0, walk = p->mode == RT_PAD_PLAY;
+     switch (axis) {
+     case SDL_GAMEPAD_AXIS_LEFTX:
+         p->lx = value;
+@@ -352,17 +417,22 @@ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, in
+     return n;
+ }
+ 
+-/* Entering a menu lifts any held movement key, and either way the
+-   carried fraction is dropped: it was in the other mode's units. */
+-int rt_pad_mode(rt_pad *p, int menu, rt_pad_pt pt, SDL_Event *out, int cap)
++/* Leaving play lifts any held movement key, leaving a dialogue lifts a
++   held flick's number key, and either way the carried fraction is
++   dropped: it was in the other mode's units. A dialogue starts unarmed,
++   so the stick that was looking has to centre before it can pick. */
++int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+-    menu = menu != 0;
+-    if (p->menu == menu) return 0;
+-    p->menu = menu;
+-    p->fx = p->fy = 0;
+-    rt_log("pad mode %s", menu ? "menu" : "play");
++    if (mode < RT_PAD_PLAY || mode >= RT_PAD_NMODES) mode = RT_PAD_PLAY;
++    if (p->mode == mode) return 0;
+     int n = 0;
+-    if (menu)
++    if (p->flick >= 0) n += rt_pad_button(p, p->flick, 0, pt, out, cap);
++    p->flick = -1;
++    p->flick_armed = 0;
++    p->mode = mode;
++    p->fx = p->fy = 0;
++    rt_log("pad mode %s", k_mode_names[mode]);
++    if (mode != RT_PAD_PLAY)
+         for (int d = 0; d < 4; d++) n += dir_key(p, d, 0, pt, out + n, cap - n);
+     return n;
+ }
+@@ -374,6 +444,8 @@ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
+     for (int d = 0; d < 4; d++) n += dir_key(p, d, 0, pt, out + n, cap - n);
+     p->rx = p->ry = p->lx = p->ly = 0;
+     p->fx = p->fy = 0;
++    p->flick = -1;
++    p->flick_armed = 0;
+     return n;
+ }
+ 
+@@ -414,12 +486,19 @@ void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *v
+     *vy = uy * s;
+ }
+ 
++/* A dialogue neither looks nor moves a cursor: the right stick is its
++   flicks, and the HUD has no pointer to move. */
+ void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy)
+ {
+-    if (!p->menu) {
++    if (p->mode == RT_PAD_PLAY) {
+         look(p, dt, dx, dy);
+         return;
+     }
++    if (p->mode == RT_PAD_DIALOGUE) {
++        *dx = *dy = 0;
++        p->fx = p->fy = 0;
++        return;
++    }
+     double rx, ry, lx, ly;
+     rt_pad_cursor_velocity(p, p->rx, p->ry, &rx, &ry);
+     rt_pad_cursor_velocity(p, p->lx, p->ly, &lx, &ly);
+@@ -491,7 +570,7 @@ static void drive(rt_pad_dev *d, int i, const char *why)
+ /* Every connected pad is open and the one used last drives, so a
+    DualSense or Xbox pad and the Sense pair both work without
+    reconnecting either. A switch lifts what the old pad held first. */
+-int rt_pad_poll(rt_pad_dev *d, int active, int menu, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy)
++int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy)
+ {
+     int n = 0;
+     *dx = *dy = 0;
+@@ -550,10 +629,11 @@ int rt_pad_poll(rt_pad_dev *d, int active, int menu, rt_pad_pt pt, uint64_t now_
+         if (d->gp) d->last_ns = now_ns;
+         return n;
+     }
+-    n += rt_pad_mode(&d->pad, menu, pt, out + n, cap - n);
++    n += rt_pad_mode(&d->pad, mode, pt, out + n, cap - n);
+     for (int i = 0; i < RT_PAD_NBTN; i++)
+         if (k_sdl[i] >= 0) n += rt_pad_button(&d->pad, i, SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)k_sdl[i]), pt, out + n, cap - n);
+     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++) n += rt_pad_axis(&d->pad, a, SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a), pt, out + n, cap - n);
++    n += rt_pad_flick(&d->pad, pt, out + n, cap - n);
+     /* Real elapsed time, not whole milliseconds: at 120 Hz truncating to
+        8 ms would run the cursor 4% slow. Long stalls are capped so a
+        hitch does not fling it. */
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 4104510..8832f51 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -10,17 +10,27 @@ enum { RT_PAD_XBOX, RT_PAD_PLAYSTATION };
+ enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL };
+ 
+ /* The triggers keep 14 and 15 so controls.txt and the m9 rows read as
+-   before; the touchpad and Xbox share button come after them. */
+-enum { RT_PAD_LT = 14, RT_PAD_RT = 15, RT_PAD_TOUCHPAD = 16, RT_PAD_MISC1 = 17, RT_PAD_NBTN = 18 };
++   before; the touchpad and Xbox share button come after them. The four
++   flicks are the right stick pushed one way in a dialogue: buttons with
++   no SDL source, so they map, release and log like any other. */
++enum { RT_PAD_LT = 14, RT_PAD_RT = 15, RT_PAD_TOUCHPAD = 16, RT_PAD_MISC1 = 17, RT_PAD_FLICK_UP = 18, RT_PAD_FLICK_RIGHT = 19,
++       RT_PAD_FLICK_DOWN = 20, RT_PAD_FLICK_LEFT = 21, RT_PAD_NBTN = 22 };
+ 
+ /* Play has the pointer locked and the right stick looking; menu is any
+-   time the game shows its cursor, the same test rt_host_cursor makes. */
+-enum { RT_PAD_PLAY, RT_PAD_MENU };
++   time the game shows its cursor, the same test rt_host_cursor makes.
++   Dialogue is the game's dialogue HUD being active: it shows no cursor
++   and takes no mouse, so it is told apart by the HUD's own flag. */
++enum { RT_PAD_PLAY, RT_PAD_MENU, RT_PAD_DIALOGUE, RT_PAD_NMODES };
+ 
+ #define RT_PAD_DEAD 8000
+ #define RT_PAD_TRIGGER 16384
+ #define RT_PAD_LOOK_SPEED 1200
+ #define RT_PAD_EVENTS 64
++
++/* A flick fires past half tilt on its axis and lets go under the stick's
++   dead zone, so a stick resting near the threshold cannot chatter. */
++#define RT_PAD_FLICK_ON 16384
++#define RT_PAD_FLICK_OFF RT_PAD_DEAD
+ #define RT_PAD_MAX 4
+ 
+ /* The menu cursor, in guest client pixels per second at full tilt. At
+@@ -42,14 +52,16 @@ typedef struct {
+ 
+ typedef struct {
+     rt_pad_tgt map[RT_PAD_NBTN];
+-    rt_pad_tgt menu_map[RT_PAD_NBTN];
+-    uint8_t menu_set[RT_PAD_NBTN];
++    /* Menu and dialogue overrides, indexed by mode minus one. */
++    rt_pad_tgt over[RT_PAD_NMODES - 1][RT_PAD_NBTN];
++    uint8_t over_set[RT_PAD_NMODES - 1][RT_PAD_NBTN];
+     rt_pad_tgt held[RT_PAD_NBTN];
+     int look_speed;
+     int cursor_speed, cursor_dead;
+     double cursor_power, cursor_left;
+-    int menu;
+-    uint32_t logged[2];
++    int mode;
++    uint32_t logged[RT_PAD_NMODES];
++    int flick, flick_armed;
+     uint8_t down[RT_PAD_NBTN];
+     uint8_t dir[4];
+     int rx, ry, lx, ly;
+@@ -76,16 +88,18 @@ int rt_pad_detect(SDL_GamepadType type, const char *name);
+ int rt_pad_kind(void);
+ const char *rt_pad_type_name(int kind);
+ const char *rt_pad_button_name(int idx);
++const char *rt_pad_mode_name(int mode);
+ 
+ void rt_pad_defaults(rt_pad *p);
+ int rt_pad_tune(rt_pad *p, const char *key, const char *value);
+ int rt_pad_load(rt_pad *p, const char *dir);
+ int rt_pad_mappings(const char *dir);
+-const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int menu);
++const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int mode);
+ 
+ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap);
+-int rt_pad_mode(rt_pad *p, int menu, rt_pad_pt pt, SDL_Event *out, int cap);
++int rt_pad_flick(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
++int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy);
+ void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *vy);
+@@ -93,7 +107,7 @@ void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy);
+ 
+ void rt_pad_dev_init(rt_pad_dev *d, const char *dir);
+ int rt_pad_start(const char *dir);
+-int rt_pad_poll(rt_pad_dev *d, int active, int menu, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy);
++int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy);
+ 
+ int rt_pad_test_start(void);
+ SDL_JoystickID rt_pad_test_attach(const char *name);
+-- 
+2.54.0 (Apple Git-157)
+

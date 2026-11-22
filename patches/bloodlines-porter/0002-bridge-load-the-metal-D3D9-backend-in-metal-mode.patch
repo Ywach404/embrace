@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:18:25 -0600
+Subject: [PATCH 2/4] bridge: load the metal D3D9 backend in metal mode
+
+rt_gfx_init dlopens RT_METAL_D3D9_LIB (or libmetal_d3d9.dylib beside the
+executable, or in Contents/Frameworks in a bundle), resolves the same
+Direct3DCreate9 entry as DXVK and hands the library rt_log and rt_stop.
+None of the Vulkan, ICD or DXVK environment is set up and none of it is
+required.
+
+The post stage 9 image check inverts for this mode: our library once,
+one libSDL3, and no DXVK or Vulkan image. Direct3DCreate9 and the menu
+frame line treat metal like dxvk, and the stage 9 line names the mode.
+---
+ shims/d3d9_bridge.c | 92 +++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 84 insertions(+), 8 deletions(-)
+
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index ac30fd4..fbbe564 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -928,6 +928,27 @@ static void image_check(void)
+                        "libvulkan_lvp %d", sdl, loader, kk, lvp);
+ }
+ 
++/* The metal mode loads one D3D9 library of its own and no Vulkan at all, so
++   the check inverts: our library once, one libSDL3, and no DXVK, loader or
++   ICD image, since any of them would mean a second renderer in the process. */
++static void metal_image_check(void)
++{
++    int sdl = 0, ours = 0, other = 0;
++    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
++        const char *n = _dyld_get_image_name(i), *b = strrchr(n, '/');
++        b = b ? b + 1 : n;
++        if (!strstr(b, "libdxvk_d3d9") && !strstr(b, "libvulkan") && !strstr(b, "libSDL3") && !strstr(b, "libmetal_d3d9"))
++            continue;
++        rt_log("gfx image %s", n);
++        sdl += !strncmp(b, "libSDL3", 7);
++        ours += !strncmp(b, "libmetal_d3d9", 13);
++        other += strstr(b, "libdxvk_d3d9") || strstr(b, "libvulkan");
++    }
++    if (sdl != 1 || ours != 1 || other)
++        rt_stop(15, 0, "gfx image check failed: libSDL3 images %d, libmetal_d3d9 %d, dxvk or Vulkan images %d", sdl, ours,
++                other);
++}
++
+ static void native_window(rt_win *w)
+ {
+     int ww, wh;
+@@ -975,10 +996,11 @@ static uint32_t d_createdevice(const uint32_t *a)
+     h_adapter_id id;
+     memset(&id, 0, sizeof id);
+     VT(e->host, D_ADAPTERID, HR (*)(void *, uint32_t, uint32_t, h_adapter_id *))(e->host, a[1], 0, &id);
+-    rt_stage(9, "dxvk \"%.*s\" vendor 0x%04X %ux%u windowed %d format %u flags 0x%X backbuffers %u interval 0x%X", 512,
+-             id.Description, id.VendorId, pp.BackBufferWidth, pp.BackBufferHeight, pp.Windowed, pp.BackBufferFormat,
+-             a[4], pp.BackBufferCount, pp.PresentationInterval);
+-    image_check();
++    rt_stage(9, "%s \"%.*s\" vendor 0x%04X %ux%u windowed %d format %u flags 0x%X backbuffers %u interval 0x%X",
++             s_mode == RT_GFX_METAL ? "metal" : "dxvk", 512, id.Description, id.VendorId, pp.BackBufferWidth,
++             pp.BackBufferHeight, pp.Windowed, pp.BackBufferFormat, a[4], pp.BackBufferCount, pp.PresentationInterval);
++    if (s_mode == RT_GFX_METAL) metal_image_check();
++    else image_check();
+     s_dev_window = dw ? dw->sdl : fw ? fw->sdl : NULL;
+     s_dev_host = dev;
+     pthread_mutex_lock(&s_pr_mu);
+@@ -2343,12 +2365,12 @@ static void build(void)
+ 
+ static uint32_t b_create9(const uint32_t *a)
+ {
+-    if (s_mode != RT_GFX_DXVK) return rt_d3d9_null_shims[0].fn(a);
++    if (s_mode == RT_GFX_NULL) return rt_d3d9_null_shims[0].fn(a);
+     main_only("Direct3DCreate9");
+     build();
+     void *d = s_create9(a[0]);
+     uint32_t p = wrap(d, K_D3D, 0);
+-    rt_log("Direct3DCreate9(%u) -> dxvk IDirect3D9 0x%08X", a[0], p);
++    rt_log("Direct3DCreate9(%u) -> %s IDirect3D9 0x%08X", a[0], s_mode == RT_GFX_METAL ? "metal" : "dxvk", p);
+     return p;
+ }
+ 
+@@ -2407,7 +2429,7 @@ int rt_gfx_present_rects(rt_present_rects *r)
+     return r->sw > 0 && r->sh > 0 && r->dw > 0 && r->dh > 0;
+ }
+ 
+-void rt_gfx_menu(void) { s_menu_pending = s_mode == RT_GFX_DXVK; }
++void rt_gfx_menu(void) { s_menu_pending = s_mode != RT_GFX_NULL; }
+ 
+ static void env(const char *name, const char *value)
+ {
+@@ -2476,11 +2498,65 @@ static void archive_dxvk_log(const char *dir)
+     closedir(d);
+ }
+ 
++static void metal_log(const char *msg) { rt_log("gfx metal %s", msg); }
++
++static void metal_stop(const char *msg) { rt_stop(10, 0, "gfx metal %s", msg); }
++
++/* The metal backend exports the same Direct3DCreate9 entry DXVK does and
++   implements the interfaces with the same vtable order and plain C ABI, so
++   the bridge's repacking, bounce locks and capture hooks are unchanged. The
++   one extra export hands it rt_log and rt_stop, so an unexpected method
++   stops the run through the runtime with its name. Nothing Vulkan is set up
++   or required here. */
++static int metal_init(const char *overlay)
++{
++    char exe[PATH_MAX], lib[PATH_MAX], path[PATH_MAX + 64];
++    own_exe(exe);
++    const char *e_lib = getenv("RT_METAL_D3D9_LIB");
++    char *slash = strrchr(exe, '/');
++    if (slash) *slash = 0;
++    size_t n = strlen(exe);
++    if (e_lib) snprintf(lib, sizeof lib, "%s", e_lib);
++    else if (n > 15 && !strcmp(exe + n - 15, "/Contents/MacOS"))
++        snprintf(lib, sizeof lib, "%.*s/Frameworks/libmetal_d3d9.dylib", (int)(n - 6), exe);
++    else snprintf(lib, sizeof lib, "%s/libmetal_d3d9.dylib", exe);
++    rt_log("gfx paths metal: lib %s", lib);
++    if (access(lib, R_OK)) {
++        rt_log("gfx missing %s; --gfx null runs without it", lib);
++        return -1;
++    }
++    snprintf(path, sizeof path, "%s/files/Vampire/vidcfg.bin", overlay);
++    FILE *f = fopen(path, "rb");
++    if (f) {
++        unsigned char id[16];
++        int zero = fread(id, 1, 16, f) == 16;
++        fclose(f);
++        for (int i = 0; i < 16 && zero; i++) zero = !id[i];
++        if (zero) rt_log("gfx deleted %s (null device ID): %s", path, unlink(path) ? "failed" : "ok");
++    }
++    s_lib = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
++    if (!s_lib) {
++        rt_log("gfx missing %s: %s; --gfx null runs without it", lib, dlerror());
++        return -1;
++    }
++    s_create9 = (void *(*)(uint32_t))dlsym(s_lib, "Direct3DCreate9");
++    void (*host)(void (*)(const char *), void (*)(const char *)) =
++        (void (*)(void (*)(const char *), void (*)(const char *)))dlsym(s_lib, "metal_d3d9_set_host");
++    if (!s_create9 || !host) {
++        rt_log("gfx missing Direct3DCreate9 or metal_d3d9_set_host in %s; --gfx null runs without it", lib);
++        return -1;
++    }
++    host(metal_log, metal_stop);
++    rt_log("gfx metal %s", lib);
++    return 0;
++}
++
+ int rt_gfx_init(int mode, const char *overlay)
+ {
+     s_mode = mode;
+     snprintf(s_overlay, sizeof s_overlay, "%s", overlay);
+-    rt_d3d9_bridge_shims[0].kind = mode == RT_GFX_DXVK ? RT_SHIM_BRIDGE : RT_SHIM_REAL;
++    rt_d3d9_bridge_shims[0].kind = mode != RT_GFX_NULL ? RT_SHIM_BRIDGE : RT_SHIM_REAL;
++    if (mode == RT_GFX_METAL) return metal_init(overlay);
+     if (mode != RT_GFX_DXVK) {
+         rt_log("gfx null");
+         return 0;

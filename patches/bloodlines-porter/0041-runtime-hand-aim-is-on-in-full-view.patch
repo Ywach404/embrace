@@ -1,0 +1,47 @@
+From a57babb9e6850b36c649854d2814e04b0a6966f6 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:00:37 -0600
+Subject: [PATCH] runtime: hand aim is on in full view
+
+With the gun following the aiming hand there is something on screen to aim by, and a headset run hit where the gun pointed, so hand aim comes on by default in full view as the earlier opt in planned. RT_HANDAIM=0 turns it off; RT_HANDAIM=1 also turns it on away from full view.
+---
+ runtime/handaim.c | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/handaim.c b/runtime/handaim.c
+index 2d8e763..b14cbbf 100644
+--- a/runtime/handaim.c
++++ b/runtime/handaim.c
+@@ -58,19 +58,22 @@ static uint32_t s_aimed;
+ uint32_t rt_hand_aim_commands(void) { return __atomic_load_n(&s_aimed, __ATOMIC_RELAXED); }
+ 
+ #if TARGET_OS_VISION
+-/* Off unless RT_HANDAIM=1: with nothing on screen showing where the hand
+-   aims (the gun still followed the head), every shot of a headset run
+-   (2026-11-21) went where the hand pointed and none where the player
+-   looked. The view model now follows the hand as well; it can come on by
+-   default once a headset run shows the gun where the shots go. */
++int metal_d3d9_fullview_enabled(void);
++
++/* On in full view, where the room and the game's world line up so the
++   hand points where it looks like it points, and the gun follows the hand
++   so there is something to aim by (a headset run, 2026-11-21, hit where
++   the gun pointed). Before the gun followed, aiming blind hit nothing.
++   RT_HANDAIM=0 turns it off, RT_HANDAIM=1 also turns it on off full
++   view. */
+ static int wanted(void)
+ {
+     static int env = -2;
+     if (env == -2) {
+         const char *v = getenv("RT_HANDAIM");
+-        env = v && *v == '1';
++        env = v && *v ? *v != '0' : -1;
+     }
+-    return env;
++    return env >= 0 ? env : metal_d3d9_fullview_enabled();
+ }
+ 
+ /* ARKit's aim for a Sense controller points well above where the hand
+-- 
+2.54.0 (Apple Git-157)
+

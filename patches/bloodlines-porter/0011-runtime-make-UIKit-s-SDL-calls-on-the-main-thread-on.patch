@@ -1,0 +1,620 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 12:38:01 -0600
+Subject: [PATCH 11/11] runtime: make UIKit's SDL calls on the main thread on
+ visionOS
+
+The first simulator run stopped in SDL_VideoInit on the runtime's
+thread: UIKit_SuspendScreenSaver set the idle timer, FrontBoard asserted
+it was off the main thread, and the process took a SIGTRAP. Patch 0010
+had made the runtime's thread SDL's main thread, but on visionOS UIKit
+only accepts the process main thread, which the host app's SwiftUI run
+loop owns.
+
+So the main thread becomes SDL's main thread. rt_host_start, which the
+host calls there, declares it ready before the runtime's thread exists,
+and every SDL call that reaches UIKit is made there through rt_main_hop
+(runtime/main_hop.h), a dispatch_sync to the main queue that runs in
+place when already on it, so hops nest. SDL_RunOnMainThread does not
+fit: SDL drains its queue only from an SDL_PumpEvents on its main
+thread, which nothing on the SwiftUI side calls. The wait is safe
+because the main thread never waits for the runtime: the host's done
+callback is asynchronous, nothing calls SDL_Quit, and the runtime ends
+with _exit.
+
+The hops are coarse. Video init is one (with SDL's iOS event pump off,
+since SwiftUI already runs the main run loop and delivers UIKit's events
+to SDL's views). Creating, showing, resizing and freeing a window is one
+each, which carries the configuration, placement, text input, input
+window and gamepad start along with it. The whole pump is one, events,
+input script, cursor, warp, relative mode and the full screen tick
+included. The bridge's native window resize is one. Waiting for events
+watches SDL's queue without pumping, since SDL_WaitEventTimeout would
+pump on the calling thread.
+
+The window's pixel size, which SDL reads from the UIView and the present
+path asks for every frame, is cached at the end of every hop and read
+from the cache off the main thread. The bridge's D3D9 thread guard asks
+for the guest's primary thread instead of SDL's main thread, which is
+the same thread on the Mac and no longer is here.
+
+Audio, timers, hints, event pushes, gamepad state and the window and
+display fields SDL keeps in its own structs stay where they are called.
+The Mac build is unchanged.
+---
+ runtime/host.h      |   5 +-
+ runtime/input.c     |  25 ++++-
+ runtime/main.c      |   4 +
+ runtime/main_hop.h  |  34 +++++++
+ runtime/window.c    | 237 ++++++++++++++++++++++++++++++++++++++++----
+ shims/d3d9_bridge.c |  52 ++++++++--
+ 6 files changed, 330 insertions(+), 27 deletions(-)
+ create mode 100644 runtime/main_hop.h
+
+diff --git a/runtime/host.h b/runtime/host.h
+index b77051b..1a3271c 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -15,7 +15,10 @@
+  * called on that thread with main's result when a run is refused or ends
+  * by returning; a game that quits ends the process from inside the
+  * runtime, as it does on the Mac. Returns 0, or an errno value if the
+- * thread could not be made.
++ * thread could not be made. Call it on the main thread, which UIKit
++ * requires for SDL's video: the runtime's window calls hop there from its
++ * own thread and wait (runtime/main_hop.h), so the main thread must keep
++ * its run loop running and never wait for the runtime.
+  */
+ int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status));
+ 
+diff --git a/runtime/input.c b/runtime/input.c
+index 9c2610d..46273e6 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1,6 +1,11 @@
+ #include "input.h"
+ #include "toggles.h"
+ 
++#include <TargetConditionals.h>
++#if TARGET_OS_VISION
++#include "main_hop.h"
++#endif
++
+ #include <math.h>
+ #include <pthread.h>
+ #include <stdio.h>
+@@ -787,13 +792,29 @@ void rt_input_pump_end(void)
+     }
+ }
+ 
+-void rt_input_minimise(int on)
++static void minimise(int on)
+ {
+-    if (!s_win) return;
+     if (on ? SDL_MinimizeWindow(s_win) : SDL_RestoreWindow(s_win)) rt_log("window %s", on ? "minimised" : "restored");
+     else rt_log("window %s failed: %s", on ? "minimise" : "restore", SDL_GetError());
+ }
+ 
++#if TARGET_OS_VISION
++static void minimise_hop(void *p) { minimise(*(int *)p); }
++#endif
++
++/* Reached from input scripts, which run inside the pump's hop on visionOS,
++   where this hop runs in place; it hops itself so no other caller can
++   reach UIKit from the runtime's thread. */
++void rt_input_minimise(int on)
++{
++    if (!s_win) return;
++#if TARGET_OS_VISION
++    rt_main_hop(minimise_hop, &on);
++#else
++    minimise(on);
++#endif
++}
++
+ void rt_input_taken(const uint32_t m[7])
+ {
+     pthread_mutex_lock(&s_mu);
+diff --git a/runtime/main.c b/runtime/main.c
+index 74707d4..221a3c2 100644
+--- a/runtime/main.c
++++ b/runtime/main.c
+@@ -18,6 +18,7 @@
+ 
+ #if TARGET_OS_VISION
+ #include "host.h"
++#include "main_hop.h"
+ 
+ #include <pthread.h>
+ 
+@@ -494,6 +495,9 @@ int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, voi
+     h->done = done;
+     s_host_desk_w = desk_w;
+     s_host_desk_h = desk_h;
++    /* Before the runtime's thread exists, so the main thread, where UIKit
++       requires SDL's video to live, is the one SDL takes as its main. */
++    rt_window_main_ready();
+     pthread_attr_t a;
+     pthread_attr_init(&a);
+     pthread_attr_setstacksize(&a, RT_HOST_STACK);
+diff --git a/runtime/main_hop.h b/runtime/main_hop.h
+new file mode 100644
+index 0000000..2f0f243
+--- /dev/null
++++ b/runtime/main_hop.h
+@@ -0,0 +1,34 @@
++#ifndef RT_MAIN_HOP_H
++#define RT_MAIN_HOP_H
++
++/*
++ * visionOS only. UIKit and FrontBoard assert that windows, scenes and views
++ * are touched on the process main thread, and on visionOS that thread runs
++ * the host app's SwiftUI run loop while the runtime runs on host_thread
++ * (runtime/host.h). So every SDL call that reaches UIKit is made on the
++ * main thread through rt_main_hop, and SDL's video and events are
++ * initialised there, which makes the real main thread SDL's main thread.
++ *
++ * rt_main_hop runs fn(ctx) on the main thread and returns when it has run.
++ * It is a dispatch_sync to the main queue, not SDL_RunOnMainThread: SDL
++ * only drains that queue from an SDL_PumpEvents on its main thread, which
++ * nothing on the SwiftUI side calls. Waiting is safe because the main
++ * thread never waits for the runtime's threads: the host's done callback
++ * goes back to it asynchronously, and the runtime has no SDL_Quit and ends
++ * the process with _exit. Called on the main thread, fn runs in place, so
++ * hops nest (a pump hop that runs an input script that minimises).
++ *
++ * Every hop also refreshes a cached pixel size of the game's main window,
++ * which rt_window_pixels answers from off the main thread, because SDL
++ * reads it from the UIView's bounds and the present path asks every frame.
++ *
++ * rt_window_main_ready declares the main thread SDL's main thread. The
++ * host calls it, through rt_host_start, before the runtime's thread exists,
++ * so no SDL subsystem the runtime's thread starts (audio, from the dsound
++ * shim) can make that thread SDL's main thread instead.
++ */
++void rt_main_hop(void (*fn)(void *ctx), void *ctx);
++int rt_window_pixels(void *sdl_window, int *w, int *h);
++void rt_window_main_ready(void);
++
++#endif
+diff --git a/runtime/window.c b/runtime/window.c
+index 4bce839..d2220d4 100644
+--- a/runtime/window.c
++++ b/runtime/window.c
+@@ -9,6 +9,11 @@
+ #if TARGET_OS_VISION
+ #define SDL_MAIN_HANDLED
+ #include <SDL3/SDL_main.h>
++
++#include "main_hop.h"
++
++#include <dispatch/dispatch.h>
++#include <pthread.h>
+ #endif
+ #include <dlfcn.h>
+ #include <math.h>
+@@ -55,16 +60,13 @@ static uint32_t now_ms(void) { return (uint32_t)(rt_now_ns() / 1000000u); }
+ 
+ int rt_window_launch_full(void) { return s_ws.fullscreen; }
+ 
+-int rt_window_init(void)
++static int video_init(void)
+ {
+-    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1");
+-    SDL_SetHint(SDL_HINT_VIDEO_METAL_AUTO_RESIZE_DRAWABLE, "0");
+ #if TARGET_OS_VISION
+-    /* SDL on UIKit refuses SDL_Init until its main has been declared ready,
+-       which SDL_main would do. The host app owns UIApplicationMain and runs
+-       the runtime on its own thread, so that thread declares itself SDL's
+-       main thread here, before the video subsystem records it. */
+-    SDL_SetMainReady();
++    /* SwiftUI already runs the main run loop, which delivers UIKit's events
++       to SDL's views. SDL's own pump would spin that run loop again from
++       inside a hop, nested in a main queue block, for nothing. */
++    SDL_SetiOSEventPump(false);
+ #endif
+     if (!SDL_Init(SDL_INIT_VIDEO)) {
+         rt_log("SDL_Init(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
+@@ -88,6 +90,101 @@ int rt_window_init(void)
+     return 0;
+ }
+ 
++#if TARGET_OS_VISION
++/* The main window's size in pixels, w << 32 | h, or 0 when there is none.
++   Written on the main thread at the end of every hop, read by
++   rt_window_pixels on the runtime's thread. */
++static uint64_t s_px;
++
++static void px_note(void)
++{
++    rt_win *w = s_main_hwnd ? rt_win_get(s_main_hwnd) : NULL;
++    int pw = 0, ph = 0;
++    uint64_t v = 0;
++    if (w && w->sdl && SDL_GetWindowSizeInPixels(w->sdl, &pw, &ph) && pw > 0 && ph > 0)
++        v = (uint64_t)(uint32_t)pw << 32 | (uint32_t)ph;
++    __atomic_store_n(&s_px, v, __ATOMIC_RELEASE);
++}
++
++typedef struct {
++    void (*fn)(void *);
++    void *ctx;
++} hop;
++
++static void hop_run(void *p)
++{
++    hop *h = p;
++    h->fn(h->ctx);
++    px_note();
++}
++
++void rt_main_hop(void (*fn)(void *), void *ctx)
++{
++    hop h = {fn, ctx};
++    if (pthread_main_np()) hop_run(&h);
++    else dispatch_sync_f(dispatch_get_main_queue(), &h, hop_run);
++}
++
++static void main_ready(void *p)
++{
++    (void)p;
++    /* SDL on UIKit refuses SDL_Init until its main has been declared
++       ready, which SDL_main would do, and the first thread to declare it
++       becomes SDL's main thread. */
++    SDL_SetMainReady();
++}
++
++void rt_window_main_ready(void) { rt_main_hop(main_ready, NULL); }
++
++typedef struct {
++    void *sw;
++    int *w, *h;
++    int ok;
++} px_ask;
++
++static void px_hop(void *p)
++{
++    px_ask *a = p;
++    a->ok = SDL_GetWindowSizeInPixels(a->sw, a->w, a->h);
++}
++
++int rt_window_pixels(void *sw, int *w, int *h)
++{
++    *w = *h = 0;
++    if (!sw) return 0;
++    if (pthread_main_np()) return SDL_GetWindowSizeInPixels(sw, w, h);
++    /* The main window is only created, resized or destroyed in hops while
++       this thread waits, so reading the table here does not race them. */
++    rt_win *m = s_main_hwnd ? rt_win_get(s_main_hwnd) : NULL;
++    uint64_t v = __atomic_load_n(&s_px, __ATOMIC_ACQUIRE);
++    if (m && m->sdl == sw && v) {
++        *w = (int)(v >> 32);
++        *h = (int)(uint32_t)v;
++        return 1;
++    }
++    px_ask a = {sw, w, h, 0};
++    rt_main_hop(px_hop, &a);
++    return a.ok;
++}
++
++static void init_hop(void *p) { *(int *)p = video_init(); }
++#endif
++
++int rt_window_init(void)
++{
++    SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1");
++    SDL_SetHint(SDL_HINT_VIDEO_METAL_AUTO_RESIZE_DRAWABLE, "0");
++#if TARGET_OS_VISION
++    /* The host has made the main thread SDL's main thread already
++       (rt_host_start); video init records it as the video thread too. */
++    int r = -1;
++    rt_main_hop(init_hop, &r);
++    return r;
++#else
++    return video_init();
++#endif
++}
++
+ void rt_desktop_size(int *w, int *h)
+ {
+     *w = s_desk_w;
+@@ -211,7 +308,7 @@ rt_win *rt_win_get(uint32_t hwnd)
+     return i < MAX_WIN ? s_wins[i] : NULL;
+ }
+ 
+-void rt_win_free(rt_win *w)
++static void win_free(rt_win *w)
+ {
+     uint32_t i = (w->hwnd - 0x00010000u) / 4u;
+     if (w->hwnd == s_main_hwnd) {
+@@ -278,9 +375,8 @@ void rt_window_configure(void *sw, int cw, int ch)
+     rt_log("window resizable, minimum %dx%d points, full-screen capable (collection behavior 0x%lX)", mw, mh, rt_window_collection_behavior(sw));
+ }
+ 
+-void rt_win_sdl(rt_win *w)
++static void win_sdl(rt_win *w)
+ {
+-    if (!s_sdl) return;
+     SDL_WindowFlags flags = SDL_WINDOW_HIDDEN | (SDL_WindowFlags)rt_gfx_window_flags();
+     SDL_Window *sw = SDL_CreateWindow(w->title, w->w, w->h, flags);
+     if (!sw) {
+@@ -310,7 +406,7 @@ void rt_win_sdl(rt_win *w)
+     s_last_pump = rt_now_ns();
+ }
+ 
+-void rt_win_resize(rt_win *w, int cw, int ch)
++static void win_resize(rt_win *w, int cw, int ch)
+ {
+     w->w = cw;
+     w->h = ch;
+@@ -324,7 +420,7 @@ void rt_win_resize(rt_win *w, int cw, int ch)
+     s_last_pump = rt_now_ns();
+ }
+ 
+-void rt_win_show(rt_win *w, int show)
++static void win_show(rt_win *w, int show)
+ {
+     w->visible = show;
+     if (!w->sdl) return;
+@@ -351,6 +447,81 @@ void rt_win_show(rt_win *w, int show)
+     s_last_pump = rt_now_ns();
+ }
+ 
++/* The window entries the guest's user32 calls reach. Each is one hop on
++   visionOS, so creating a window, with its configuration, placement, input
++   and gamepad start, crosses to the main thread once. */
++#if TARGET_OS_VISION
++typedef struct {
++    rt_win *w;
++    int a, b;
++} win_args;
++
++static void free_hop(void *p) { win_free(((win_args *)p)->w); }
++
++static void sdl_hop(void *p)
++{
++    win_sdl(((win_args *)p)->w);
++    /* With its event pump off, SDL watches the app's lifecycle (resign
++       active, background, terminate) only while a window exists, and
++       decides that only when the pump setting is made. Making it again
++       now that one does starts the watch. */
++    SDL_SetiOSEventPump(false);
++}
++
++static void resize_hop(void *p)
++{
++    win_args *x = p;
++    win_resize(x->w, x->a, x->b);
++}
++
++static void show_hop(void *p)
++{
++    win_args *x = p;
++    win_show(x->w, x->a);
++}
++#endif
++
++void rt_win_free(rt_win *w)
++{
++#if TARGET_OS_VISION
++    win_args x = {w, 0, 0};
++    rt_main_hop(free_hop, &x);
++#else
++    win_free(w);
++#endif
++}
++
++void rt_win_sdl(rt_win *w)
++{
++    if (!s_sdl) return;
++#if TARGET_OS_VISION
++    win_args x = {w, 0, 0};
++    rt_main_hop(sdl_hop, &x);
++#else
++    win_sdl(w);
++#endif
++}
++
++void rt_win_resize(rt_win *w, int cw, int ch)
++{
++#if TARGET_OS_VISION
++    win_args x = {w, cw, ch};
++    rt_main_hop(resize_hop, &x);
++#else
++    win_resize(w, cw, ch);
++#endif
++}
++
++void rt_win_show(rt_win *w, int show)
++{
++#if TARGET_OS_VISION
++    win_args x = {w, show, 0};
++    rt_main_hop(show_hop, &x);
++#else
++    win_show(w, show);
++#endif
++}
++
+ void rt_msg_post(uint32_t hwnd, uint32_t msg, uint32_t wp, uint32_t lp)
+ {
+     if (s_qn == QLEN) {
+@@ -437,11 +608,8 @@ static void window_tick(void)
+ 
+ int rt_pump_due(void) { return s_sdl && rt_now_ns() - s_last_pump >= 16000000u; }
+ 
+-void rt_pump(int force)
++static void pump(uint64_t now)
+ {
+-    (void)force;
+-    if (!s_sdl || !rt_is_primary()) return;
+-    uint64_t now = rt_now_ns();
+     if (s_main_hwnd) rt_note_pump_gap(now - s_last_pump);
+     s_last_pump = now;
+     SDL_PumpEvents();
+@@ -521,6 +689,28 @@ void rt_pump(int force)
+     }
+     rt_input_pump_end();
+     window_tick();
++}
++
++#if TARGET_OS_VISION
++static void pump_hop(void *p) { pump(*(uint64_t *)p); }
++#endif
++
++/* On visionOS the whole pump is one hop: SDL's event pump, the input
++   script, every event's handling (which can warp the pointer, change
++   relative mode or read the view's size) and the full screen tick. The
++   game thread waits in the hop, so the runtime state those touch is not
++   shared with it meanwhile. The primary check stays here, where the
++   thread is the runtime's. */
++void rt_pump(int force)
++{
++    (void)force;
++    if (!s_sdl || !rt_is_primary()) return;
++    uint64_t now = rt_now_ns();
++#if TARGET_OS_VISION
++    rt_main_hop(pump_hop, &now);
++#else
++    pump(now);
++#endif
+     s_pump_ns += rt_now_ns() - now;
+ }
+ 
+@@ -529,7 +719,20 @@ uint64_t rt_pump_ns(void) { return s_pump_ns; }
+ int rt_window_wait_event(uint32_t ms)
+ {
+     if (!s_sdl) return 0;
++#if TARGET_OS_VISION
++    /* SDL_WaitEventTimeout pumps on the calling thread, and the main
++       thread cannot be held for the wait. UIKit's events reach SDL's queue
++       from the main run loop by themselves, so this only watches the queue
++       until one is there; the caller pumps, in a hop, when it returns. */
++    uint64_t end = rt_now_ns() + (uint64_t)ms * 1000000u;
++    for (;;) {
++        if (SDL_HasEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST)) return 1;
++        if (rt_now_ns() >= end) return 0;
++        SDL_DelayNS(1000000u);
++    }
++#else
+     return SDL_WaitEventTimeout(NULL, (Sint32)ms);
++#endif
+ }
+ 
+ void rt_window_push_close(void)
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index d709d11..ee5385d 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -6,6 +6,9 @@
+ 
+ #include <SDL3/SDL.h>
+ #include <TargetConditionals.h>
++#if TARGET_OS_VISION
++#include "main_hop.h"
++#endif
+ #include <dirent.h>
+ #include <dlfcn.h>
+ #include <errno.h>
+@@ -355,7 +358,14 @@ static char s_cap_name[64];
+ 
+ static void main_only(const char *what)
+ {
++#if TARGET_OS_VISION
++    /* SDL's main thread is the app's here, not the game's (main_hop.h),
++       so the guard asks for the guest's primary thread instead, which is
++       the thread the Mac pins to: there both are the process main. */
++    if (!rt_is_primary()) {
++#else
+     if (!SDL_IsMainThread()) {
++#endif
+         rt_thread *t = rt_self();
+         rt_stop(5, 0, "d3d9 call %s from a thread other than the main thread (guest thread 0x%X)", what, t ? t->tid : 0);
+     }
+@@ -968,18 +978,46 @@ static void metal_image_check(void)
+ #endif
+ }
+ 
++typedef struct {
++    rt_win *w;
++    int ww, wh;
++} native_args;
++
++static void native_resize(void *p)
++{
++    native_args *n = p;
++    SDL_SetWindowSize(n->w->sdl, n->ww, n->wh);
++    rt_window_place(n->w->sdl, n->ww, n->wh);
++    SDL_SyncWindow(n->w->sdl);
++}
++
+ static void native_window(rt_win *w)
+ {
+     int ww, wh;
+     if (!w || !w->sdl) return;
+     rt_aspect_native_window(w->w, w->h, &ww, &wh);
+     if (ww == w->w && wh == w->h) return;
+-    SDL_SetWindowSize(w->sdl, ww, wh);
+-    rt_window_place(w->sdl, ww, wh);
+-    SDL_SyncWindow(w->sdl);
++    native_args n = {w, ww, wh};
++#if TARGET_OS_VISION
++    /* The resize reaches the UIKit window: one hop for all three calls. */
++    rt_main_hop(native_resize, &n);
++#else
++    native_resize(&n);
++#endif
+     rt_log("gfx native back buffer %dx%d in a %dx%d point window", w->w, w->h, ww, wh);
+ }
+ 
++/* The window's size in pixels. On visionOS SDL reads it from the UIView,
++   so off the main thread it comes from the cache every hop refreshes. */
++static void px_size(void *win, int *pw, int *ph)
++{
++#if TARGET_OS_VISION
++    rt_window_pixels(win, pw, ph);
++#else
++    SDL_GetWindowSizeInPixels(win, pw, ph);
++#endif
++}
++
+ static uint32_t host_interval(h_present_params *pp, void *sdl_window)
+ {
+     uint32_t gi = pp->PresentationInterval;
+@@ -1271,7 +1309,7 @@ void rt_gfx_luma_report(void)
+ static void fx_present(void *win, uint32_t bw, uint32_t bh)
+ {
+     int pw = 0, ph = 0, r[4];
+-    SDL_GetWindowSizeInPixels(win, &pw, &ph);
++    px_size(win, &pw, &ph);
+     rt_aspect_letterbox((int)bw, (int)bh, pw, ph, r);
+     rt_fx_frame(pw, ph, r);
+ }
+@@ -1310,7 +1348,7 @@ static uint32_t v_present(const uint32_t *a)
+     int32_t lb[4];
+     if (!a[2] && s_pr.windowed && s_pr.win) {
+         int pw = 0, ph = 0, r[4];
+-        SDL_GetWindowSizeInPixels(s_pr.win, &pw, &ph);
++        px_size(s_pr.win, &pw, &ph);
+         rt_aspect_letterbox((int)s_pr.bw, (int)s_pr.bh, pw, ph, r);
+         if (pw > 0 && ph > 0 && (r[2] != pw || r[3] != ph)) {
+             lb[0] = r[0];
+@@ -1473,7 +1511,7 @@ int rt_gfx_movie_blit(const void *xrgb, uint32_t w, uint32_t h, uint32_t pitch,
+     int32_t lb[4];
+     if (s_pr.windowed && s_dev_window) {
+         int pw = 0, ph = 0, r[4];
+-        SDL_GetWindowSizeInPixels(s_dev_window, &pw, &ph);
++        px_size(s_dev_window, &pw, &ph);
+         if (pw > 0 && ph > 0) {
+             rt_aspect_letterbox((int)bd.Width, (int)bd.Height, pw, ph, r);
+             lb[0] = r[0];
+@@ -2440,7 +2478,7 @@ int rt_gfx_present_rects(rt_present_rects *r)
+     pthread_mutex_unlock(&s_pr_mu);
+     if (!p.have) return 0;
+     int pw = 0, ph = 0;
+-    if (p.win) SDL_GetWindowSizeInPixels(p.win, &pw, &ph);
++    if (p.win) px_size(p.win, &pw, &ph);
+     if (p.windowed && p.src) *r = (rt_present_rects){p.s[0], p.s[1], p.s[2] - p.s[0], p.s[3] - p.s[1], 0, 0, 0, 0};
+     else *r = (rt_present_rects){0, 0, (int)p.bw, (int)p.bh, 0, 0, 0, 0};
+     if (p.windowed && p.dst) {
+-- 
+2.54.0 (Apple Git-157)
+

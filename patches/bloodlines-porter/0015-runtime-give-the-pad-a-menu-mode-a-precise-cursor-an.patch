@@ -1,0 +1,1111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:04:47 -0600
+Subject: [PATCH 15/15] runtime: give the pad a menu mode, a precise cursor and
+ the pad used last
+
+When the game shows its cursor (the test rt_host_cursor already makes)
+the pad is in menu mode: Cross and the right trigger click, the left
+trigger right clicks, Circle is Escape and Square is the game's
+inventory key (i, slot6). In play Square opens the inventory too, so
+reload moves to the touchpad and the Xbox share button, and the quest
+log (l) goes on L3, the one spare every pad has, the Sense pair
+included. Create stays on the character sheet (c). The d-pad keeps
+1 to 4 in menus: dialogue answers are number keys and the game binds
+the arrows to movement. A release always sends what its press sent, so
+a button held across a mode change cannot leave a key stuck, and
+entering a menu lifts the movement keys the left stick held.
+
+In menus both sticks drive the cursor through a radial dead zone and a
+power curve, slow near the centre for inventory slots and fast at the
+rim, in client pixels so a slow step is not lost to rounding on a
+scaled screen, and scaled by real elapsed time rather than whole
+milliseconds. The left stick runs at half speed. The move goes out as
+a warp so the Mac pointer and the host's virtual pointer follow it.
+Look in play is unchanged. controls.txt takes menu.<button>= for menu
+targets, none to unbind, and cursor_speed, cursor_power, cursor_dead
+and cursor_left; RT_PAD_* environment variables override it.
+
+Every connected pad is open and the one with a fresh press or stick
+push drives, so a gamepad and the Sense pair both work without
+reconnecting. Each button is logged once per mode with its target.
+---
+ runtime/input.c          |  38 +++-
+ runtime/input.h          |   5 +-
+ runtime/input_selftest.c | 273 +++++++++++++++++++++++++-
+ runtime/m9_selftest.c    |   4 +-
+ runtime/pad.c            | 403 +++++++++++++++++++++++++++++++--------
+ runtime/pad.h            |  42 +++-
+ 6 files changed, 664 insertions(+), 101 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 7f8c357..68493c4 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -333,15 +333,32 @@ static rt_pad_pt pad_point(const rt_input_state *s, const rt_present_rects *r, f
+     return p;
+ }
+ 
+-int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, const rt_present_rects *r, float density,
+-                       rt_wmsg *out, int cap)
++int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int menu, const rt_present_rects *r,
++                       float density, rt_wmsg *out, int cap)
+ {
+     int n = 0;
+     for (int i = 0; i < k && n < cap; i++) {
+         if (s->gui && ev[i].type == SDL_EVENT_KEY_DOWN) continue;
+         n += rt_input_translate(s, &ev[i], r, density, out + n, cap - n);
+     }
+-    if ((dx || dy) && n < cap) {
++    if (!dx && !dy) return n < cap ? n : cap;
++    /* The menu cursor moves in client pixels, not through the window: a
++       step smaller than one window pixel would round away on a scaled
++       screen, which is where the slow end of the curve lives. It then
++       goes out as a warp, so the Mac pointer and the host's virtual
++       pointer follow the cursor the pad moved. */
++    if (menu) {
++        if (!s->focus || s->relative) return n < cap ? n : cap;
++        int32_t x = s->x + dx, y = s->y + dy;
++        x = x < 0 ? 0 : x >= s->client_w ? s->client_w - 1 : x;
++        y = y < 0 ? 0 : y >= s->client_h ? s->client_h - 1 : y;
++        if (x != s->x || y != s->y) {
++            rt_input_state_set_cursor(s, x, y);
++            s->move_pending = 1;
++        }
++        return n < cap ? n : cap;
++    }
++    if (n < cap) {
+         double rho = density > 0 ? density : 1.0;
+         rt_pad_pt p = pad_point(s, r, density);
+         SDL_Event e;
+@@ -360,16 +377,16 @@ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now
+                       rt_wmsg *out, int cap)
+ {
+     SDL_Event ev[RT_PAD_EVENTS];
+-    int dx, dy;
+-    int k = rt_pad_poll(d, active, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
+-    return rt_input_pad_apply(s, ev, k, dx, dy, r, density, out, cap);
++    int dx, dy, menu = rt_input_menu(s);
++    int k = rt_pad_poll(d, active, menu, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
++    return rt_input_pad_apply(s, ev, k, dx, dy, menu, r, density, out, cap);
+ }
+ 
+ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *r, float density, rt_wmsg *out, int cap)
+ {
+     SDL_Event ev[RT_PAD_EVENTS];
+     int k = rt_pad_release(&d->pad, pad_point(s, r, density), ev, RT_PAD_EVENTS);
+-    return rt_input_pad_apply(s, ev, k, 0, 0, r, density, out, cap);
++    return rt_input_pad_apply(s, ev, k, 0, 0, 0, r, density, out, cap);
+ }
+ 
+ int rt_input_release_all(rt_input_state *s, rt_wmsg *out, int cap)
+@@ -444,6 +461,11 @@ static int guest_shape(const rt_input_state *s)
+     return SDL_SYSTEM_CURSOR_DEFAULT;
+ }
+ 
++/* The game shows its cursor exactly when a screen of its own is up:
++   menus, dialogue, the inventory and the character sheet. The pad's
++   menu mode and the host's cursor ring both key off this one test. */
++int rt_input_menu(const rt_input_state *s) { return s->focus && guest_shape(s) != RT_CUR_HIDDEN; }
++
+ int rt_input_relative_wanted(const rt_input_state *s)
+ {
+     return s->focus && s->host_focus && guest_shape(s) == RT_CUR_HIDDEN;
+@@ -1154,7 +1176,7 @@ void *rt_host_game_window(void) { return __atomic_load_n(&s_host_uiwindow, __ATO
+ int rt_host_cursor(float *u, float *v)
+ {
+     pthread_mutex_lock(&s_mu);
+-    int shown = S.focus && guest_shape(&S) != RT_CUR_HIDDEN;
++    int shown = rt_input_menu(&S);
+     float x = (float)((S.x + 0.5) / (S.client_w > 0 ? S.client_w : 1));
+     float y = (float)((S.y + 0.5) / (S.client_h > 0 ? S.client_h : 1));
+     pthread_mutex_unlock(&s_mu);
+diff --git a/runtime/input.h b/runtime/input.h
+index d8e19a4..5195588 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -97,8 +97,9 @@ void rt_input_map(const rt_present_rects *r, float density, float x, float y, in
+ void rt_input_unmap(const rt_present_rects *r, float density, int32_t cx, int32_t cy, float *x, float *y);
+ int rt_input_translate(rt_input_state *s, const SDL_Event *e, const rt_present_rects *r, float density, rt_wmsg *out,
+                        int cap);
+-int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, const rt_present_rects *r, float density,
+-                       rt_wmsg *out, int cap);
++int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, int dy, int menu, const rt_present_rects *r,
++                       float density, rt_wmsg *out, int cap);
++int rt_input_menu(const rt_input_state *s);
+ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now_ns, const rt_present_rects *r, float density,
+                       rt_wmsg *out, int cap);
+ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *r, float density, rt_wmsg *out, int cap);
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 4a3d558..3f0b4a8 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1,10 +1,12 @@
+ #include "input.h"
+ #include "toggles.h"
+ 
++#include <math.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ static int s_pass, s_fail;
+ 
+@@ -900,21 +902,43 @@ static void pad_drive(void)
+     SDL_JoystickID id2 = rt_pad_test_attach("DualSense Wireless Controller");
+     rt_pad_test_button(id2, SDL_GAMEPAD_BUTTON_EAST, 1);
+     padpump(&s, &d, 10);
+-    check(s_n == 0 && d.nignored == 1, "a second pad is ignored while the first drives", "%s ignored %d", dump(), d.nignored);
++    check(s_n == 0 && d.id == id && d.nslots == 2, "a button held as a second pad connects does not take the drive", "%s slots %d",
++          dump(), d.nslots);
+     rt_pad_test_button(id2, SDL_GAMEPAD_BUTTON_EAST, 0);
+     padpump(&s, &d, 10);
++    check(s_n == 0, "the second pad's release before it drives sends nothing", "%s", dump());
++    rt_pad_test_button(id2, SDL_GAMEPAD_BUTTON_EAST, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 3 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 32 && s_m[1].msg == WM_KEYUP && s_m[1].wp == 0x44 &&
++              s_m[2].msg == WM_KEYDOWN && s_m[2].wp == 0x45,
++          "a fresh press on the second pad takes the drive and lifts the first pad's keys first", "%s", dump());
++    check(d.id == id2 && rt_pad_kind() == RT_PAD_PLAYSTATION, "the pad used last drives and sets the pad type", "kind %d", rt_pad_kind());
++    s_n = 0;
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(s_n == 0 && d.id == id2, "what the first pad still holds does not take the drive back", "%s", dump());
++    rt_pad_test_button(id2, SDL_GAMEPAD_BUTTON_EAST, 0);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_KEYUP, 0x45, 1), "the second pad's release lifts its key", "%s", dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_SOUTH, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_SOUTH, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 32 && s_m[1].msg == WM_KEYDOWN && s_m[1].wp == 0x44 && d.id == id &&
++              rt_pad_kind() == RT_PAD_XBOX,
++          "a fresh press on the first pad takes the drive back with what it holds", "%s kind %d", dump(), rt_pad_kind());
+     s_n = 0;
+     rt_pad_test_detach(id);
+     padpump(&s, &d, 10);
+-    check(s_n == 2 && s_m[0].msg == WM_KEYUP && s_m[1].msg == WM_KEYUP, "removing the first pad releases both keys", "%s", dump());
+-    check(d.gp && d.id == id2 && rt_pad_kind() == RT_PAD_PLAYSTATION, "after removal the second pad drives", "kind %d", rt_pad_kind());
++    check(s_n == 2 && s_m[0].msg == WM_KEYUP && s_m[1].msg == WM_KEYUP, "removing the driving pad releases both keys", "%s", dump());
++    check(d.gp && d.id == id2 && rt_pad_kind() == RT_PAD_PLAYSTATION, "after removal the other pad drives", "kind %d", rt_pad_kind());
+     s_n = 0;
+     rt_pad_test_button(id2, SDL_GAMEPAD_BUTTON_EAST, 1);
+     padpump(&s, &d, 10);
+     check(msgs_are(WM_KEYDOWN, 0x45, 1), "the second pad's east gives the default key (e)", "%s", dump());
+     rt_pad_test_detach(id2);
+     padpump(&s, &d, 10);
+-    check(!d.gp && rt_pad_kind() == RT_PAD_XBOX, "no pad falls back to Xbox", "kind %d", rt_pad_kind());
++    check(!d.gp && d.nslots == 0 && rt_pad_kind() == RT_PAD_XBOX, "no pad falls back to Xbox", "kind %d", rt_pad_kind());
+ 
+     st(&s);
+     s.cursor = 0;
+@@ -930,6 +954,244 @@ static void pad_drive(void)
+     rt_pad_test_detach(id3);
+ }
+ 
++static void padpump_ns(rt_input_state *s, rt_pad_dev *d, uint64_t ns)
++{
++    s_pad_t += ns;
++    s_n += rt_input_pad_pump(s, d, s->focus, s_pad_t, &R1, 1.0f, s_m + s_n, 256 - s_n);
++}
++
++/* SDL button, or -1 with the trigger axis; then what menu and play send:
++   the message and, for keys and clicks, its wparam (0 skips it). */
++static const struct {
++    int btn, axis;
++    const char *name;
++    uint32_t menu_msg, menu_wp, play_msg, play_wp;
++} k_padmap[] = {
++    {SDL_GAMEPAD_BUTTON_SOUTH, -1, "Cross", WM_LBUTTONDOWN, 1, WM_KEYDOWN, 0x20},
++    {SDL_GAMEPAD_BUTTON_EAST, -1, "Circle", WM_KEYDOWN, 0x1B, WM_KEYDOWN, 0x45},
++    {SDL_GAMEPAD_BUTTON_WEST, -1, "Square", WM_KEYDOWN, 0x49, WM_KEYDOWN, 0x49},
++    {SDL_GAMEPAD_BUTTON_NORTH, -1, "Triangle", WM_KEYDOWN, 0x46, WM_KEYDOWN, 0x46},
++    {SDL_GAMEPAD_BUTTON_BACK, -1, "Create", WM_KEYDOWN, 0x43, WM_KEYDOWN, 0x43},
++    {SDL_GAMEPAD_BUTTON_START, -1, "Options", WM_KEYDOWN, 0x1B, WM_KEYDOWN, 0x1B},
++    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, -1, "L1", WM_MOUSEWHEEL, 0, WM_MOUSEWHEEL, 0},
++    {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, -1, "R1", WM_MOUSEWHEEL, 0, WM_MOUSEWHEEL, 0},
++    {SDL_GAMEPAD_BUTTON_LEFT_STICK, -1, "L3", WM_KEYDOWN, 0x4C, WM_KEYDOWN, 0x4C},
++    {SDL_GAMEPAD_BUTTON_RIGHT_STICK, -1, "R3", WM_KEYDOWN, 0x11, WM_KEYDOWN, 0x11},
++    {SDL_GAMEPAD_BUTTON_DPAD_UP, -1, "d-pad up", WM_KEYDOWN, 0x31, WM_KEYDOWN, 0x31},
++    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1, "d-pad down", WM_KEYDOWN, 0x33, WM_KEYDOWN, 0x33},
++    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1, "d-pad left", WM_KEYDOWN, 0x34, WM_KEYDOWN, 0x34},
++    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1, "d-pad right", WM_KEYDOWN, 0x32, WM_KEYDOWN, 0x32},
++    {SDL_GAMEPAD_BUTTON_TOUCHPAD, -1, "touchpad", WM_KEYDOWN, 0x52, WM_KEYDOWN, 0x52},
++    {SDL_GAMEPAD_BUTTON_MISC1, -1, "share", WM_KEYDOWN, 0x52, WM_KEYDOWN, 0x52},
++    {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", WM_RBUTTONDOWN, 2, WM_RBUTTONDOWN, 2},
++    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", WM_LBUTTONDOWN, 1, WM_LBUTTONDOWN, 1},
++};
++
++static void press(SDL_JoystickID id, int i, int down)
++{
++    if (k_padmap[i].btn >= 0) rt_pad_test_button(id, k_padmap[i].btn, down);
++    else rt_pad_test_axis(id, k_padmap[i].axis, down ? 32767 : 0);
++}
++
++static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int menu)
++{
++    char name[96];
++    for (size_t i = 0; i < sizeof k_padmap / sizeof *k_padmap; i++) {
++        uint32_t msg = menu ? k_padmap[i].menu_msg : k_padmap[i].play_msg;
++        uint32_t wp = menu ? k_padmap[i].menu_wp : k_padmap[i].play_wp;
++        s_n = 0;
++        press(id, (int)i, 1);
++        padpump(s, d, 10);
++        snprintf(name, sizeof name, "%s %s press", menu ? "menu" : "play", k_padmap[i].name);
++        /* Escape also gives its WM_CHAR, so only the first message is held to. */
++        check(s_n >= 1 && s_n <= 2 && s_m[0].msg == msg && (msg == WM_MOUSEWHEEL || s_m[0].wp == wp), name, "%s", dump());
++        s_n = 0;
++        press(id, (int)i, 0);
++        padpump(s, d, 10);
++        snprintf(name, sizeof name, "%s %s release", menu ? "menu" : "play", k_padmap[i].name);
++        check(msg == WM_MOUSEWHEEL ? s_n == 0 : s_n == 1 && s_m[0].msg == msg + 1 && (s_m[0].wp == wp || msg != WM_KEYDOWN), name, "%s",
++              dump());
++    }
++}
++
++static void pad_modes(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.x = 640;
++    s.y = 512;
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    padpump(&s, &d, 10);
++    check(rt_input_menu(&s) && d.pad.menu == RT_PAD_MENU && s_n == 0, "a shown cursor is menu mode", "menu %d %s", d.pad.menu, dump());
++    pad_map_mode(&s, &d, id, 1);
++    check((d.pad.logged[RT_PAD_MENU] & 1u) && !(d.pad.logged[RT_PAD_PLAY] & 1u), "a press is logged once for its mode", "%X %X",
++          d.pad.logged[RT_PAD_MENU], d.pad.logged[RT_PAD_PLAY]);
++
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    s_n = 0;
++    padpump(&s, &d, 10);
++    check(!rt_input_menu(&s) && d.pad.menu == RT_PAD_PLAY && s_n == 0, "a hidden cursor is play mode", "menu %d %s", d.pad.menu, dump());
++    pad_map_mode(&s, &d, id, 0);
++
++    /* Across a mode change a release sends what its press sent. */
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_SOUTH, 1);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTX, 32767);
++    padpump(&s, &d, 10);
++    check(s_n == 2 && s_m[0].wp == 0x20 && s_m[1].wp == 0x44, "play: Cross holds space and the left stick holds D", "%s", dump());
++    s_n = 0;
++    s.cursor = 0x00007F00u;
++    rt_input_relative_update(&s);
++    int32_t x0 = s.x;
++    padpump(&s, &d, 10);
++    check(s_n == 1 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x44, "opening a menu lifts the left stick's movement key", "%s", dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_SOUTH, 0);
++    padpump(&s, &d, 10);
++    /* The cursor move the left stick made is flushed ahead of the key. */
++    int k0 = s_n == 2 && s_m[0].msg == WM_MOUSEMOVE;
++    check((s_n == 1 || k0) && s_m[k0].msg == WM_KEYUP && s_m[k0].wp == 0x20, "Cross pressed in play releases as space in a menu, not a click",
++          "%s", dump());
++    check(s.x > x0, "in a menu the left stick moves the cursor", "%d -> %d", x0, s.x);
++    s_n = 0;
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(s_n == 0, "in a menu the left stick holds no keys", "%s", dump());
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTX, 0);
++    padpump(&s, &d, 10);
++
++    /* The cursor moves in client pixels and clamps to the client. */
++    s.x = 1270;
++    s.y = 512;
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTX, 32767);
++    for (int i = 0; i < 10; i++) padpump(&s, &d, 10);
++    check(s.x == 1279 && s.y == 512, "the menu cursor stops at the client's edge", "%d,%d", s.x, s.y);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTX, 0);
++    padpump(&s, &d, 10);
++    check(s.warp_pending, "a pad cursor move asks for a warp so the host pointer follows", "%d", s.warp_pending);
++
++    /* Frame rate independence: the same stick for the same real time
++       moves the cursor the same distance at 30, 60, 90 and 120 Hz. */
++    static const int k_hz[] = {30, 60, 90, 120};
++    double dz = RT_PAD_CURSOR_DEAD / 32767.0;
++    int half = (int)lround((dz + 0.5 * (1 - dz)) * 32767);
++    double want = RT_PAD_CURSOR_SPEED * pow(0.5, RT_PAD_CURSOR_POWER);
++    for (int axis = 0; axis < 2; axis++) {
++        for (size_t h = 0; h < sizeof k_hz / sizeof *k_hz; h++) {
++            int stick = axis ? SDL_GAMEPAD_AXIS_LEFTX : SDL_GAMEPAD_AXIS_RIGHTX;
++            s.x = 100;
++            s.y = 512;
++            rt_pad_test_axis(id, stick, half);
++            uint64_t step = 1000000000ull / (uint64_t)k_hz[h];
++            for (int f = 0; f < k_hz[h]; f++) padpump_ns(&s, &d, step);
++            rt_pad_test_axis(id, stick, 0);
++            padpump(&s, &d, 10);
++            double got = s.x - 100, w = axis ? want * RT_PAD_CURSOR_LEFT : want;
++            char name[96];
++            snprintf(name, sizeof name, "%s stick half tilt for 1 s at %d Hz moves %.0f px", axis ? "left" : "right", k_hz[h], w);
++            check(fabs(got - w) <= 2.0, name, "moved %.0f", got);
++        }
++    }
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
++static void pad_curve(void)
++{
++    rt_pad p;
++    rt_pad_defaults(&p);
++    double vx, vy, dz = p.cursor_dead / 32767.0;
++    rt_pad_cursor_velocity(&p, 0, 0, &vx, &vy);
++    check(vx == 0 && vy == 0, "cursor at rest is still", "%f %f", vx, vy);
++    rt_pad_cursor_velocity(&p, p.cursor_dead, 0, &vx, &vy);
++    check(vx == 0, "cursor inside its dead zone is still", "%f", vx);
++    static const double k_d[] = {0.05, 0.1, 0.25, 0.5, 0.75, 1.0};
++    double last = 0;
++    for (size_t i = 0; i < sizeof k_d / sizeof *k_d; i++) {
++        int v = (int)lround((dz + k_d[i] * (1 - dz)) * 32767);
++        rt_pad_cursor_velocity(&p, v, 0, &vx, &vy);
++        double w = p.cursor_speed * pow(k_d[i], p.cursor_power);
++        char name[96];
++        snprintf(name, sizeof name, "cursor at %.0f%% past the dead zone runs %.1f px/s", k_d[i] * 100, w);
++        check(fabs(vx - w) <= w * 0.01 + 0.5 && vx > last && vy == 0, name, "%f", vx);
++        last = vx;
++        rt_pad_cursor_velocity(&p, -v, 0, &vx, &vy);
++        snprintf(name, sizeof name, "cursor at %.0f%% to the left mirrors it", k_d[i] * 100);
++        check(fabs(vx + w) <= w * 0.01 + 0.5, name, "%f", vx);
++    }
++    rt_pad_cursor_velocity(&p, 23170, 23170, &vx, &vy);
++    check(fabs(hypot(vx, vy) - p.cursor_speed) < 2 && fabs(vx - vy) < 1e-9, "a full diagonal runs at full speed along it", "%f %f", vx, vy);
++    rt_pad_cursor_velocity(&p, 32767, 0, &vx, &vy);
++    check(fabs(vx - RT_PAD_CURSOR_SPEED) < 1e-6, "full tilt is cursor_speed", "%f", vx);
++    p.rx = 32767;
++    int dx = 0, dy = 0, sum = 0;
++    for (int i = 0; i < 10; i++) {
++        rt_pad_move(&p, 0.01, &dx, &dy);
++        sum += dx;
++    }
++    check(sum == 120, "play look stays linear and separate: 10 x 10 ms at 1200 px/s is 120 px", "%d", sum);
++    p.menu = RT_PAD_MENU;
++    sum = 0;
++    for (int i = 0; i < 10; i++) {
++        rt_pad_move(&p, 0.01, &dx, &dy);
++        sum += dx;
++    }
++    check(sum == 160, "menu at full tilt: 10 x 10 ms at 1600 px/s is 160 px", "%d", sum);
++
++    check(rt_pad_tune(&p, "cursor_power", "3") == 0 && p.cursor_power == 3, "cursor_power takes a number", "%f", p.cursor_power);
++    check(rt_pad_tune(&p, "cursor_power", "9") == -2 && p.cursor_power == 3, "cursor_power out of range is refused", "%f", p.cursor_power);
++    check(rt_pad_tune(&p, "cursor_speed", "fast") == -2, "cursor_speed must be a number", "");
++    check(rt_pad_tune(&p, "cursor_left", "0.25") == 0 && p.cursor_left == 0.25, "cursor_left takes a fraction", "%f", p.cursor_left);
++    check(rt_pad_tune(&p, "cursor_dead", "0") == 0 && p.cursor_dead == 0, "cursor_dead may be zero", "%d", p.cursor_dead);
++    check(rt_pad_tune(&p, "look_speed", "1.5") == -2, "look_speed stays whole", "");
++    check(rt_pad_tune(&p, "south", "space") == -1, "a button is not a tunable", "");
++}
++
++static void pad_controls(void)
++{
++    const char *tmp = getenv("TMPDIR");
++    char dir[512], path[600];
++    snprintf(dir, sizeof dir, "%s/rt-pad-selftest-XXXXXX", tmp && *tmp ? tmp : "/tmp");
++    if (!mkdtemp(dir)) {
++        check(0, "controls scratch folder", "%s", dir);
++        return;
++    }
++    snprintf(path, sizeof path, "%s/controls.txt", dir);
++    FILE *f = fopen(path, "w");
++    if (!f) {
++        check(0, "controls file", "%s", path);
++        return;
++    }
++    fputs("# test\nmenu.south=space\nmenu.east=play\nwest=r\nmenu.dpup=up\ntouchpad=none\ncursor_speed=800\ncursor_power=2\n"
++          "menu.bogus=x\nmenu.north=notakey\n",
++          f);
++    fclose(f);
++    rt_pad p;
++    int bad = rt_pad_load(&p, dir);
++    unlink(path);
++    rmdir(dir);
++    const rt_pad_tgt *t = rt_pad_target(&p, 0, 1);
++    check(bad == 2, "two bad controls lines are counted", "%d", bad);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "menu.south remaps Cross in menus only", "%d %d", t->kind, t->arg);
++    t = rt_pad_target(&p, 0, 0);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
++    t = rt_pad_target(&p, 1, 1);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "menu.east=play hands Circle back to its play key", "%d", t->arg);
++    t = rt_pad_target(&p, 2, 0);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_R, "west remaps Square in play", "%d", t->arg);
++    t = rt_pad_target(&p, 2, 1);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_I, "a play remap leaves Square's menu key", "%d", t->arg);
++    t = rt_pad_target(&p, 10, 1);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_UP, "menu.dpup can send an arrow", "%d", t->arg);
++    t = rt_pad_target(&p, RT_PAD_TOUCHPAD, 0);
++    check(t->kind == RT_PADT_NONE, "none unbinds a button", "%d", t->kind);
++    t = rt_pad_target(&p, 3, 1);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_F, "a bad menu target falls through to play", "%d", t->arg);
++    check(p.cursor_speed == 800 && p.cursor_power == 2, "controls.txt sets the cursor curve", "%d %f", p.cursor_speed, p.cursor_power);
++}
++
+ int rt_input_selftest(void)
+ {
+     setvbuf(stdout, NULL, _IOLBF, 0);
+@@ -949,6 +1211,9 @@ int rt_input_selftest(void)
+     waitmap();
+     pad_detect();
+     pad_drive();
++    pad_curve();
++    pad_modes();
++    pad_controls();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+ }
+diff --git a/runtime/m9_selftest.c b/runtime/m9_selftest.c
+index 684f6a4..9225e22 100644
+--- a/runtime/m9_selftest.c
++++ b/runtime/m9_selftest.c
+@@ -862,13 +862,13 @@ static int case_controller(const char *dir, int player)
+         SDL_JoystickID id = rt_pad_test_attach(names[i]);
+         SDL_Event ev[RT_PAD_EVENTS];
+         int dx, dy;
+-        rt_pad_poll(&d, 1, (rt_pad_pt){0, 0}, 1000000000u, ev, RT_PAD_EVENTS, &dx, &dy);
++        rt_pad_poll(&d, 1, 0, (rt_pad_pt){0, 0}, 1000000000u, ev, RT_PAD_EVENTS, &dx, &dy);
+         int kind = rt_pad_kind();
+         const char *got = d.gp ? SDL_GetGamepadName(d.gp) : NULL;
+         row("controller", "type", "name=\"%s\" type=%s gamepad=\"%s\"", names[i], rt_pad_type_name(kind), got ? got : "");
+         bad |= !id || kind != want[i];
+         rt_pad_test_detach(id);
+-        rt_pad_poll(&d, 1, (rt_pad_pt){0, 0}, 2000000000u, ev, RT_PAD_EVENTS, &dx, &dy);
++        rt_pad_poll(&d, 1, 0, (rt_pad_pt){0, 0}, 2000000000u, ev, RT_PAD_EVENTS, &dx, &dy);
+         rt_toggles_defaults(0);
+         bad |= d.gp != NULL || rt_pad_kind() != RT_PAD_XBOX;
+         row("controller", "removed", "pad=\"%s\" type=%s", names[i], rt_pad_type_name(rt_pad_kind()));
+diff --git a/runtime/pad.c b/runtime/pad.c
+index a374b2e..9ce0262 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -12,17 +12,38 @@
+ 
+ static const char *const k_names[RT_PAD_NBTN] = {"south", "east", "west", "north", "back", "start", "leftshoulder", "rightshoulder",
+                                                  "leftstick", "rightstick", "dpup", "dpdown", "dpleft", "dpright", "lefttrigger",
+-                                                 "righttrigger"};
++                                                 "righttrigger", "touchpad", "misc1"};
+ 
+-static const SDL_GamepadButton k_sdl[14] = {
++/* -1 for the triggers, which are axes in SDL and buttons here. */
++static const int k_sdl[RT_PAD_NBTN] = {
+     SDL_GAMEPAD_BUTTON_SOUTH,      SDL_GAMEPAD_BUTTON_EAST,       SDL_GAMEPAD_BUTTON_WEST,       SDL_GAMEPAD_BUTTON_NORTH,
+     SDL_GAMEPAD_BUTTON_BACK,       SDL_GAMEPAD_BUTTON_START,      SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+     SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_DPAD_UP,   SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+-    SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
++    SDL_GAMEPAD_BUTTON_DPAD_LEFT,  SDL_GAMEPAD_BUTTON_DPAD_RIGHT,  -1,                           -1,
++    SDL_GAMEPAD_BUTTON_TOUCHPAD,   SDL_GAMEPAD_BUTTON_MISC1,
+ };
+ 
+-static const char *const k_default[RT_PAD_NBTN] = {"space", "e",      "r",      "f",      "c",      "escape",     "wheeldown", "wheelup",
+-                                                   "lshift", "lctrl", "1",      "3",      "4",      "2",          "mouse2",    "mouse1"};
++/* Keys are the game's own binds (cfg/config.cfg): i is slot6, the
++   general inventory; c is +chareditor; l is +questlog; e is +use; f is
++   vm_feed; r is +reload. Square takes the inventory, which moves reload
++   to the touchpad and the Xbox share button. The Sense pair has neither,
++   so the quest log goes on L3 where every pad has it, and walk (lshift)
++   is left to controls.txt; crouch on R3 matters more for stealth. */
++static const char *const k_default[RT_PAD_NBTN] = {"space", "e", "i",  "f", "c", "escape", "wheeldown", "wheelup", "l",
++                                                   "lctrl", "1", "3",  "4", "2", "mouse2", "mouse1",    "r",       "r"};
++
++/* Where menu mode differs. Cross clicks so the Sense pair's thumb can
++   work a screen without the trigger, Circle backs out, and the triggers
++   are pinned to the mouse so a play remap cannot take clicking away.
++   The d-pad stays on 1 to 4: dialogue answers are number keys, and the
++   game binds the arrows to movement, which would walk the player behind
++   the inventory panel. Anything not listed falls through to play. */
++static const struct {
++    int idx;
++    const char *target;
++} k_menu_default[] = {
++    {0, "mouse1"}, {1, "escape"}, {2, "i"}, {RT_PAD_LT, "mouse2"}, {RT_PAD_RT, "mouse1"},
++};
+ 
+ static const int k_dir_key[4] = {SDL_SCANCODE_W, SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_D};
+ 
+@@ -54,6 +75,10 @@ const char *rt_pad_button_name(int idx) { return idx >= 0 && idx < RT_PAD_NBTN ?
+ 
+ static int parse_target(const char *v, rt_pad_tgt *t)
+ {
++    if (!strcmp(v, "none")) {
++        *t = (rt_pad_tgt){RT_PADT_NONE, 0};
++        return 0;
++    }
+     if (!strcmp(v, "mouse1") || !strcmp(v, "mouse2") || !strcmp(v, "mouse3")) {
+         *t = (rt_pad_tgt){RT_PADT_MOUSE, v[5] == '1' ? 1 : v[5] == '2' ? 3 : 2};
+         return 0;
+@@ -83,57 +108,141 @@ void rt_pad_defaults(rt_pad *p)
+ {
+     memset(p, 0, sizeof *p);
+     p->look_speed = RT_PAD_LOOK_SPEED;
++    p->cursor_speed = RT_PAD_CURSOR_SPEED;
++    p->cursor_power = RT_PAD_CURSOR_POWER;
++    p->cursor_dead = RT_PAD_CURSOR_DEAD;
++    p->cursor_left = RT_PAD_CURSOR_LEFT;
+     for (int i = 0; i < RT_PAD_NBTN; i++) parse_target(k_default[i], &p->map[i]);
++    for (size_t i = 0; i < sizeof k_menu_default / sizeof *k_menu_default; i++) {
++        parse_target(k_menu_default[i].target, &p->menu_map[k_menu_default[i].idx]);
++        p->menu_set[k_menu_default[i].idx] = 1;
++    }
+ }
+ 
+-int rt_pad_load(rt_pad *p, const char *dir)
++const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int menu)
+ {
+-    rt_pad_defaults(p);
+-    if (!dir || !dir[0]) return 0;
+-    char path[1100], line[128];
+-    snprintf(path, sizeof path, "%s/controls.txt", dir);
+-    FILE *f = fopen(path, "r");
+-    if (!f) return 0;
++    return menu && p->menu_set[idx] ? &p->menu_map[idx] : &p->map[idx];
++}
++
++static int number(const char *v, double lo, double hi, double *out)
++{
++    char *end;
++    double n = strtod(v, &end);
++    if (end == v || *end || !(n >= lo && n <= hi)) return -1;
++    *out = n;
++    return 0;
++}
++
++/* One place for the tunables, so controls.txt and the environment take
++   the same names and ranges. 0 when taken, -1 for an unknown key, -2 for
++   a value out of range. */
++int rt_pad_tune(rt_pad *p, const char *key, const char *v)
++{
++    double n;
++    if (!strcmp(key, "look_speed")) {
++        if (number(v, 1, 20000, &n) || n != floor(n)) return -2;
++        p->look_speed = (int)n;
++    } else if (!strcmp(key, "cursor_speed")) {
++        if (number(v, 1, 20000, &n)) return -2;
++        p->cursor_speed = (int)n;
++    } else if (!strcmp(key, "cursor_power")) {
++        if (number(v, 1, 5, &n)) return -2;
++        p->cursor_power = n;
++    } else if (!strcmp(key, "cursor_dead")) {
++        if (number(v, 0, 30000, &n)) return -2;
++        p->cursor_dead = (int)n;
++    } else if (!strcmp(key, "cursor_left")) {
++        if (number(v, 0, 1, &n)) return -2;
++        p->cursor_left = n;
++    } else {
++        return -1;
++    }
++    return 0;
++}
++
++static int load_line(rt_pad *p, char *line)
++{
++    char *eq = strchr(line, '=');
++    if (!eq) {
++        rt_log("pad controls: ignored line \"%s\"", line);
++        return 1;
++    }
++    *eq = 0;
++    const char *v = eq + 1;
++    int t = rt_pad_tune(p, line, v);
++    if (t == -2) {
++        rt_log("pad controls: bad value \"%s\" for %s, default kept", v, line);
++        return 1;
++    }
++    if (!t) return 0;
++    int menu = !strncmp(line, "menu.", 5);
++    const char *name = menu ? line + 5 : line;
++    int idx = -1;
++    for (int i = 0; i < RT_PAD_NBTN; i++)
++        if (!strcmp(name, k_names[i])) idx = i;
++    if (idx < 0) {
++        rt_log("pad controls: unknown button \"%s\"", line);
++        return 1;
++    }
++    /* menu.X=play hands a button back to its play target in menus. */
++    if (menu && !strcmp(v, "play")) {
++        p->menu_set[idx] = 0;
++        return 0;
++    }
++    rt_pad_tgt tg;
++    if (parse_target(v, &tg)) {
++        rt_log("pad controls: bad target \"%s\" for %s, default kept", v, line);
++        return 1;
++    }
++    if (menu) {
++        p->menu_map[idx] = tg;
++        p->menu_set[idx] = 1;
++    } else {
++        p->map[idx] = tg;
++    }
++    return 0;
++}
++
++/* The environment comes last, so a device launch can try a cursor
++   setting without editing the file in the app's container. */
++static int load_env(rt_pad *p)
++{
++    static const char *const k_env[][2] = {{"RT_PAD_LOOK_SPEED", "look_speed"},     {"RT_PAD_CURSOR_SPEED", "cursor_speed"},
++                                           {"RT_PAD_CURSOR_POWER", "cursor_power"}, {"RT_PAD_CURSOR_DEAD", "cursor_dead"},
++                                           {"RT_PAD_CURSOR_LEFT", "cursor_left"}};
+     int bad = 0;
+-    while (fgets(line, sizeof line, f)) {
+-        line[strcspn(line, "\r\n")] = 0;
+-        if (!line[0] || line[0] == '#') continue;
+-        char *eq = strchr(line, '=');
+-        if (!eq) {
+-            rt_log("pad controls: ignored line \"%s\"", line);
+-            bad++;
+-            continue;
+-        }
+-        *eq = 0;
+-        const char *v = eq + 1;
+-        if (!strcmp(line, "look_speed")) {
+-            char *end;
+-            long n = strtol(v, &end, 10);
+-            if (end == v || *end || n < 1 || n > 20000) {
+-                rt_log("pad controls: bad value \"%s\" for look_speed, default kept", v);
+-                bad++;
+-            } else {
+-                p->look_speed = (int)n;
+-            }
+-            continue;
+-        }
+-        int idx = -1;
+-        for (int i = 0; i < RT_PAD_NBTN; i++)
+-            if (!strcmp(line, k_names[i])) idx = i;
+-        if (idx < 0) {
+-            rt_log("pad controls: unknown button \"%s\"", line);
++    for (size_t i = 0; i < sizeof k_env / sizeof *k_env; i++) {
++        const char *v = getenv(k_env[i][0]);
++        if (!v || !v[0]) continue;
++        if (rt_pad_tune(p, k_env[i][1], v)) {
++            rt_log("pad env: bad value \"%s\" for %s, kept", v, k_env[i][0]);
+             bad++;
+-            continue;
++        } else {
++            rt_log("pad env: %s=%s", k_env[i][0], v);
+         }
+-        rt_pad_tgt t;
+-        if (parse_target(v, &t)) {
+-            rt_log("pad controls: bad target \"%s\" for %s, default kept", v, line);
+-            bad++;
+-            continue;
++    }
++    return bad;
++}
++
++int rt_pad_load(rt_pad *p, const char *dir)
++{
++    rt_pad_defaults(p);
++    int bad = 0;
++    char path[1100], line[128];
++    snprintf(path, sizeof path, "%s/controls.txt", dir ? dir : "");
++    FILE *f = dir && dir[0] ? fopen(path, "r") : NULL;
++    if (f) {
++        while (fgets(line, sizeof line, f)) {
++            line[strcspn(line, "\r\n")] = 0;
++            if (!line[0] || line[0] == '#') continue;
++            bad += load_line(p, line);
+         }
+-        p->map[idx] = t;
++        fclose(f);
+     }
+-    fclose(f);
++    if (!dir || !dir[0]) return bad;
++    bad += load_env(p);
++    rt_log("pad cursor speed %d power %.2f dead %d left %.2f, look speed %d", p->cursor_speed, p->cursor_power, p->cursor_dead,
++           p->cursor_left, p->look_speed);
+     return bad;
+ }
+ 
+@@ -181,24 +290,34 @@ static int emit(const rt_pad_tgt *t, int down, rt_pad_pt pt, SDL_Event *out, int
+     }
+ }
+ 
+-static void log_press(int idx, const rt_pad_tgt *t)
++/* Once per button and mode, so a device log shows each mapping working
++   without a line for every press. */
++static void log_first(rt_pad *p, int idx, const rt_pad_tgt *t)
+ {
++    uint32_t bit = 1u << idx;
++    if (p->logged[p->menu] & bit) return;
++    p->logged[p->menu] |= bit;
+     char lab[24] = "", tb[16];
+-    if (idx < 14) {
++    if (k_sdl[idx] >= 0) {
+         int kind = rt_pad_kind();
+-        SDL_GamepadButtonLabel l = SDL_GetGamepadButtonLabelForType(kind == RT_PAD_PLAYSTATION ? SDL_GAMEPAD_TYPE_PS5 : SDL_GAMEPAD_TYPE_XBOXONE, k_sdl[idx]);
++        SDL_GamepadButtonLabel l =
++            SDL_GetGamepadButtonLabelForType(kind == RT_PAD_PLAYSTATION ? SDL_GAMEPAD_TYPE_PS5 : SDL_GAMEPAD_TYPE_XBOXONE, (SDL_GamepadButton)k_sdl[idx]);
+         if (l >= SDL_GAMEPAD_BUTTON_LABEL_A && l <= SDL_GAMEPAD_BUTTON_LABEL_Y) snprintf(lab, sizeof lab, " (%s)", k_face[0][l - SDL_GAMEPAD_BUTTON_LABEL_A]);
+         else if (l >= SDL_GAMEPAD_BUTTON_LABEL_CROSS) snprintf(lab, sizeof lab, " (%s)", k_face[1][l - SDL_GAMEPAD_BUTTON_LABEL_CROSS]);
+     }
+-    rt_log("pad %s%s -> %s", k_names[idx], lab, target_name(t, tb, sizeof tb));
++    rt_log("pad first %s%s in %s -> %s", k_names[idx], lab, p->menu ? "menu" : "play", target_name(t, tb, sizeof tb));
+ }
+ 
++/* A release sends what the press sent: Cross held as space when a menu
++   opens must lift space, not click. */
+ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     if (idx < 0 || idx >= RT_PAD_NBTN || p->down[idx] == (down != 0)) return 0;
+     p->down[idx] = down != 0;
+-    if (down) log_press(idx, &p->map[idx]);
+-    return emit(&p->map[idx], down, pt, out, cap);
++    if (!down) return emit(&p->held[idx], 0, pt, out, cap);
++    p->held[idx] = *rt_pad_target(p, idx, p->menu);
++    log_first(p, idx, &p->held[idx]);
++    return emit(&p->held[idx], 1, pt, out, cap);
+ }
+ 
+ static int dir_key(rt_pad *p, int d, int on, rt_pad_pt pt, SDL_Event *out, int cap)
+@@ -208,17 +327,21 @@ static int dir_key(rt_pad *p, int d, int on, rt_pad_pt pt, SDL_Event *out, int c
+     return emit(&(rt_pad_tgt){RT_PADT_KEY, k_dir_key[d]}, on, pt, out, cap);
+ }
+ 
++/* In menus the left stick is a second, finer cursor, so it holds no
++   movement keys there. */
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+-    int n = 0;
++    int n = 0, walk = !p->menu;
+     switch (axis) {
+     case SDL_GAMEPAD_AXIS_LEFTX:
+-        n += dir_key(p, 1, value < -RT_PAD_DEAD, pt, out + n, cap - n);
+-        n += dir_key(p, 3, value > RT_PAD_DEAD, pt, out + n, cap - n);
++        p->lx = value;
++        n += dir_key(p, 1, walk && value < -RT_PAD_DEAD, pt, out + n, cap - n);
++        n += dir_key(p, 3, walk && value > RT_PAD_DEAD, pt, out + n, cap - n);
+         break;
+     case SDL_GAMEPAD_AXIS_LEFTY:
+-        n += dir_key(p, 0, value < -RT_PAD_DEAD, pt, out + n, cap - n);
+-        n += dir_key(p, 2, value > RT_PAD_DEAD, pt, out + n, cap - n);
++        p->ly = value;
++        n += dir_key(p, 0, walk && value < -RT_PAD_DEAD, pt, out + n, cap - n);
++        n += dir_key(p, 2, walk && value > RT_PAD_DEAD, pt, out + n, cap - n);
+         break;
+     case SDL_GAMEPAD_AXIS_RIGHTX: p->rx = value; break;
+     case SDL_GAMEPAD_AXIS_RIGHTY: p->ry = value; break;
+@@ -229,12 +352,27 @@ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, in
+     return n;
+ }
+ 
++/* Entering a menu lifts any held movement key, and either way the
++   carried fraction is dropped: it was in the other mode's units. */
++int rt_pad_mode(rt_pad *p, int menu, rt_pad_pt pt, SDL_Event *out, int cap)
++{
++    menu = menu != 0;
++    if (p->menu == menu) return 0;
++    p->menu = menu;
++    p->fx = p->fy = 0;
++    rt_log("pad mode %s", menu ? "menu" : "play");
++    int n = 0;
++    if (menu)
++        for (int d = 0; d < 4; d++) n += dir_key(p, d, 0, pt, out + n, cap - n);
++    return n;
++}
++
+ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     int n = 0;
+     for (int i = 0; i < RT_PAD_NBTN; i++) n += rt_pad_button(p, i, 0, pt, out + n, cap - n);
+     for (int d = 0; d < 4; d++) n += dir_key(p, d, 0, pt, out + n, cap - n);
+-    p->rx = p->ry = 0;
++    p->rx = p->ry = p->lx = p->ly = 0;
+     p->fx = p->fy = 0;
+     return n;
+ }
+@@ -249,15 +387,48 @@ static int whole(double *f)
+ 
+ static double deflect(int v) { return abs(v) > RT_PAD_DEAD ? v / 32767.0 : 0.0; }
+ 
+-void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy)
++static void look(rt_pad *p, double dt, int *dx, int *dy)
+ {
+-    double k = (double)p->look_speed * ms / 1000.0;
++    double k = (double)p->look_speed * dt;
+     p->fx += deflect(p->rx) * k;
+     p->fy += deflect(p->ry) * k;
+     *dx = whole(&p->fx);
+     *dy = whole(&p->fy);
+ }
+ 
++void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy) { look(p, ms / 1000.0, dx, dy); }
++
++/* A radial dead zone and a power curve on what is left: the stick's
++   direction is kept whole, so a diagonal is not slowed by squaring each
++   axis, and speed rises slowly near the centre and fast at the rim. */
++void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *vy)
++{
++    *vx = *vy = 0;
++    double ux = x / 32767.0, uy = y / 32767.0, m = sqrt(ux * ux + uy * uy);
++    double dz = p->cursor_dead / 32767.0;
++    if (m <= dz || m <= 0) return;
++    double d = (m - dz) / (1.0 - dz);
++    if (d > 1) d = 1;
++    double s = p->cursor_speed * pow(d, p->cursor_power) / m;
++    *vx = ux * s;
++    *vy = uy * s;
++}
++
++void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy)
++{
++    if (!p->menu) {
++        look(p, dt, dx, dy);
++        return;
++    }
++    double rx, ry, lx, ly;
++    rt_pad_cursor_velocity(p, p->rx, p->ry, &rx, &ry);
++    rt_pad_cursor_velocity(p, p->lx, p->ly, &lx, &ly);
++    p->fx += (rx + lx * p->cursor_left) * dt;
++    p->fy += (ry + ly * p->cursor_left) * dt;
++    *dx = whole(&p->fx);
++    *dy = whole(&p->fy);
++}
++
+ void rt_pad_dev_init(rt_pad_dev *d, const char *dir)
+ {
+     memset(d, 0, sizeof *d);
+@@ -281,47 +452,114 @@ static int ignored(const rt_pad_dev *d, SDL_JoystickID id)
+     return 0;
+ }
+ 
+-int rt_pad_poll(rt_pad_dev *d, int active, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy)
++static int slot_of(const rt_pad_dev *d, SDL_JoystickID id)
++{
++    for (int i = 0; i < d->nslots; i++)
++        if (d->slot[i].id == id) return i;
++    return -1;
++}
++
++/* What a pad is doing, one bit per button (the triggers at their click
++   point) and one per stick direction past the dead zone. A pad takes
++   over on a bit that newly sets, not on bits that stay set, so a
++   resting stick that drifts past the dead zone cannot steal the drive
++   back. */
++static uint32_t live(SDL_Gamepad *gp)
++{
++    uint32_t b = 0;
++    for (int i = 0; i < RT_PAD_NBTN; i++)
++        if (k_sdl[i] >= 0 && SDL_GetGamepadButton(gp, (SDL_GamepadButton)k_sdl[i])) b |= 1u << i;
++    if (SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > RT_PAD_TRIGGER) b |= 1u << RT_PAD_LT;
++    if (SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > RT_PAD_TRIGGER) b |= 1u << RT_PAD_RT;
++    for (int a = 0; a < 4; a++) {
++        int v = SDL_GetGamepadAxis(gp, (SDL_GamepadAxis)a);
++        if (v < -RT_PAD_DEAD) b |= 1u << (RT_PAD_NBTN + 2 * a);
++        if (v > RT_PAD_DEAD) b |= 1u << (RT_PAD_NBTN + 2 * a + 1);
++    }
++    return b;
++}
++
++static void drive(rt_pad_dev *d, int i, const char *why)
++{
++    d->gp = d->slot[i].gp;
++    d->id = d->slot[i].id;
++    const char *nm = SDL_GetGamepadName(d->gp);
++    atomic_store(&s_detected, rt_pad_detect(SDL_GetGamepadType(d->gp), nm));
++    rt_log("pad drives %s type=%s (%s)", nm ? nm : "?", rt_pad_type_name(rt_pad_kind()), why);
++}
++
++/* Every connected pad is open and the one used last drives, so a
++   DualSense or Xbox pad and the Sense pair both work without
++   reconnecting either. A switch lifts what the old pad held first. */
++int rt_pad_poll(rt_pad_dev *d, int active, int menu, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy)
+ {
+     int n = 0;
+     *dx = *dy = 0;
+-    if (d->gp && !SDL_GamepadConnected(d->gp)) {
+-        n += rt_pad_release(&d->pad, pt, out, cap);
+-        SDL_CloseGamepad(d->gp);
++    for (int i = 0; i < d->nslots;) {
++        if (SDL_GamepadConnected(d->slot[i].gp)) {
++            i++;
++            continue;
++        }
++        const char *nm = SDL_GetGamepadName(d->slot[i].gp);
++        rt_log("pad removed %s", nm ? nm : "?");
++        int was = d->slot[i].id == d->id;
++        SDL_CloseGamepad(d->slot[i].gp);
++        memmove(&d->slot[i], &d->slot[i + 1], (size_t)(d->nslots - i - 1) * sizeof d->slot[0]);
++        d->nslots--;
++        d->nignored = 0;
++        if (!was) continue;
++        n += rt_pad_release(&d->pad, pt, out + n, cap - n);
+         d->gp = NULL;
+         d->id = 0;
+-        d->nignored = 0;
+         atomic_store(&s_detected, RT_PAD_XBOX);
+-        rt_log("pad removed");
++        if (d->nslots) drive(d, 0, "the driving pad was removed");
+     }
+     int count = 0;
+     SDL_JoystickID *ids = SDL_GetGamepads(&count);
+     for (int i = 0; ids && i < count; i++) {
+-        if (d->gp) {
+-            if (ids[i] == d->id || ignored(d, ids[i]) || d->nignored >= 8) continue;
++        if (slot_of(d, ids[i]) >= 0 || ignored(d, ids[i])) continue;
++        if (d->nslots >= RT_PAD_MAX) {
++            if (d->nignored >= 8) continue;
+             d->ignored[d->nignored++] = ids[i];
+             const char *nm = SDL_GetGamepadNameForID(ids[i]);
+-            rt_log("pad ignored %s (another pad drives)", nm ? nm : "?");
++            rt_log("pad ignored %s (%d pads open)", nm ? nm : "?", RT_PAD_MAX);
+             continue;
+         }
+-        d->gp = SDL_OpenGamepad(ids[i]);
+-        if (!d->gp) continue;
+-        d->id = ids[i];
+-        d->last_ns = now_ns;
+-        const char *nm = SDL_GetGamepadName(d->gp);
+-        atomic_store(&s_detected, rt_pad_detect(SDL_GetGamepadType(d->gp), nm));
+-        rt_log("pad added %s type=%s", nm ? nm : "?", rt_pad_type_name(rt_pad_kind()));
++        SDL_Gamepad *gp = SDL_OpenGamepad(ids[i]);
++        if (!gp) continue;
++        /* What is held at connect is not use: the first pad is adopted
++           silently, and a later one waits for a fresh press. */
++        rt_pad_slot *s = &d->slot[d->nslots++];
++        *s = (rt_pad_slot){gp, ids[i], live(gp)};
++        const char *nm = SDL_GetGamepadName(gp);
++        rt_log("pad added %s type=%s", nm ? nm : "?", rt_pad_type_name(rt_pad_detect(SDL_GetGamepadType(gp), nm)));
++        if (!d->gp) {
++            drive(d, d->nslots - 1, "first pad");
++            d->last_ns = now_ns;
++        }
+     }
+     SDL_free(ids);
++    for (int i = 0; i < d->nslots; i++) {
++        uint32_t now = live(d->slot[i].gp), fresh = now & ~d->slot[i].live;
++        d->slot[i].live = now;
++        if (!fresh || d->slot[i].id == d->id) continue;
++        n += rt_pad_release(&d->pad, pt, out + n, cap - n);
++        drive(d, i, "used last");
++    }
+     if (!d->gp || !active) {
+         if (d->gp) d->last_ns = now_ns;
+         return n;
+     }
+-    for (int i = 0; i < 14; i++) n += rt_pad_button(&d->pad, i, SDL_GetGamepadButton(d->gp, k_sdl[i]), pt, out + n, cap - n);
++    n += rt_pad_mode(&d->pad, menu, pt, out + n, cap - n);
++    for (int i = 0; i < RT_PAD_NBTN; i++)
++        if (k_sdl[i] >= 0) n += rt_pad_button(&d->pad, i, SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)k_sdl[i]), pt, out + n, cap - n);
+     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++) n += rt_pad_axis(&d->pad, a, SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a), pt, out + n, cap - n);
+-    uint64_t ms = (now_ns - d->last_ns) / 1000000u;
++    /* Real elapsed time, not whole milliseconds: at 120 Hz truncating to
++       8 ms would run the cursor 4% slow. Long stalls are capped so a
++       hitch does not fling it. */
++    double dt = (double)(now_ns - d->last_ns) / 1e9;
+     d->last_ns = now_ns;
+-    rt_pad_look(&d->pad, ms > 100 ? 100 : (uint32_t)ms, dx, dy);
++    rt_pad_move(&d->pad, dt > 0.1 ? 0.1 : dt, dx, dy);
+     return n;
+ }
+ 
+@@ -343,8 +581,9 @@ SDL_JoystickID rt_pad_test_attach(const char *name)
+     SDL_INIT_INTERFACE(&desc);
+     desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+     desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+-    desc.nbuttons = SDL_GAMEPAD_BUTTON_DPAD_RIGHT + 1;
+-    desc.button_mask = (1u << (SDL_GAMEPAD_BUTTON_DPAD_RIGHT + 1)) - 1u;
++    /* Every SDL button, so the touchpad and share button can be tested. */
++    desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
++    desc.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1u;
+     desc.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1u;
+     desc.name = name;
+     SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 6f88b2a..4104510 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -9,12 +9,28 @@ enum { RT_PAD_XBOX, RT_PAD_PLAYSTATION };
+ 
+ enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL };
+ 
+-enum { RT_PAD_LT = 14, RT_PAD_RT = 15, RT_PAD_NBTN = 16 };
++/* The triggers keep 14 and 15 so controls.txt and the m9 rows read as
++   before; the touchpad and Xbox share button come after them. */
++enum { RT_PAD_LT = 14, RT_PAD_RT = 15, RT_PAD_TOUCHPAD = 16, RT_PAD_MISC1 = 17, RT_PAD_NBTN = 18 };
++
++/* Play has the pointer locked and the right stick looking; menu is any
++   time the game shows its cursor, the same test rt_host_cursor makes. */
++enum { RT_PAD_PLAY, RT_PAD_MENU };
+ 
+ #define RT_PAD_DEAD 8000
+ #define RT_PAD_TRIGGER 16384
+ #define RT_PAD_LOOK_SPEED 1200
+ #define RT_PAD_EVENTS 64
++#define RT_PAD_MAX 4
++
++/* The menu cursor, in guest client pixels per second at full tilt. At
++   the default power half tilt is about 18% of that, so an inventory slot
++   can be hit without overshooting and a full push still crosses the
++   screen in under a second. */
++#define RT_PAD_CURSOR_SPEED 1600
++#define RT_PAD_CURSOR_POWER 2.5
++#define RT_PAD_CURSOR_DEAD 3000
++#define RT_PAD_CURSOR_LEFT 0.5
+ 
+ typedef struct {
+     int kind, arg;
+@@ -26,18 +42,33 @@ typedef struct {
+ 
+ typedef struct {
+     rt_pad_tgt map[RT_PAD_NBTN];
++    rt_pad_tgt menu_map[RT_PAD_NBTN];
++    uint8_t menu_set[RT_PAD_NBTN];
++    rt_pad_tgt held[RT_PAD_NBTN];
+     int look_speed;
++    int cursor_speed, cursor_dead;
++    double cursor_power, cursor_left;
++    int menu;
++    uint32_t logged[2];
+     uint8_t down[RT_PAD_NBTN];
+     uint8_t dir[4];
+-    int rx, ry;
++    int rx, ry, lx, ly;
+     double fx, fy;
+ } rt_pad;
+ 
++typedef struct {
++    SDL_Gamepad *gp;
++    SDL_JoystickID id;
++    uint32_t live;
++} rt_pad_slot;
++
+ typedef struct {
+     rt_pad pad;
+     SDL_Gamepad *gp;
+     SDL_JoystickID id, ignored[8];
+     int nignored;
++    rt_pad_slot slot[RT_PAD_MAX];
++    int nslots;
+     uint64_t last_ns;
+ } rt_pad_dev;
+ 
+@@ -47,17 +78,22 @@ const char *rt_pad_type_name(int kind);
+ const char *rt_pad_button_name(int idx);
+ 
+ void rt_pad_defaults(rt_pad *p);
++int rt_pad_tune(rt_pad *p, const char *key, const char *value);
+ int rt_pad_load(rt_pad *p, const char *dir);
+ int rt_pad_mappings(const char *dir);
++const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int menu);
+ 
+ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap);
++int rt_pad_mode(rt_pad *p, int menu, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy);
++void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *vy);
++void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy);
+ 
+ void rt_pad_dev_init(rt_pad_dev *d, const char *dir);
+ int rt_pad_start(const char *dir);
+-int rt_pad_poll(rt_pad_dev *d, int active, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy);
++int rt_pad_poll(rt_pad_dev *d, int active, int menu, rt_pad_pt pt, uint64_t now_ns, SDL_Event *out, int cap, int *dx, int *dy);
+ 
+ int rt_pad_test_start(void);
+ SDL_JoystickID rt_pad_test_attach(const char *name);
+-- 
+2.54.0 (Apple Git-157)
+

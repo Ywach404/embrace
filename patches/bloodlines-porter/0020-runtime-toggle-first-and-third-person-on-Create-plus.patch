@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:37:41 -0600
+Subject: [PATCH] runtime: toggle first and third person on Create plus L1
+
+The game's own view switch is togglecamera, a plain console command its
+config.cfg binds to z, with no cheat flag. A pad has no button left for
+it: every one is bound, L3 and R3 are the quest log and crouch, and the
+host takes the two together for stereo. So the pad layer gains chords.
+In play, a button pressed while a chord's modifier is held sends the
+chord's target instead of its own; Create plus L1 sends z by default,
+both on the left Sense half so one hand makes it.
+
+A modifier's own target would fire on its press, before the chord can
+be known, and Create's is the character sheet. So in play a chord's
+modifier holds its target back and sends it as a tap on release, only
+if no chord used that hold; the sheet opening on release rather than
+press is the cost. A wheel target is never held back, having no
+release. Lifting everything (focus lost, the pad gone) drops a waiting
+modifier without tapping it. Menus and dialogues keep every button as
+it was, since the chord only means something in play.
+
+controls.txt takes chord.mod+btn=target lines: a new pair is added, a
+known one changed, =none removes it, and an action target or a flick
+is refused, flicks being a dialogue's. Each chord fired is logged with
+its count, so a device log shows every toggle.
+---
+ runtime/input_selftest.c | 118 ++++++++++++++++++++++++++++++++++++++-
+ runtime/pad.c            |  96 ++++++++++++++++++++++++++++++-
+ runtime/pad.h            |  17 ++++++
+ 3 files changed, 228 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 7961aae..a1a3197 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1246,6 +1246,17 @@ static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, in
+             padpump(s, d, 10);
+             continue;
+         }
++        /* Create is the view toggle chord's modifier in play: alone it is
++           a tap on release (pad_chords). */
++        if (mode == RT_PAD_PLAY && k_padmap[i].btn == SDL_GAMEPAD_BUTTON_BACK) {
++            check(s_n == 0, name, "%s", dump());
++            s_n = 0;
++            press(id, (int)i, 0);
++            padpump(s, d, 10);
++            snprintf(name, sizeof name, "%s %s release taps it", mn, k_padmap[i].name);
++            check(s_n == 2 && s_m[0].msg == msg && s_m[0].wp == wp && s_m[1].msg == msg + 1 && s_m[1].wp == wp, name, "%s", dump());
++            continue;
++        }
+         /* Escape also gives its WM_CHAR, so only the first message is held to. */
+         check(s_n >= 1 && s_n <= 2 && s_m[0].msg == msg && (msg == WM_MOUSEWHEEL || s_m[0].wp == wp), name, "%s", dump());
+         s_n = 0;
+@@ -2131,6 +2142,102 @@ static void pad_curve(void)
+     check(rt_pad_tune(&p, "south", "space") == -1, "a button is not a tunable", "");
+ }
+ 
++/* Create plus L1 in play is the game's togglecamera bind (z): once per
++   press, L1's own wheel step and Create's character sheet both held back;
++   Create alone still opens the sheet, on release; L1 alone still steps;
++   the chord is play's only; and lifting everything while Create waits
++   taps nothing. */
++static void pad_chords(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("PlayStation VR2 Sense Controllers (L/R)");
++    padpump(&s, &d, 10);
++    check(d.pad.mode == RT_PAD_PLAY && d.pad.nchord == 1, "the view toggle chord is there by default", "mode %d chords %d", d.pad.mode,
++          d.pad.nchord);
++    for (int round = 0; round < 2; round++) {
++        char name[96];
++        s_n = 0;
++        rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 1);
++        padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "chord %d: Create held in play sends nothing yet", round + 1);
++        check(s_n == 0, name, "%s", dump());
++        rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1);
++        padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "chord %d: Create + L1 is z down (togglecamera), no wheel", round + 1);
++        check(msgs_are(WM_KEYDOWN, 0x5A, 1), name, "%s", dump());
++        s_n = 0;
++        for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "chord %d: held, it fires once", round + 1);
++        check(s_n == 0, name, "%s", dump());
++        rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0);
++        padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "chord %d: L1 up lifts z", round + 1);
++        check(msgs_are(WM_KEYUP, 0x5A, 1), name, "%s", dump());
++        s_n = 0;
++        rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 0);
++        padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "chord %d: Create up after a chord opens no character sheet", round + 1);
++        check(s_n == 0, name, "%s", dump());
++    }
++    check(d.pad.chords_fired == 2, "each chord is counted for its log line", "%u", d.pad.chords_fired);
++
++    /* Create let go before L1: z still lifts with L1. */
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 1);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1);
++    padpump(&s, &d, 10);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 0);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_KEYDOWN, 0x5A, 1), "Create let go first sends nothing more", "%s", dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0);
++    padpump(&s, &d, 10);
++    check(msgs_are(WM_KEYUP, 0x5A, 1), "then L1 up lifts z", "%s", dump());
++
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 1 && s_m[0].msg == WM_MOUSEWHEEL, "L1 alone still steps the weapon", "%s", dump());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0);
++    padpump(&s, &d, 10);
++
++    /* Lifting everything while Create waits must not tap it. */
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 1);
++    padpump(&s, &d, 10);
++    rt_pad_pt pt = {0, 0};
++    SDL_Event ev[8];
++    int n = rt_pad_release(&d.pad, pt, ev, 8);
++    check(n == 0 && s_n == 0, "a release of everything while Create waits sends nothing", "%d events %s", n, dump());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 0);
++    padpump(&s, &d, 10);
++    check(s_n == 0, "nor does Create's own release after it", "%s", dump());
++
++    /* In a menu the chord is not there: Create is c at once, L1 a wheel. */
++    s_n = 0;
++    s.cursor = 0x00007F00u;
++    rt_input_relative_update(&s);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 1);
++    padpump(&s, &d, 10);
++    check(d.pad.mode == RT_PAD_MENU && msgs_are(WM_KEYDOWN, 0x43, 1), "in a menu Create is c on the press", "mode %d %s", d.pad.mode, dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 1);
++    padpump(&s, &d, 10);
++    check(s_n == 1 && s_m[0].msg == WM_MOUSEWHEEL, "and Create + L1 there is L1's wheel, no toggle", "%s", dump());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, 0);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_BACK, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
+ static void pad_controls(void)
+ {
+     const char *tmp = getenv("TMPDIR");
+@@ -2148,7 +2255,9 @@ static void pad_controls(void)
+     }
+     fputs("# test\nmenu.south=space\nmenu.east=play\nwest=r\nmenu.dpup=up\ntouchpad=none\ncursor_speed=800\ncursor_power=2\n"
+           "menu.bogus=x\nmenu.north=notakey\ndialogue.flickleft=5\ndialogue.east=play\ndialogue.flickup=nokey\n"
+-          "dialogue.dpdown=answerup\ndialogue.dpup=answerup/space\n",
++          "dialogue.dpdown=answerup\ndialogue.dpup=answerup/space\n"
++          "chord.back+leftshoulder=none\nchord.north+dpup=z\nchord.bogus+south=z\nchord.back+flickup=z\nchord.west+west=z\n"
++          "chord.start+south=answer\n",
+           f);
+     fclose(f);
+     rt_pad p;
+@@ -2156,7 +2265,11 @@ static void pad_controls(void)
+     unlink(path);
+     rmdir(dir);
+     const rt_pad_tgt *t = rt_pad_target(&p, 0, 1);
+-    check(bad == 4, "four bad controls lines are counted, a fallback on a step among them", "%d", bad);
++    check(bad == 8, "eight bad controls lines are counted, a fallback on a step and four chords among them", "%d", bad);
++    check(p.nchord == 1 && p.chord[0].mod == 3 && p.chord[0].btn == 10 && p.chord[0].target.kind == RT_PADT_KEY &&
++              p.chord[0].target.arg == SDL_SCANCODE_Z,
++          "chord.back+leftshoulder=none removes the view toggle, chord.north+dpup=z moves it", "%d chords, %d+%d", p.nchord, p.chord[0].mod,
++          p.chord[0].btn);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "menu.south remaps Cross in menus only", "%d %d", t->kind, t->arg);
+     t = rt_pad_target(&p, 0, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
+@@ -2223,6 +2336,7 @@ int rt_input_selftest(void)
+     pad_answers();
+     pad_left();
+     pad_lone();
++    pad_chords();
+     pad_controls();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+diff --git a/runtime/pad.c b/runtime/pad.c
+index f43c191..6f86b65 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -73,6 +73,17 @@ static const struct {
+     {RT_PAD_DIALOGUE, RT_PAD_FLICK_DOWN, "answerdown"},
+ };
+ 
++/* Create plus L1, in play, is the game's own togglecamera, bound to z in
++   its config.cfg: first and third person. Both are on the left Sense
++   half, so one hand does it, and neither stick is clicked, which both
++   L3 (quest log) and R3 (crouch) and the two together (stereo) take.
++   Create is the character sheet, which then opens on release when no
++   chord was made; L1 alone still steps the weapon down. */
++static const struct {
++    int mod, btn;
++    const char *target;
++} k_chord_default[] = {{4, 6, "z"}};
++
+ static const char *const k_mode_names[RT_PAD_NMODES] = {"play", "menu", "dialogue"};
+ 
+ static const int k_dir_key[4] = {SDL_SCANCODE_W, SDL_SCANCODE_A, SDL_SCANCODE_S, SDL_SCANCODE_D};
+@@ -207,6 +218,53 @@ void rt_pad_defaults(rt_pad *p)
+         parse_target(k_mode_default[i].target, &p->over[m][idx]);
+         p->over_set[m][idx] = 1;
+     }
++    for (size_t i = 0; i < sizeof k_chord_default / sizeof *k_chord_default; i++) {
++        rt_pad_chord *c = &p->chord[p->nchord++];
++        c->mod = k_chord_default[i].mod;
++        c->btn = k_chord_default[i].btn;
++        parse_target(k_chord_default[i].target, &c->target);
++    }
++}
++
++static int button_named(const char *name, size_t n)
++{
++    for (int i = 0; i < RT_PAD_FLICK_UP; i++)
++        if (strlen(k_names[i]) == n && !strncmp(name, k_names[i], n)) return i;
++    return -1;
++}
++
++/* chord.mod+btn=target: a new pair is added, a known one changed, and
++   =none removes it. Flicks are not chord buttons: they are a dialogue's
++   and chords are play's. 0 when taken, 1 for a bad line. */
++static int load_chord(rt_pad *p, const char *spec, const char *v)
++{
++    const char *plus = strchr(spec, '+');
++    int mod = plus ? button_named(spec, (size_t)(plus - spec)) : -1, btn = plus ? button_named(plus + 1, strlen(plus + 1)) : -1;
++    rt_pad_tgt tg;
++    if (mod < 0 || btn < 0 || mod == btn) {
++        rt_log("pad controls: bad chord \"%s\"", spec);
++        return 1;
++    }
++    if (parse_target(v, &tg) || tg.kind >= RT_PADT_ANSWER_UP) {
++        rt_log("pad controls: bad target \"%s\" for chord %s, default kept", v, spec);
++        return 1;
++    }
++    int at = -1;
++    for (int i = 0; i < p->nchord; i++)
++        if (p->chord[i].mod == mod && p->chord[i].btn == btn) at = i;
++    if (tg.kind == RT_PADT_NONE) {
++        if (at >= 0) p->chord[at] = p->chord[--p->nchord];
++        return 0;
++    }
++    if (at < 0) {
++        if (p->nchord >= RT_PAD_NCHORD) {
++            rt_log("pad controls: chord %s ignored, %d at most", spec, RT_PAD_NCHORD);
++            return 1;
++        }
++        at = p->nchord++;
++    }
++    p->chord[at] = (rt_pad_chord){mod, btn, tg};
++    return 0;
+ }
+ 
+ const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int mode)
+@@ -266,6 +324,7 @@ static int load_line(rt_pad *p, char *line)
+         return 1;
+     }
+     if (!t) return 0;
++    if (!strncmp(line, "chord.", 6)) return load_chord(p, line + 6, v);
+     int mode = !strncmp(line, "menu.", 5) ? RT_PAD_MENU : !strncmp(line, "dialogue.", 9) ? RT_PAD_DIALOGUE : RT_PAD_PLAY;
+     const char *name = mode == RT_PAD_MENU ? line + 5 : mode == RT_PAD_DIALOGUE ? line + 9 : line;
+     int idx = -1;
+@@ -415,12 +474,40 @@ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, in
+ {
+     if (idx < 0 || idx >= RT_PAD_NBTN || p->down[idx] == (down != 0)) return 0;
+     p->down[idx] = down != 0;
+-    if (!down) return emit(&p->held[idx], 0, pt, out, cap);
++    if (!down) {
++        if (!p->deferred[idx]) return emit(&p->held[idx], 0, pt, out, cap);
++        /* A modifier let go: its own target as a tap, unless a chord used
++           this hold. */
++        p->deferred[idx] = 0;
++        if (p->chorded[idx] || cap < 2) return 0;
++        int n = emit(&p->held[idx], 1, pt, out, cap);
++        return n + emit(&p->held[idx], 0, pt, out + n, cap - n);
++    }
++    if (p->mode == RT_PAD_PLAY)
++        for (int i = 0; i < p->nchord; i++) {
++            const rt_pad_chord *c = &p->chord[i];
++            if (c->btn != idx || !p->deferred[c->mod]) continue;
++            p->chorded[c->mod] = 1;
++            p->held[idx] = c->target;
++            char tb[40];
++            rt_log("pad chord %s+%s -> %s (%u this run)", k_names[c->mod], k_names[idx], target_name(&c->target, tb, sizeof tb),
++                   ++p->chords_fired);
++            return emit(&p->held[idx], 1, pt, out, cap);
++        }
+     rt_pad_tgt t = *rt_pad_target(p, idx, p->mode);
+     if ((t.kind == RT_PADT_ANSWER || t.kind == RT_PADT_ANSWER_CLEAR) && !p->lit) t = (rt_pad_tgt){t.alt_kind, t.alt_arg, RT_PADT_NONE, 0};
+     p->held[idx] = t;
+     p->step_at[idx] = p->now_ns + RT_PAD_STEP_DELAY_NS;
+     log_first(p, idx, &p->held[idx]);
++    /* A chord's modifier in play waits to see whether it is one. Only a
++       key or click waits: a wheel step has no release to defer to. */
++    if (p->mode == RT_PAD_PLAY && (t.kind == RT_PADT_KEY || t.kind == RT_PADT_MOUSE))
++        for (int i = 0; i < p->nchord; i++)
++            if (p->chord[i].mod == idx) {
++                p->deferred[idx] = 1;
++                p->chorded[idx] = 0;
++                return 0;
++            }
+     return emit(&p->held[idx], 1, pt, out, cap);
+ }
+ 
+@@ -572,6 +659,13 @@ int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap)
+ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     int n = 0;
++    /* A modifier still waiting sent nothing, so lifting everything (focus
++       lost, the pad gone) must neither tap it nor lift its key. */
++    for (int i = 0; i < RT_PAD_NBTN; i++)
++        if (p->deferred[i]) {
++            p->deferred[i] = 0;
++            p->held[i] = (rt_pad_tgt){RT_PADT_NONE, 0, RT_PADT_NONE, 0};
++        }
+     for (int i = 0; i < RT_PAD_NBTN; i++) n += rt_pad_button(p, i, 0, pt, out + n, cap - n);
+     for (int d = 0; d < 4; d++) n += dir_key(p, d, 0, pt, out + n, cap - n);
+     p->rx = p->ry = p->lx = p->ly = 0;
+diff --git a/runtime/pad.h b/runtime/pad.h
+index a7cc3d9..3ec72ef 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -72,8 +72,25 @@ typedef struct {
+     float x, y;
+ } rt_pad_pt;
+ 
++/* A chord: btn pressed while mod is held, in play, sends target instead
++   of btn's own. mod's own target then waits for its release and is sent
++   as a tap only if no chord used it, so holding Create for the view
++   toggle does not open the character sheet first. Up to RT_PAD_NCHORD,
++   as controls.txt's chord.mod+btn=target lines say. */
++#define RT_PAD_NCHORD 4
++typedef struct {
++    int mod, btn;
++    rt_pad_tgt target;
++} rt_pad_chord;
++
+ typedef struct {
+     rt_pad_tgt map[RT_PAD_NBTN];
++    rt_pad_chord chord[RT_PAD_NCHORD];
++    int nchord;
++    /* A chord's modifier held with its own target waiting (deferred), and
++       whether a chord has used this hold (chorded). */
++    uint8_t deferred[RT_PAD_NBTN], chorded[RT_PAD_NBTN];
++    uint32_t chords_fired;
+     /* Menu and dialogue overrides, indexed by mode minus one. */
+     rt_pad_tgt over[RT_PAD_NMODES - 1][RT_PAD_NBTN];
+     uint8_t over_set[RT_PAD_NMODES - 1][RT_PAD_NBTN];
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 01:49:49 -0600
+Subject: [PATCH 6/6] bridge: let the metal backend finish at exit
+
+The game never releases its D3D9 device when it quits, so the metal
+backend's release path, which writes its pipeline archive and logs the
+pipeline summary, never ran: a real session opened a new archive and
+left nothing on disk. rt_gfx_report runs at every traced exit, so in
+metal mode it now resolves metal_d3d9_shutdown from the backend and
+calls it before its own report. A backend without the export is left
+alone, so older builds of it still load.
+---
+ shims/d3d9_bridge.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/shims/d3d9_bridge.c b/shims/d3d9_bridge.c
+index f6c2c05..34f3335 100644
+--- a/shims/d3d9_bridge.c
++++ b/shims/d3d9_bridge.c
+@@ -2640,6 +2640,15 @@ static int cmp64(const void *x, const void *y)
+ 
+ void rt_gfx_report(void)
+ {
++    /* The game quits without releasing its device, and the metal
++       backend writes its pipeline archive and summary at release, so
++       neither would happen. It does both here instead, before this
++       report, so its lines land with the rest of the exit. Resolved
++       late and optional: a backend without the export just skips it. */
++    if (s_mode == RT_GFX_METAL && s_lib) {
++        void (*shutdown)(void) = (void (*)(void))dlsym(s_lib, "metal_d3d9_shutdown");
++        if (shutdown) shutdown();
++    }
+     uint32_t n = s_nframes;
+     double q[4] = {0, 0, 0, 0};
+     uint64_t *v = n ? malloc(n * sizeof *v) : NULL;

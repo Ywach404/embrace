@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 13:03:34 -0600
+Subject: [PATCH 12/12] runtime: find vampire.exe in any case and hand refusals
+ to the host
+
+The second simulator run stopped right after stage 2: main returned
+through the vampire.exe header refusal, which wrote only to stderr, so
+neither the console nor the run log said why, and the host app showed a
+bare status.
+
+refuse now goes through rt_log, so a refusal after the run log opens is
+in the log too, and keeps the reason. stderr reads exactly as before. The
+unknown option path keeps its reason the same way. On visionOS the
+reason goes to the host with the status through rt_host_start's done
+callback, which is the only channel for refusals made before the log
+folder exists.
+
+The executable's headers are now read from the path the vfs resolves
+for C:\VTMB\vampire.exe, which is up by then, instead of from a fixed
+lowercase name. Installs ship Vampire.exe and the headset's file system
+can be case sensitive. The refusal names the path and the errno or the
+byte count, so the next failure here explains itself. On the Mac the
+same file is opened as before.
+---
+ runtime/host.h |  9 +++++++--
+ runtime/main.c | 44 +++++++++++++++++++++++++++++++++++---------
+ 2 files changed, 42 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 1a3271c..6de2686 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -14,12 +14,17 @@
+  * the headset has no desktop of its own to measure. done, if not NULL, is
+  * called on that thread with main's result when a run is refused or ends
+  * by returning; a game that quits ends the process from inside the
+- * runtime, as it does on the Mac. Returns 0, or an errno value if the
++ * runtime, as it does on the Mac. why is the refusal's reason, the line
++ * stderr and the run log show, or NULL when nothing was refused; it is
++ * only valid during the call, so a host copies it, and since done runs on
++ * the runtime's thread, a host hops to its own before it touches any UI.
++ * Refusals before the overlay's log folder exists reach no log, so why is
++ * the only place a host sees them. Returns 0, or an errno value if the
+  * thread could not be made. Call it on the main thread, which UIKit
+  * requires for SDL's video: the runtime's window calls hop there from its
+  * own thread and wait (runtime/main_hop.h), so the main thread must keep
+  * its run loop running and never wait for the runtime.
+  */
+-int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status));
++int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status, const char *why));
+ 
+ #endif
+diff --git a/runtime/main.c b/runtime/main.c
+index 221a3c2..d2dc9f9 100644
+--- a/runtime/main.c
++++ b/runtime/main.c
+@@ -131,9 +131,16 @@ static void real_path(const char *p, char *out)
+     snprintf(out + n, PATH_MAX - n, "%s", tail);
+ }
+ 
++/* Why the last run was refused. A host app has no terminal to show stderr
++   in, so it gets this text with the status (runtime/host.h). */
++static char s_refusal[PATH_MAX + 256];
++
++/* Through rt_log, so a refusal after the run log is open lands there as
++   well as on stderr, where it reads as it always has. */
+ static int refuse(const char *why)
+ {
+-    fprintf(stderr, "rt: run refused: %s\n", why);
++    snprintf(s_refusal, sizeof s_refusal, "%s", why);
++    rt_log("run refused: %s", why);
+     return 1;
+ }
+ 
+@@ -285,7 +292,8 @@ static int run(int argc, char **argv)
+             i++;
+             break;
+         } else {
+-            fprintf(stderr, "rt: unknown --run option %s\n", argv[i]);
++            snprintf(s_refusal, sizeof s_refusal, "unknown --run option %s", argv[i]);
++            rt_log("%s", s_refusal);
+             return 2;
+         }
+     }
+@@ -373,11 +381,29 @@ static int run(int argc, char **argv)
+     rt_stage(2, "%u images, %u slots, 0 unbound", rt_nmodules, slots);
+ 
+     rt_heap_init(RT_ALLOC_LO, RT_ALLOC_HI);
+-    char exe[PATH_MAX];
+-    snprintf(exe, sizeof exe, "%s/vampire.exe", game);
+-    int fd = open(exe, O_RDONLY);
+-    if (fd < 0 || read(fd, rt_host(RT_EXE_BASE), 0x400) != 0x400) return refuse("vampire.exe headers unreadable");
++    /* Through the vfs, which is up by now, so the name matches in any case:
++       installs ship Vampire.exe, and the headset's file system can be case
++       sensitive. An overlay copy wins, as it does for the guest's own opens
++       of the same name. */
++    char exe[PATH_MAX], why[PATH_MAX + 128];
++    int exists = 0, in_overlay = 0;
++    if (rt_vfs_resolve("C:\\VTMB\\vampire.exe", exe, sizeof exe, &exists, &in_overlay, NULL, 0) || !exists) {
++        snprintf(why, sizeof why, "vampire.exe not found in %s in any case", rgame);
++        return refuse(why);
++    }
++    int fd = open(exe, O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        snprintf(why, sizeof why, "vampire.exe cannot be opened: %s (%s)", strerror(errno), exe);
++        return refuse(why);
++    }
++    ssize_t got = read(fd, rt_host(RT_EXE_BASE), 0x400);
++    int read_errno = errno;
+     close(fd);
++    if (got != 0x400) {
++        if (got < 0) snprintf(why, sizeof why, "vampire.exe headers unreadable: %s (%s)", strerror(read_errno), exe);
++        else snprintf(why, sizeof why, "vampire.exe headers unreadable: %zd of 1024 bytes (%s)", got, exe);
++        return refuse(why);
++    }
+     if (rt_up_init(args)) return refuse("-game needs a plain folder name");
+     int lw, lh;
+     rt_aspect_launch_size(&lw, &lh);
+@@ -465,19 +491,19 @@ int main(int argc, char **argv)
+ typedef struct {
+     int argc;
+     char **argv;
+-    void (*done)(int);
++    void (*done)(int, const char *);
+ } host_run;
+ 
+ static void *host_thread(void *p)
+ {
+     host_run *h = p;
+     int r = rt_main(h->argc, h->argv);
+-    if (h->done) h->done(r);
++    if (h->done) h->done(r, r && s_refusal[0] ? s_refusal : NULL);
+     else exit(r);
+     return NULL;
+ }
+ 
+-int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status))
++int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status, const char *why))
+ {
+     if (argc < 1 || !argv) return EINVAL;
+     host_run *h = calloc(1, sizeof *h);
+-- 
+2.54.0 (Apple Git-157)
+

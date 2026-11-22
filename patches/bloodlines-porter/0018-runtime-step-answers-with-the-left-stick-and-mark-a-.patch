@@ -1,0 +1,666 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 01:06:08 -0600
+Subject: [PATCH] runtime: step answers with the left stick and mark a lone
+ answer
+
+On device the selector worked, but the thumb that reaches for it is
+the left one, the stick that walks. In dialogue mode the left stick's
+up and down flicks now step the highlight with the same repeat the
+right stick has. The right stick keeps stepping: look is off in a
+dialogue, so it does no harm. Both sticks share the four flick
+buttons, so one controls.txt line moves both and live() still fits a
+pad in 32 bits. A held flick stays with the stick that fired it, so
+the other stick cannot take it over mid push. Walking and stepping
+are gated by the same mode test, so a push in a dialogue is never
+both. After a dialogue opens each stick has to centre once before it
+steps, as the right one did.
+
+A dialogue with one answer now has it marked as soon as it shows, so
+Cross or RT confirms it with no step; one answer is what continue is
+in this HUD. The check runs every pump, so a pick that leads to a
+one-answer node is marked too, and a Cross that soon still waits out
+the 0.5 s guard. Two answers or more stay unmarked until the first
+move. Two sets are left alone: the one Circle cleared, until the
+answers change or the dialogue closes, and the one a confirm just
+picked, until the game's pick time moves or the answers change, so
+the line still on screen is not marked again and copied into the
+history with its marker. Only while a pad drives a dialogue: under a
+menu, or for a keyboard player, the game's own text is left as is.
+---
+ runtime/input.c          |  94 +++++++++++---
+ runtime/input.h          |   7 +
+ runtime/input_selftest.c | 273 +++++++++++++++++++++++++++++++++++++++
+ runtime/pad.c            |  84 ++++++++----
+ runtime/pad.h            |  11 +-
+ 5 files changed, 425 insertions(+), 44 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 885ed84..2361aba 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -450,30 +450,35 @@ static void sel_light(rt_dialogue_sel *g, uint32_t va, int32_t count, int idx, u
+     sel_note(g, now);
+ }
+ 
++/* What the answers are, as one number: a set seen again under the same
++   key is the same set, so a lone answer Circle cleared stays cleared.
++   Read only while nothing is marked, so the key is over the game's own
++   text. */
++static uint32_t set_key(uint32_t va, int32_t count)
++{
++    uint32_t h = (2166136261u ^ va) * 16777619u;
++    h = (h ^ (uint32_t)count) * 16777619u;
++    for (int i = 0; i < slots_of(count); i++) {
++        h = (h ^ text_sum(slot_text(va, i))) * 16777619u;
++        h = (h ^ panel32(va + DIALOGUE_TYPE + 4u * (uint32_t)i)) * 16777619u;
++        h = (h ^ panel32(va + DIALOGUE_FLAGS + 4u * (uint32_t)i)) * 16777619u;
++    }
++    return h;
++}
++
+ /* The panel can be stepped: it is the HUD, active, and showing answers. */
+ static int sel_ready(uint32_t va)
+ {
+     return va && panel8(va + DIALOGUE_ACTIVE) && !panel8(va + DIALOGUE_HISTORY) && !panel8(va + DIALOGUE_SINGLE);
+ }
+ 
+-/* Once per pump, before the pad is read, on the game thread: the pump
+-   runs between the game's frames, so nothing of the game's writes a slot
+-   while it is read or edited here. Anything that changes the answers
+-   other than our own edit ends the highlight, so a confirm can never
+-   send the number of an answer the player did not see marked. A slot
+-   rewritten to the same text it had (the game putting it back on its own
+-   schedule) gets the marker again. */
+-static void sel_sync(rt_input_state *s, uint64_t now)
++/* Anything that changes the answers other than our own edit ends the
++   highlight, so a confirm can never send the number of an answer the
++   player did not see marked. A slot rewritten to the same text it had
++   (the game putting it back on its own schedule) gets the marker
++   again. */
++static void sel_check(rt_dialogue_sel *g, uint32_t va, uint64_t now)
+ {
+-    rt_dialogue_sel *g = &s->sel;
+-    uint32_t va = s->dialogue_va;
+-    if (va) {
+-        uint32_t bits = panel32(va + DIALOGUE_PICK_TIME);
+-        if (g->pick_va == va && bits != g->pick_bits) g->pick_ns = now;
+-        g->pick_va = va;
+-        g->pick_bits = bits;
+-    }
+-    if (!g->lit) return;
+     /* A HUD that is gone or replaced is never written: the memory may
+        belong to something else now. */
+     if (va != g->va) {
+@@ -527,6 +532,46 @@ static void sel_sync(rt_input_state *s, uint64_t now)
+     if (g->log_dirty && now - g->log_ns >= DIALOGUE_LOG_NS) sel_log(g, now);
+ }
+ 
++/* One answer is what "continue" is in this HUD, so it is marked as soon
++   as it shows and Cross confirms it with no step first. It is checked
++   every pump, so a pick that leads to a one-answer node is marked too;
++   a Cross that soon after a pick still waits out the guard in sel_act.
++   Two sets are left alone: the one Circle cleared, which the player
++   chose not to have marked, and the one a confirm just picked, which is
++   still on screen until the game moves on and must not be marked again
++   and copied into the history with its marker. Only while a pad drives
++   a dialogue: a keyboard player sees the game's own text. */
++static void sel_auto(rt_dialogue_sel *g, uint32_t va, uint64_t now, int can_auto)
++{
++    if (!va || !panel8(va + DIALOGUE_ACTIVE)) g->skip_on = g->await_on = 0;
++    if (g->lit || !sel_ready(va)) return;
++    int32_t count = (int32_t)panel32(va + DIALOGUE_COUNT);
++    uint32_t key = set_key(va, count);
++    if (g->skip_on && key != g->skip_key) g->skip_on = 0;
++    if (g->await_on && (key != g->await_key || g->pick_bits != g->await_bits)) g->await_on = 0;
++    if (count != 1 || g->skip_on || g->await_on || !can_auto) return;
++    sel_light(g, va, 1, 0, now);
++    g->autos++;
++    rt_log("dialogue lone answer marked");
++}
++
++/* Once per pump, before the pad is read, on the game thread: the pump
++   runs between the game's frames, so nothing of the game's writes a slot
++   while it is read or edited here. */
++static void sel_sync(rt_input_state *s, uint64_t now, int can_auto)
++{
++    rt_dialogue_sel *g = &s->sel;
++    uint32_t va = s->dialogue_va;
++    if (va) {
++        uint32_t bits = panel32(va + DIALOGUE_PICK_TIME);
++        if (g->pick_va == va && bits != g->pick_bits) g->pick_ns = now;
++        g->pick_va = va;
++        g->pick_bits = bits;
++    }
++    if (g->lit) sel_check(g, va, now);
++    sel_auto(g, va, now, can_auto);
++}
++
+ static int key_event(SDL_Event *e, int scancode, int down)
+ {
+     memset(e, 0, sizeof *e);
+@@ -560,7 +605,15 @@ static int sel_act(rt_input_state *s, int act, uint64_t now, SDL_Event *out, int
+         sel_light(g, va, count, idx, now);
+         return 0;
+     }
+-    case RT_PAD_ACT_CLEAR: sel_drop(g, 1, "Circle"); return 0;
++    case RT_PAD_ACT_CLEAR: {
++        int lone = g->lit && g->count == 1;
++        sel_drop(g, 1, "Circle");
++        if (lone) {
++            g->skip_on = 1;
++            g->skip_key = set_key(g->va, 1);
++        }
++        return 0;
++    }
+     case RT_PAD_ACT_CONFIRM: {
+         if (!g->lit || cap < 2) return 0;
+         if (g->pick_ns && now - g->pick_ns < DIALOGUE_GUARD_NS) {
+@@ -578,6 +631,9 @@ static int sel_act(rt_input_state *s, int act, uint64_t now, SDL_Event *out, int
+         g->log_dirty = 0;
+         g->confirms++;
+         g->pick_ns = now;
++        g->await_on = 1;
++        g->await_key = set_key(g->va, count);
++        g->await_bits = g->pick_bits;
+         rt_log("dialogue confirm %d of %d", idx + 1, count);
+         key_event(&out[0], SDL_SCANCODE_1 + idx, 1);
+         key_event(&out[1], SDL_SCANCODE_1 + idx, 0);
+@@ -639,7 +695,7 @@ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now
+ {
+     SDL_Event ev[RT_PAD_EVENTS], go[RT_PAD_EVENTS + 2];
+     int dx, dy, mode = rt_input_pad_mode(s), n = 0;
+-    sel_sync(s, now_ns);
++    sel_sync(s, now_ns, active && d->gp && mode == RT_PAD_DIALOGUE);
+     d->pad.lit = s->sel.lit;
+     int k = rt_pad_poll(d, active, mode, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
+     /* Answer actions become what the selector sends, in their place in
+diff --git a/runtime/input.h b/runtime/input.h
+index fc8c5d9..d700469 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -65,6 +65,13 @@ typedef struct {
+     uint32_t sum[RT_DLG_SLOTS], type[RT_DLG_SLOTS], flags[RT_DLG_SLOTS];
+     uint32_t pick_va, pick_bits;
+     uint64_t pick_ns;
++    /* A lone answer is marked as it appears, except for two sets: the
++       one Circle cleared, until the answers change, and the one a confirm
++       just picked, until the game's pick time moves or the answers
++       change. Each is held as a key over the panel, count, texts, types
++       and flags. */
++    int skip_on, await_on;
++    uint32_t skip_key, await_key, await_bits, autos;
+     int log_dirty;
+     uint64_t log_ns, reapply_log_ns;
+     uint32_t steps, confirms, resets, reapplies, held;
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 04e6b71..7b1fecd 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1574,6 +1574,277 @@ static void pad_answers(void)
+     padpump(&s, &d, 10);
+ }
+ 
++/* A left stick push for one pump, then where it is left. */
++static void lstick(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int x, int y)
++{
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTX, x);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, y);
++    padpump(s, d, 10);
++}
++
++/* A movement key pressed in what was sent: W, A, S or D. */
++static int walked(void)
++{
++    for (int i = 0; i < s_n; i++)
++        if (s_m[i].msg == WM_KEYDOWN && (s_m[i].wp == 0x57 || s_m[i].wp == 0x41 || s_m[i].wp == 0x53 || s_m[i].wp == 0x44)) return 1;
++    return 0;
++}
++
++static void dialogue_on(rt_input_state *s, int on)
++{
++    fake8(DIALOGUE_ACTIVE_OFF, (uint8_t)on);
++    s->dialogue = on;
++    /* The probe keeps the HUD's address while it is inactive. */
++    s->dialogue_va = FAKE_VA;
++}
++
++/* The left stick is the primary way through the answers: it steps as
++   the right stick does, never walks in a dialogue, and like the right
++   one has to centre after the dialogue opens before it steps. */
++static void pad_left(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("DualSense Wireless Controller");
++    padpump(&s, &d, 10);
++    fake_open(4);
++    s_n = 0;
++    lstick(&s, &d, id, 0, -32767);
++    check(sent_at(WM_KEYDOWN, 0x57) >= 0, "in play the left stick walks", "%s", dump());
++
++    /* Both sticks held as the dialogue opens: the walk key is lifted and
++       neither steps. */
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTY, 32767);
++    s_n = 0;
++    dialogue_on(&s, 1);
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(sent_at(WM_KEYUP, 0x57) >= 0 && !walked() && marked() == -1,
++          "a dialogue opening under both sticks lifts the walk key and steps nothing", "%s slot %d", dump(), marked());
++
++    /* The left stick centres and steps; the right, held since the open,
++       still does not. */
++    s_n = 0;
++    lstick(&s, &d, id, 0, 0);
++    lstick(&s, &d, id, 0, 32767);
++    lstick(&s, &d, id, 0, 0);
++    check(marked() == 0 && s_n == 0, "the left stick, once centred, marks the first answer while the right, held since the open, does not",
++          "slot %d %s", marked(), dump());
++    lstick(&s, &d, id, 0, 32767);
++    lstick(&s, &d, id, 0, 0);
++    check(marked() == 1, "left down steps to the second answer", "slot %d", marked());
++    lstick(&s, &d, id, 0, -32767);
++    lstick(&s, &d, id, 0, 0);
++    check(marked() == 0, "left up steps back", "slot %d", marked());
++    lstick(&s, &d, id, 32767, 0);
++    lstick(&s, &d, id, -32767, 0);
++    lstick(&s, &d, id, 0, 0);
++    check(marked() == 0 && s_n == 0, "left and right on the left stick do nothing", "slot %d %s", marked(), dump());
++    rstick(&s, &d, id, 0, 0);
++    rstick(&s, &d, id, 0, 32767);
++    rstick(&s, &d, id, 0, 0);
++    check(marked() == 1 && s_n == 0, "the right stick steps too once it has centred", "slot %d %s", marked(), dump());
++
++    /* Repeat on the left stick: once on the push, again at 0.4 s, then
++       every 0.15 s, and never a walk key. */
++    lstick(&s, &d, id, 0, -32767);
++    lstick(&s, &d, id, 0, 0);
++    s_n = 0;
++    int32_t hx = s.x, hy = s.y;
++    lstick(&s, &d, id, 0, 32767);
++    check(marked() == 1, "a held left stick steps once on the push", "slot %d", marked());
++    for (int i = 0; i < 39; i++) padpump(&s, &d, 10);
++    check(marked() == 1, "and not again before 0.4 s", "slot %d", marked());
++    padpump(&s, &d, 10);
++    check(marked() == 2, "it repeats at 0.4 s", "slot %d", marked());
++    for (int i = 0; i < 14; i++) padpump(&s, &d, 10);
++    check(marked() == 2, "and not again before another 0.15 s", "slot %d", marked());
++    padpump(&s, &d, 10);
++    check(marked() == 3, "then every 0.15 s", "slot %d", marked());
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    check(marked() == 3 && fake_clean_except(3), "held, it stops at the last answer", "slot %d", marked());
++    check(!walked() && s.x == hx && s.y == hy, "a left stick held in a dialogue never walks or moves the pointer", "%s at %d,%d", dump(),
++          s.x, s.y);
++    lstick(&s, &d, id, 0, 0);
++
++    /* A flick held on one stick stays with it: the other stick pushed
++       further does not take it over, nor step until the first lets go. */
++    lstick(&s, &d, id, 0, -20000);
++    check(marked() == 2, "a left flick up steps", "slot %d", marked());
++    rstick(&s, &d, id, 0, 32767);
++    check(marked() == 2, "the right stick pushed further while the left holds does not step", "slot %d", marked());
++    lstick(&s, &d, id, 0, 0);
++    check(marked() == 3, "the left letting go hands the step to the right, which is still out", "slot %d", marked());
++    rstick(&s, &d, id, 0, 0);
++
++    /* The reverse open: the left held from before, the right centred.
++       The right steps at once, the left only after centring. */
++    dialogue_on(&s, 0);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    lstick(&s, &d, id, 0, 32767);
++    check(sent_at(WM_KEYDOWN, 0x53) >= 0, "back in play the left stick walks again", "%s", dump());
++    fake_open(4);
++    s_n = 0;
++    dialogue_on(&s, 1);
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(marked() == -1 && sent_at(WM_KEYUP, 0x53) >= 0 && !walked(), "a left stick held from play into a dialogue does not step",
++          "slot %d %s", marked(), dump());
++    rstick(&s, &d, id, 0, 32767);
++    rstick(&s, &d, id, 0, 0);
++    check(marked() == 0, "a centred right stick steps at once", "slot %d", marked());
++    lstick(&s, &d, id, 0, 0);
++    lstick(&s, &d, id, 0, 32767);
++    lstick(&s, &d, id, 0, 0);
++    check(marked() == 1, "the left steps once it has been back to the centre", "slot %d", marked());
++
++    dialogue_on(&s, 0);
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
++/* A lone answer is marked as soon as it shows, so Cross confirms it with
++   no step first. */
++static void pad_lone(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("DualSense Wireless Controller");
++    padpump(&s, &d, 10);
++    fake_open(1);
++    s_n = 0;
++    dialogue_on(&s, 1);
++    padpump(&s, &d, 10);
++    check(marked() == 0 && s.sel.lit && s.sel.autos == 1 && s_n == 0 && fake_clean_except(0), "a lone answer is marked as it appears",
++          "slot %d lit %d %s", marked(), s.sel.lit, dump());
++
++    for (int32_t c = 2; c <= 4; c++) {
++        char name[80];
++        fake32(DIALOGUE_COUNT_OFF, (uint32_t)c);
++        for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++        snprintf(name, sizeof name, "%d answers are not marked until a move", c);
++        check(marked() == -1 && !s.sel.lit && fake_clean_except(-1), name, "slot %d", marked());
++    }
++    fake32(DIALOGUE_COUNT_OFF, 1);
++    padpump(&s, &d, 10);
++    check(marked() == 0 && s.sel.lit, "the count coming back to one marks it again", "slot %d", marked());
++
++    /* Cross confirms the marked lone answer as its number key. */
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(sent_at(WM_KEYDOWN, 0x31) >= 0 && sent_at(WM_KEYUP, 0x31) >= 0 && sent_at(WM_KEYDOWN, 0x20) < 0 && fake_clean_except(-1),
++          "Cross confirms the lone answer as 1, with its text restored", "%s", dump());
++    for (int i = 0; i < 10; i++) padpump(&s, &d, 10);
++    check(marked() == -1 && !s.sel.lit, "the answer just picked is not marked again while it is still shown", "slot %d", marked());
++
++    /* The game moves on to a node with the same single line: its pick
++       time moves, and the line is marked; Cross that soon waits out the
++       guard and keeps the mark. */
++    fake32(DIALOGUE_PICK_OFF, 0x3F800000u);
++    padpump(&s, &d, 10);
++    check(marked() == 0 && s.sel.lit, "the next lone answer, the same line, is marked once the game's pick time moves", "slot %d", marked());
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(s_n == 0 && marked() == 0 && s.sel.held == 1, "Cross on a lone answer right after a pick is held by the guard", "%s slot %d", dump(),
++          marked());
++    for (int i = 0; i < 50; i++) padpump(&s, &d, 10);
++    s_n = 0;
++    tap(&s, &d, id, PM_R2);
++    check(sent_at(WM_KEYDOWN, 0x31) >= 0 && marked() == -1, "past the guard RT confirms it", "%s", dump());
++
++    /* A pick among two answers that leads to a one-answer node. */
++    fake32(DIALOGUE_COUNT_OFF, 2);
++    fake32(DIALOGUE_PICK_OFF, 0x40000000u);
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    check(marked() == -1, "a two-answer node starts unmarked", "slot %d", marked());
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(sent_at(WM_KEYDOWN, 0x32) >= 0, "Cross picks the second of two", "%s", dump());
++    fake32(DIALOGUE_COUNT_OFF, 1);
++    fake_text(0, "I will be going.");
++    padpump(&s, &d, 10);
++    check(marked() == 0 && s.sel.lit, "a pick that leads to a one-answer node marks it", "slot %d", marked());
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(s_n == 0 && marked() == 0, "and Cross waits out the guard", "%s slot %d", dump(), marked());
++    for (int i = 0; i < 50; i++) padpump(&s, &d, 10);
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(sent_at(WM_KEYDOWN, 0x31) >= 0 && marked() == -1, "then confirms it", "%s", dump());
++
++    /* Circle clears the auto mark, and the same set is not marked again;
++       a new set is. */
++    fake32(DIALOGUE_PICK_OFF, 0x40400000u);
++    fake_text(0, "Fine.");
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    check(marked() == 0, "a new lone answer is marked", "slot %d", marked());
++    s_n = 0;
++    tap(&s, &d, id, PM_CIRCLE);
++    for (int i = 0; i < 20; i++) padpump(&s, &d, 10);
++    check(marked() == -1 && !s.sel.lit && fake_clean_except(-1) && s_n == 0, "Circle clears the auto mark and it is not put back",
++          "slot %d %s", marked(), dump());
++    fake8(DIALOGUE_HISTORY_OFF, 1);
++    padpump(&s, &d, 10);
++    fake8(DIALOGUE_HISTORY_OFF, 0);
++    padpump(&s, &d, 10);
++    check(marked() == -1, "nor after the history opens and closes over the same set", "slot %d", marked());
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(sent_at(WM_KEYDOWN, 0x20) >= 0 && sent_at(WM_KEYDOWN, 0x31) < 0, "Cross after Circle is space, the game's continue", "%s", dump());
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == 0, "a step still marks the cleared answer by hand", "slot %d", marked());
++    tap(&s, &d, id, PM_CIRCLE);
++    fake_text(0, "Later.");
++    padpump(&s, &d, 10);
++    check(marked() == 0 && s.sel.lit, "once the answer changes the new one is marked", "slot %d", marked());
++
++    /* Not under a menu, and not without a pad driving. */
++    tap(&s, &d, id, PM_CIRCLE);
++    s.cursor = 0x00007F00u;
++    rt_input_relative_update(&s);
++    fake_text(0, "Under a menu.");
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(marked() == -1, "a lone answer under a menu is not marked", "slot %d", marked());
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    padpump(&s, &d, 10);
++    check(marked() == 0, "and is marked when the menu closes", "slot %d", marked());
++    tap(&s, &d, id, PM_CIRCLE);
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++    fake_text(0, "No pad.");
++    for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
++    check(marked() == -1, "without a pad a lone answer is left as the game drew it", "slot %d", marked());
++
++    /* The dialogue closing forgets the cleared set: a new dialogue with
++       the same line is marked. */
++    id = rt_pad_test_attach("DualSense Wireless Controller");
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 10);
++    check(marked() == 0, "a pad coming back marks it", "slot %d", marked());
++    tap(&s, &d, id, PM_CIRCLE);
++    dialogue_on(&s, 0);
++    padpump(&s, &d, 10);
++    dialogue_on(&s, 1);
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 10);
++    check(marked() == 0, "a dialogue opening again marks a lone answer Circle cleared in the last one", "slot %d", marked());
++
++    dialogue_on(&s, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
+ static void pad_curve(void)
+ {
+     rt_pad p;
+@@ -1714,6 +1985,8 @@ int rt_input_selftest(void)
+     rt_arena_use(rt_arena_new());
+     pad_dialogue();
+     pad_answers();
++    pad_left();
++    pad_lone();
+     pad_controls();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 72fe72c..84c1f30 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -51,8 +51,8 @@ static const struct {
+     {RT_PAD_MENU, RT_PAD_RT, "mouse1"},
+     /* The dialogue HUD (client CHudDialog::Key_Event) answers only to the
+        number keys, picking on release, and has no highlight of its own,
+-       so input.c keeps one: the stick's up and down flicks and the d-pad
+-       step it through the answers the game shows, and the answer is sent
++       so input.c keeps one: either stick's up and down flicks and the
++       d-pad step it through the answers the game shows, and the answer is sent
+        as its number key on confirm. No answer sits on a fixed direction,
+        so a later lift of the game's four answer cut-off changes no
+        control. The answers are listed top to bottom in slot order, so up
+@@ -432,23 +432,57 @@ static int dir_key(rt_pad *p, int d, int on, rt_pad_pt pt, SDL_Event *out, int c
+     return emit(&(rt_pad_tgt){RT_PADT_KEY, k_dir_key[d]}, on, pt, out, cap);
+ }
+ 
+-/* Which flick the right stick holds, as a button index or -1. The axis
+-   that is further out wins, a held flick lets go only when its own axis
+-   comes back under the release mark, and after entering a dialogue
+-   nothing fires until the stick has been back to the centre: a player
+-   looking around as the dialogue opens must not move the highlight. */
++static void stick_of(const rt_pad *p, int stick, int *x, int *y)
++{
++    *x = stick ? p->lx : p->rx;
++    *y = stick ? p->ly : p->ry;
++}
++
++/* One stick's flick, or -1: the axis that is further out wins, past
++   half tilt. *out is how far out that axis is, so two sticks can be
++   compared. */
++static int stick_flick(const rt_pad *p, int stick, int *out)
++{
++    int x, y;
++    stick_of(p, stick, &x, &y);
++    int ax = abs(x), ay = abs(y);
++    *out = ax > ay ? ax : ay;
++    if (ay >= ax && ay > RT_PAD_FLICK_ON) return y < 0 ? RT_PAD_FLICK_UP : RT_PAD_FLICK_DOWN;
++    if (ax > ay && ax > RT_PAD_FLICK_ON) return x < 0 ? RT_PAD_FLICK_LEFT : RT_PAD_FLICK_RIGHT;
++    return -1;
++}
++
++/* Which flick the sticks hold, as a button index or -1, with the stick
++   that holds it in p->flick_stick. The left stick is the one a player
++   reaches for, since it is what walks; the right one steps too because
++   it looks at nothing in a dialogue. A held flick lets go only when its
++   own stick's axis comes back under the release mark, so the other
++   stick cannot take it over mid push. After entering a dialogue neither
++   stick fires until it has been back to the centre: a player walking or
++   looking as the dialogue opens must not move the highlight. */
+ static int flick_of(rt_pad *p)
+ {
+-    int ax = abs(p->rx), ay = abs(p->ry);
+-    if (ax <= RT_PAD_FLICK_OFF && ay <= RT_PAD_FLICK_OFF) p->flick_armed = 1;
++    for (int st = 0; st < 2; st++) {
++        int x, y;
++        stick_of(p, st, &x, &y);
++        if (abs(x) <= RT_PAD_FLICK_OFF && abs(y) <= RT_PAD_FLICK_OFF) p->flick_armed[st] = 1;
++    }
+     if (p->flick >= 0) {
+-        int v = p->flick == RT_PAD_FLICK_UP ? -p->ry : p->flick == RT_PAD_FLICK_DOWN ? p->ry : p->flick == RT_PAD_FLICK_LEFT ? -p->rx : p->rx;
++        int x, y;
++        stick_of(p, p->flick_stick, &x, &y);
++        int v = p->flick == RT_PAD_FLICK_UP ? -y : p->flick == RT_PAD_FLICK_DOWN ? y : p->flick == RT_PAD_FLICK_LEFT ? -x : x;
+         if (v > RT_PAD_FLICK_OFF) return p->flick;
+     }
+-    if (!p->flick_armed) return -1;
+-    if (ay >= ax && ay > RT_PAD_FLICK_ON) return p->ry < 0 ? RT_PAD_FLICK_UP : RT_PAD_FLICK_DOWN;
+-    if (ax > ay && ax > RT_PAD_FLICK_ON) return p->rx < 0 ? RT_PAD_FLICK_LEFT : RT_PAD_FLICK_RIGHT;
+-    return -1;
++    /* Left first, so a tie goes to the primary stick. */
++    int best = -1, far = 0;
++    for (int st = 1; st >= 0; st--) {
++        int out, f = p->flick_armed[st] ? stick_flick(p, st, &out) : -1;
++        if (f < 0 || (best >= 0 && out <= far)) continue;
++        best = f;
++        far = out;
++        p->flick_stick = st;
++    }
++    return best;
+ }
+ 
+ /* A flick is a press for as long as the stick is out, so a held flick
+@@ -462,14 +496,17 @@ int rt_pad_flick(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
+     if (p->flick >= 0) n += rt_pad_button(p, p->flick, 0, pt, out, cap);
+     p->flick = f;
+     if (f >= 0) {
+-        p->flick_armed = 0;
++        p->flick_armed[p->flick_stick] = 0;
+         n += rt_pad_button(p, f, 1, pt, out + n, cap - n);
+     }
+     return n;
+ }
+ 
+ /* In menus the left stick is a second, finer cursor, so it holds no
+-   movement keys there; nor in a dialogue, where the player stands. */
++   movement keys there; nor in a dialogue, where the player stands and
++   the stick steps the answers through rt_pad_flick instead. The same
++   mode test gates both, so a push in a dialogue is never a step and a
++   walk at once. */
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     int n = 0, walk = p->mode == RT_PAD_PLAY;
+@@ -495,8 +532,9 @@ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, in
+ 
+ /* Leaving play lifts any held movement key, leaving a dialogue lets go
+    of a held flick, and either way the carried fraction is
+-   dropped: it was in the other mode's units. A dialogue starts unarmed,
+-   so the stick that was looking has to centre before it can pick. */
++   dropped: it was in the other mode's units. A dialogue starts with
++   both sticks unarmed, so the one that was walking or looking has to
++   centre before it can step. */
+ int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     if (mode < RT_PAD_PLAY || mode >= RT_PAD_NMODES) mode = RT_PAD_PLAY;
+@@ -504,7 +542,8 @@ int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap)
+     int n = 0;
+     if (p->flick >= 0) n += rt_pad_button(p, p->flick, 0, pt, out, cap);
+     p->flick = -1;
+-    p->flick_armed = 0;
++    p->flick_stick = 0;
++    p->flick_armed[0] = p->flick_armed[1] = 0;
+     p->mode = mode;
+     p->fx = p->fy = 0;
+     rt_log("pad mode %s", k_mode_names[mode]);
+@@ -521,7 +560,8 @@ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
+     p->rx = p->ry = p->lx = p->ly = 0;
+     p->fx = p->fy = 0;
+     p->flick = -1;
+-    p->flick_armed = 0;
++    p->flick_stick = 0;
++    p->flick_armed[0] = p->flick_armed[1] = 0;
+     return n;
+ }
+ 
+@@ -562,8 +602,8 @@ void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *v
+     *vy = uy * s;
+ }
+ 
+-/* A dialogue neither looks nor moves a cursor: the right stick steps
+-   the highlight, and the HUD has no pointer to move. */
++/* A dialogue neither looks nor moves a cursor: both sticks step the
++   highlight, and the HUD has no pointer to move. */
+ void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy)
+ {
+     if (p->mode == RT_PAD_PLAY) {
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 8248593..132c71f 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -17,8 +17,10 @@ enum { RT_PAD_ACT_UP = 1, RT_PAD_ACT_DOWN, RT_PAD_ACT_CONFIRM, RT_PAD_ACT_CLEAR
+ 
+ /* The triggers keep 14 and 15 so controls.txt and the m9 rows read as
+    before; the touchpad and Xbox share button come after them. The four
+-   flicks are the right stick pushed one way in a dialogue: buttons with
+-   no SDL source, so they map, release, repeat and log like any other. */
++   flicks are a stick pushed one way in a dialogue, either stick: buttons
++   with no SDL source, so they map, release, repeat and log like any
++   other. Both sticks share them, so one controls.txt line moves both and
++   live() still fits a pad's buttons and axes in 32 bits. */
+ enum { RT_PAD_LT = 14, RT_PAD_RT = 15, RT_PAD_TOUCHPAD = 16, RT_PAD_MISC1 = 17, RT_PAD_FLICK_UP = 18, RT_PAD_FLICK_RIGHT = 19,
+        RT_PAD_FLICK_DOWN = 20, RT_PAD_FLICK_LEFT = 21, RT_PAD_NBTN = 22 };
+ 
+@@ -75,7 +77,10 @@ typedef struct {
+     double cursor_power, cursor_left;
+     int mode;
+     uint32_t logged[RT_PAD_NMODES];
+-    int flick, flick_armed;
++    /* The flick held, the stick holding it (0 right, 1 left), and per
++       stick whether it has been back to the centre since the dialogue
++       opened. */
++    int flick, flick_stick, flick_armed[2];
+     /* Set by input.c before each poll: an answer is highlighted, so the
+        answer actions act rather than fall back. */
+     int lit;
+-- 
+2.54.0 (Apple Git-157)
+

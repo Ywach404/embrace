@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:45:45 -0600
+Subject: [PATCH 08/10] up: make the self test's scratch folders without
+ system() on visionOS
+
+visionOS marks system() unavailable, so up.c did not compile there. The
+four calls belong to the self test: two mkdir -p, a chmod -R u+w and a
+final chmod and rm -rf of the scratch folder. Under TARGET_OS_VISION they
+become mkdir and nftw walks that do the same thing in process. The Mac
+keeps its shell commands.
+---
+ runtime/up.c | 66 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/up.c b/runtime/up.c
+index 1884406..f600ac8 100644
+--- a/runtime/up.c
++++ b/runtime/up.c
+@@ -1,7 +1,12 @@
+ #include "recomp_types.h"
+ #include "rt.h"
+ 
++#include <TargetConditionals.h>
+ #include <ctype.h>
++#if TARGET_OS_VISION
++#include <errno.h>
++#include <ftw.h>
++#endif
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -481,6 +486,48 @@ static void parse_cases(void)
+           "another quoted option with a space is fine", "got %s", m);
+ }
+ 
++#if TARGET_OS_VISION
++/* visionOS has no system(), so the self test's scratch folders are made,
++   opened up and removed here with mkdir and nftw instead of mkdir -p,
++   chmod -R u+w and rm -rf. */
++static int up_mkdir_p(const char *p)
++{
++    char b[PATH_MAX];
++    snprintf(b, sizeof b, "%s", p);
++    for (char *c = b + 1; *c; c++)
++        if (*c == '/') {
++            *c = 0;
++            if (mkdir(b, 0755) && errno != EEXIST) return -1;
++            *c = '/';
++        }
++    return mkdir(b, 0755) && errno != EEXIST ? -1 : 0;
++}
++
++/* Pre-order, so a folder is writable before its contents are visited. */
++static int up_writable_cb(const char *p, const struct stat *s, int flag, struct FTW *w)
++{
++    (void)w;
++    if (flag == FTW_SL || flag == FTW_SLN) return 0;
++    return chmod(p, (s->st_mode | S_IWUSR) & 07777) ? -1 : 0;
++}
++
++static int up_writable(const char *dir) { return nftw(dir, up_writable_cb, 16, FTW_PHYS); }
++
++static int up_remove_cb(const char *p, const struct stat *s, int flag, struct FTW *w)
++{
++    (void)s;
++    (void)flag;
++    (void)w;
++    return remove(p);
++}
++
++static int up_remove_tree(const char *dir)
++{
++    if (up_writable(dir)) return -1;
++    return nftw(dir, up_remove_cb, 16, FTW_DEPTH | FTW_PHYS);
++}
++#endif
++
+ static int write_file(const char *path, const char *mode, const char *text)
+ {
+     FILE *f = fopen(path, mode);
+@@ -669,9 +716,13 @@ static void vfs_cases(const char *dir)
+     snprintf(gu, sizeof gu, "%s/gu", dir);
+     snprintf(ov, sizeof ov, "%s/ov", dir);
+     snprintf(file, sizeof file, "%s/Unofficial_Patch/scripts", gu);
++#if TARGET_OS_VISION
++    if (up_mkdir_p(file) || up_mkdir_p(ov)) {
++#else
+     char cmd[PATH_MAX * 2];
+     snprintf(cmd, sizeof cmd, "mkdir -p '%s' '%s'", file, ov);
+     if (system(cmd)) {
++#endif
+         check(0, "scratch folders", "mkdir failed");
+         return;
+     }
+@@ -711,8 +762,12 @@ static void vfs_cases(const char *dir)
+     ch->fn(ca);
+     n = slurp(file, data, sizeof data);
+     check(n == 22 && !memcmp(data, "ORIGINAL-CONTENT-OF-GU", 22), "the GU file is still unchanged", "");
++#if TARGET_OS_VISION
++    if (up_writable(gu)) printf("note: chmod of the scratch GU failed\n");
++#else
+     snprintf(cmd, sizeof cmd, "chmod -R u+w '%s'", gu);
+     if (system(cmd)) printf("note: chmod of the scratch GU failed\n");
++#endif
+     rt_up_set_mod("Unofficial_Patch");
+     create_dirs();
+     struct stat st;
+@@ -736,10 +791,15 @@ static void init_cases(const char *dir)
+         {"FileSystem_Stdio", "KERNEL32.dll", "FindFirstFileA", &k_find_shim, &s_find_orig},
+     };
+     enum { N = sizeof k / sizeof k[0] };
+-    char ini[PATH_MAX], cmd[PATH_MAX * 2];
++    char ini[PATH_MAX];
+     snprintf(ini, sizeof ini, "%s/gu/Bin/loader", dir);
++#if TARGET_OS_VISION
++    if (up_mkdir_p(ini)) {
++#else
++    char cmd[PATH_MAX * 2];
+     snprintf(cmd, sizeof cmd, "mkdir -p '%s'", ini);
+     if (system(cmd)) {
++#endif
+         check(0, "rt_up_init scratch loader.ini folder", "mkdir failed");
+         return;
+     }
+@@ -823,9 +883,13 @@ int rt_up_selftest(const char *game, const char *overlay)
+         int n = rt_up_switches_read(p);
+         check(n >= 60, "the game root's loader.ini parses", "%d keys from %s", n, p);
+     }
++#if TARGET_OS_VISION
++    if (up_remove_tree(dir)) printf("note: scratch folder %s was not removed\n", dir);
++#else
+     char cmd[PATH_MAX + 32];
+     snprintf(cmd, sizeof cmd, "chmod -R u+w '%s'; rm -rf '%s'", dir, dir);
+     if (system(cmd)) printf("note: scratch folder %s was not removed\n", dir);
++#endif
+     rt_up_set_mod(saved_mod);
+     printf("up selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     fflush(stdout);

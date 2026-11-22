@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 23:38:47 -0600
+Subject: [PATCH] runtime: full view, the play frame drawn over the headset's
+ whole field
+
+On visionOS with the backend's full view on, a frame in play is drawn
+with the union of both eyes' views as its field (the backend's
+metal_d3d9_fullview_game_tan), written where the view's FOV becomes its
+frustum so culling follows, and the head pump tells the backend each
+frame whether it is in play, which decides both that field and the
+frame's replay into each eye's own view. Menus, dialogue and the sheet
+keep the game's field. On the Mac RT_FULLVIEW_TAN forces the field on
+every frame, for a capture of what a full view frame draws.
+---
+ runtime/g2b_engine.c | 55 +++++++++++++++++++++++++++++++++++++++++++-
+ runtime/input.c      |  4 ++++
+ 2 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/g2b_engine.c b/runtime/g2b_engine.c
+index 434aea6..08b4f6c 100644
+--- a/runtime/g2b_engine.c
++++ b/runtime/g2b_engine.c
+@@ -2,12 +2,17 @@
+ #include "rt.h"
+ #include "aspect.h"
+ 
++#include <TargetConditionals.h>
+ #include <math.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#if TARGET_OS_VISION
++int metal_d3d9_fullview_game_tan(float *tan_x, float *tan_y);
++#endif
++
+ enum { G_BYTES, G_JMP, G_CELL, G_DATA, G_CALL };
+ 
+ #define CALL_LEN 6
+@@ -102,9 +107,57 @@ static void hor_once(uint32_t va)
+     MEM32(va) = e->out;
+ }
+ 
++/* Full view: a play frame is drawn over the headset's whole field, the
++   union of both eyes' views (the backend's metal_d3d9_fullview_game_tan),
++   instead of the game's own FOV made wider for the shape. Written where
++   the view's FOV becomes its frustum, so culling follows. 0 when this
++   frame is not a full view one: menus, dialogue and the sheet keep the
++   game's field and go on the plane. The view model's FOV is left alone.
++   On the Mac RT_FULLVIEW_TAN (tan_x[,tan_y]) forces it on every frame,
++   for a capture of what a full view frame draws. */
++static double full_view_deg(void)
++{
++    double deg = 0;
++#if TARGET_OS_VISION
++    float tx, ty;
++    if (metal_d3d9_fullview_game_tan(&tx, &ty) && tx > 0.0f) deg = 2.0 * atan(tx) * 180.0 / M_PI;
++#else
++    static int read;
++    static double forced;
++    if (!read) {
++        read = 1;
++        const char *v = getenv("RT_FULLVIEW_TAN");
++        double tx = v && *v ? atof(v) : 0;
++        if (tx > 0.05 && tx < 20) forced = 2.0 * atan(tx) * 180.0 / M_PI;
++    }
++    deg = forced;
++#endif
++    static int logged;
++    if (deg > 0 && !logged) {
++        logged = 1;
++        rt_log("full view: play frames drawn %.1f degrees across", deg);
++    }
++    return deg;
++}
++
++/* hor_once, with the result forced to `deg` when it is positive. The cache
++   keeps the game's own value as the input either way, so turning full
++   view off gives the game's field back. */
++static void hor_once_to(uint32_t va, double deg)
++{
++    __typeof__(s_fov[0]) *e = &s_fov[(va >> 2) % 64];
++    uint32_t cur = MEM32(va);
++    if (e->va != va || e->out != cur) e->in = cur;
++    e->va = va;
++    float in;
++    memcpy(&in, &e->in, 4);
++    e->out = fbits(deg > 0 ? (float)deg : hor(in));
++    MEM32(va) = e->out;
++}
++
+ static uint32_t view_fov(const uint32_t *a)
+ {
+-    hor_once(a[0] + 0x38);
++    hor_once_to(a[0] + 0x38, full_view_deg());
+     hor_once(a[0] + 0x3c);
+     return 0;
+ }
+diff --git a/runtime/input.c b/runtime/input.c
+index 9a1ae71..2d2d1b4 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1290,6 +1290,7 @@ int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va)
+ 
+ #if TARGET_OS_VISION
+ void metal_d3d9_immersive_view_pose(int valid, float yaw_deg, float pitch_deg);
++void metal_d3d9_immersive_view_play(int play);
+ 
+ /* The host's latest head pose: the two angles' float bits in one word so
+    a pump never pairs one pose's yaw with another's pitch, and whether
+@@ -1353,6 +1354,9 @@ static void head_pump(void)
+     uint32_t was_rc = s_head.recentres, was_abs = s_head.absorbed;
+     rt_input_head_apply(&s_head, &in, rt_hook_va("engine", VIEW_ANGLES_RVA));
+     metal_d3d9_immersive_view_pose(s_head.pose_valid, s_head.pose_yaw, s_head.pose_pitch);
++    /* Whether the next frame is play, for full view: its field of view
++       (g2b_engine.c) and its replay into the eyes' views both follow it. */
++    metal_d3d9_immersive_view_play(in.play);
+     if (s_head.on != was_on) rt_log("head look %s", s_head.on ? "on: the head drives the view" : "off: the game's camera");
+     else if (s_head.on && s_head.playing != was_playing)
+         rt_log("head look %s", s_head.playing ? "resumed" : "paused (menu, dialogue or sheet)");

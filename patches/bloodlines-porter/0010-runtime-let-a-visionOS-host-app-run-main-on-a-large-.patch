@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:47:24 -0600
+Subject: [PATCH 10/10] runtime: let a visionOS host app run main on a
+ large-stack thread
+
+On visionOS the app owns the process main and UIKit owns its thread, so
+the runtime's main is renamed there and rt_host_start (runtime/host.h)
+copies argv and runs it on a detached thread with a 256 MiB stack, the
+size -stack_size gives the Mac executable. host.h is separate from rt.h
+so the lifted files, which all include rt.h, are not rebuilt for it.
+
+The host also passes a desktop size. rt_window_init reads SDL's desktop
+mode, which on the headset is a placeholder, so run pins the desktop and
+its usable area to the host's size right after it; the window is then
+fitted at 4:3 inside it as on the Mac.
+
+SDL on UIKit refuses SDL_Init until SDL_SetMainReady has been called,
+which SDL_main does for an SDL app. rt_window_init calls it on the
+runtime's thread under TARGET_OS_VISION, which also makes that thread
+SDL's main thread, so the bridge's main thread pinning holds.
+
+Paths need nothing more: the host passes --game and --overlay, and the
+remaining HOME and _NSGetExecutablePath uses are defaults it overrides
+or self tests a host does not run. The Mac build is unchanged.
+---
+ runtime/host.h   | 22 +++++++++++++++
+ runtime/main.c   | 72 ++++++++++++++++++++++++++++++++++++++++++++++++
+ runtime/window.c | 12 ++++++++
+ 3 files changed, 106 insertions(+)
+ create mode 100644 runtime/host.h
+
+diff --git a/runtime/host.h b/runtime/host.h
+new file mode 100644
+index 0000000..b77051b
+--- /dev/null
++++ b/runtime/host.h
+@@ -0,0 +1,22 @@
++#ifndef RT_HOST_H
++#define RT_HOST_H
++
++/*
++ * The entry a host app calls on visionOS, where the app owns the process
++ * main and the runtime cannot. It is kept out of rt.h because every lifted
++ * file includes rt.h, and a host needs nothing else from it.
++ *
++ * rt_host_start copies argv and runs what main would run with it on a new
++ * thread with a 256 MiB stack, the size the Mac executable gets from
++ * -stack_size; the guest's own stack and the lifted code's deep frames
++ * live there. desk_w and desk_h, when both are positive, pin the desktop
++ * and its usable area, which the runtime fits its 4:3 window into, since
++ * the headset has no desktop of its own to measure. done, if not NULL, is
++ * called on that thread with main's result when a run is refused or ends
++ * by returning; a game that quits ends the process from inside the
++ * runtime, as it does on the Mac. Returns 0, or an errno value if the
++ * thread could not be made.
++ */
++int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status));
++
++#endif
+diff --git a/runtime/main.c b/runtime/main.c
+index 9165271..74707d4 100644
+--- a/runtime/main.c
++++ b/runtime/main.c
+@@ -2,6 +2,7 @@
+ #include "rt.h"
+ #include "toggles.h"
+ 
++#include <TargetConditionals.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <ftw.h>
+@@ -15,6 +16,14 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++#if TARGET_OS_VISION
++#include "host.h"
++
++#include <pthread.h>
++
++static int s_host_desk_w, s_host_desk_h;
++#endif
++
+ static int list_imports(void)
+ {
+     for (uint32_t i = 0; i < rt_nimports; i++)
+@@ -326,6 +335,15 @@ static int run(int argc, char **argv)
+         return refuse(why);
+     }
+     if (wi) return refuse("SDL_Init failed");
++#if TARGET_OS_VISION
++    /* rt_window_init has just read SDL's desktop mode, which on the headset
++       is a fixed placeholder, so the host's size replaces it here. */
++    if (s_host_desk_w > 0 && s_host_desk_h > 0) {
++        rt_desktop_usable_set(s_host_desk_w, s_host_desk_h, s_host_desk_w, s_host_desk_h, 0);
++        rt_log("desktop pinned by the host to %dx%d, usable %dx%d, no title bar", s_host_desk_w, s_host_desk_h,
++               s_host_desk_w, s_host_desk_h);
++    }
++#endif
+     char args[4096] = "";
+     size_t o = 0;
+     const char *marker = NULL;
+@@ -391,7 +409,11 @@ static int run(int argc, char **argv)
+     rt_exit((int)r);
+ }
+ 
++#if TARGET_OS_VISION
++static int rt_main(int argc, char **argv)
++#else
+ int main(int argc, char **argv)
++#endif
+ {
+     raise_fd_limit();
+     if (argc >= 2 && !strcmp(argv[1], "--run")) return run(argc, argv);
+@@ -432,3 +454,53 @@ int main(int argc, char **argv)
+     }
+     return check(0, NULL);
+ }
++
++#if TARGET_OS_VISION
++/* The Mac executable is linked with -stack_size 0x10000000 for its main
++   thread; a visionOS app's main thread belongs to UIKit and cannot be
++   grown, so the runtime gets a thread of the same size instead. */
++#define RT_HOST_STACK 0x10000000u
++
++typedef struct {
++    int argc;
++    char **argv;
++    void (*done)(int);
++} host_run;
++
++static void *host_thread(void *p)
++{
++    host_run *h = p;
++    int r = rt_main(h->argc, h->argv);
++    if (h->done) h->done(r);
++    else exit(r);
++    return NULL;
++}
++
++int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status))
++{
++    if (argc < 1 || !argv) return EINVAL;
++    host_run *h = calloc(1, sizeof *h);
++    char **v = h ? calloc((size_t)argc + 1, sizeof *v) : NULL;
++    if (!v) {
++        free(h);
++        return ENOMEM;
++    }
++    /* The caller's strings need not outlive this call; the runtime keeps
++       pointers into argv for the whole run. */
++    for (int i = 0; i < argc; i++)
++        if (!(v[i] = strdup(argv[i] ? argv[i] : ""))) return ENOMEM;
++    h->argc = argc;
++    h->argv = v;
++    h->done = done;
++    s_host_desk_w = desk_w;
++    s_host_desk_h = desk_h;
++    pthread_attr_t a;
++    pthread_attr_init(&a);
++    pthread_attr_setstacksize(&a, RT_HOST_STACK);
++    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
++    pthread_t t;
++    int e = pthread_create(&t, &a, host_thread, h);
++    pthread_attr_destroy(&a);
++    return e;
++}
++#endif
+diff --git a/runtime/window.c b/runtime/window.c
+index 209f219..4bce839 100644
+--- a/runtime/window.c
++++ b/runtime/window.c
+@@ -5,6 +5,11 @@
+ #include "winstate.h"
+ 
+ #include <SDL3/SDL.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_VISION
++#define SDL_MAIN_HANDLED
++#include <SDL3/SDL_main.h>
++#endif
+ #include <dlfcn.h>
+ #include <math.h>
+ #include <stdlib.h>
+@@ -54,6 +59,13 @@ int rt_window_init(void)
+ {
+     SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "1");
+     SDL_SetHint(SDL_HINT_VIDEO_METAL_AUTO_RESIZE_DRAWABLE, "0");
++#if TARGET_OS_VISION
++    /* SDL on UIKit refuses SDL_Init until its main has been declared ready,
++       which SDL_main would do. The host app owns UIApplicationMain and runs
++       the runtime on its own thread, so that thread declares itself SDL's
++       main thread here, before the video subsystem records it. */
++    SDL_SetMainReady();
++#endif
+     if (!SDL_Init(SDL_INIT_VIDEO)) {
+         rt_log("SDL_Init(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
+         return -1;

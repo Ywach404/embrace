@@ -1,0 +1,469 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 17:37:53 -0600
+Subject: [PATCH 13/13] runtime: let a visionOS host app own input in an
+ immersive space
+
+In an immersive space the game is drawn by the host app into a
+CompositorServices scene, so no SDL window has focus and there is no
+system pointer. The game's window reports focus lost, which released
+every key and button and stopped the gamepad pump, and SDL's GCKeyboard
+events arrive with window 0, which the runtime dropped as another
+window's. The guest's cursor is an SDL system cursor, which such a space
+does not draw either.
+
+So the host claims input (runtime/host.h). While claimed, the main
+window's focus loss is ignored and the first pump after the claim
+regains focus if it was already lost, before that pump's events, so
+nothing queued meanwhile is dropped. Key, mouse and text events sent to
+window 0 are taken as the game's. The claim stands in for SDL's window
+focus, so the guest's relative mode and warps decide as on the Mac, but
+SDL's pointer is neither locked nor warped; a warp or the recentre when
+relative mode ends moves the host's virtual pointer instead, and SDL's
+relative mode is squared with the guest's when the claim ends.
+
+The host feeds the mouse from GCMouse: motion, buttons and wheel become
+SDL events pushed for the main window from the host's own threads. The
+runtime keeps a virtual pointer in window points, clamped to the window,
+for menus, while mouse look reads the deltas as before; the wheel
+carries fractional notches. Those threads never ask SDL for geometry,
+which on visionOS reads the UIView, so the pump leaves a snapshot for
+them while claimed. rt_host_cursor tells the host where the guest's
+cursor is, as fractions of the client area, so the compositor can draw
+it.
+
+The claim is logged as it changes and the run report counts the host's
+mouse events. With no claim the runtime behaves as before, and none of
+this is compiled for the Mac.
+---
+ runtime/host.h     |  36 +++++++
+ runtime/input.c    | 247 ++++++++++++++++++++++++++++++++++++++++++++-
+ runtime/main_hop.h |  12 +++
+ runtime/window.c   |  20 ++++
+ 4 files changed, 312 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 6de2686..b30552f 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -27,4 +27,40 @@
+  */
+ int rt_host_start(int argc, const char *const *argv, int desk_w, int desk_h, void (*done)(int status, const char *why));
+ 
++/*
++ * Immersive mode (visionOS): the game is shown in a CompositorServices
++ * space, where no SDL window has focus and there is no system pointer, so
++ * the host owns input focus and feeds the mouse itself. The keyboard still
++ * comes through SDL's own GCKeyboard handler and the gamepad through SDL's
++ * gamepad API. All five may be called from any thread, before or after the
++ * game's window exists; none of them waits on the runtime or the main
++ * thread.
++ *
++ * rt_host_input_claim(1) says the host holds focus: the game's window
++ * losing focus is ignored, focus lost before the claim is regained at the
++ * next pump, key, mouse and text events sent to no window (window 0) are
++ * the game's, and the runtime neither locks nor warps SDL's pointer, moving
++ * the host's virtual pointer to the warp target instead. A claim of 0
++ * returns to the windowed behaviour.
++ *
++ * rt_host_mouse_motion takes a GCMouse delta in points, dy positive down.
++ * It moves a virtual pointer the runtime keeps inside the window, which
++ * menus read, while mouse look reads the delta; nothing is sent before the
++ * window exists. rt_host_mouse_button takes SDL's button numbers, 1 to 5
++ * (left, middle, right, x1, x2), and clicks at the virtual pointer.
++ * rt_host_mouse_wheel takes notches, positive away from the user, and
++ * carries fractions until they add up to a whole one.
++ *
++ * rt_host_cursor returns 1 when the game shows a cursor and writes where,
++ * as fractions 0 to 1 of the game's image, left to right and top to bottom,
++ * for the host to draw: the game's cursor is an SDL system cursor, which an
++ * immersive space does not have. It returns 0 when the cursor is hidden,
++ * as in mouse look, or the game does not have focus.
++ */
++void rt_host_input_claim(int on);
++void rt_host_mouse_motion(float dx, float dy);
++void rt_host_mouse_button(int button, int down);
++void rt_host_mouse_wheel(float dy);
++int rt_host_cursor(float *u, float *v);
++
+ #endif
+diff --git a/runtime/input.c b/runtime/input.c
+index 46273e6..3a29df4 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -3,6 +3,7 @@
+ 
+ #include <TargetConditionals.h>
+ #if TARGET_OS_VISION
++#include "host.h"
+ #include "main_hop.h"
+ #endif
+ 
+@@ -518,6 +519,89 @@ static SDL_Window *s_win;
+ static int s_scale_set;
+ static SDL_Cursor *s_cursors[SDL_SYSTEM_CURSOR_COUNT];
+ 
++#if TARGET_OS_VISION
++/* The host app's input in an immersive space (runtime/host.h). There is no
++   SDL window with focus there and no system pointer, so the host claims
++   focus and feeds a GCMouse itself, through SDL's queue like any other
++   event. The flags are atomics because the host sets them from its own
++   queues; everything else is under s_mu. */
++#define RT_HOST_MOUSE_ID 0x484F5354u
++
++static int s_host_claim, s_host_ever, s_host_regain, s_host_seed;
++static uint32_t s_host_win;
++/* Only the pump touches this: whether SDL's window was last asked for
++   relative mode, so a claim that skipped the call can be squared after. */
++static int s_sdl_rel;
++/* The geometry the pump last saw, for the host's threads, which must not
++   ask SDL: on visionOS its window sizes read the UIView's bounds. vx, vy
++   is the host's pointer in SDL window points. */
++static struct {
++    int valid;
++    rt_present_rects r;
++    float d, vx, vy;
++    int w, h;
++    double wheel;
++    uint32_t moves, buttons, wheels;
++} H;
++
++static int host_claimed(void) { return __atomic_load_n(&s_host_claim, __ATOMIC_ACQUIRE); }
++
++static void host_snapshot(void)
++{
++    rt_present_rects r;
++    float d;
++    int w = 0, h = 0;
++    rt_input_geometry(&r, &d);
++    SDL_GetWindowSize(s_win, &w, &h);
++    int seed = __atomic_exchange_n(&s_host_seed, 0, __ATOMIC_ACQ_REL);
++    pthread_mutex_lock(&s_mu);
++    H.r = r;
++    H.d = d;
++    H.w = w;
++    H.h = h;
++    H.valid = 1;
++    /* A fresh claim starts the host's pointer where the guest's cursor is,
++       so a menu does not jump under it. */
++    if (seed) {
++        int32_t cx, cy;
++        rt_input_client_point(&S, &cx, &cy);
++        rt_input_unmap(&r, d, cx, cy, &H.vx, &H.vy);
++    }
++    pthread_mutex_unlock(&s_mu);
++}
++#endif
++
++/* While the host holds input there is no pointer to warp, so its virtual
++   pointer goes to the point instead. */
++static void warp_to(float x, float y, int claimed)
++{
++#if TARGET_OS_VISION
++    if (claimed) {
++        pthread_mutex_lock(&s_mu);
++        H.vx = x;
++        H.vy = y;
++        pthread_mutex_unlock(&s_mu);
++        return;
++    }
++#else
++    (void)claimed;
++#endif
++    SDL_WarpMouseInWindow(s_win, x, y);
++}
++
++/* Likewise there is no pointer to lock while the host holds input; the
++   relative state machine runs on and SDL is squared when the claim ends. */
++static void relative_to(int rel, int claimed)
++{
++#if TARGET_OS_VISION
++    if (claimed) return;
++    s_sdl_rel = rel;
++#else
++    (void)claimed;
++#endif
++    if (!SDL_SetWindowRelativeMouseMode(s_win, rel != 0)) rt_log("input relative mode failed: %s", SDL_GetError());
++}
++
+ #define LAT_MAX 256
+ static struct {
+     int armed, state;
+@@ -641,6 +725,11 @@ void rt_input_main_window(uint32_t hwnd, void *sdl)
+     int start = sdl && !s_pad_started;
+     s_pad_started = s_pad_started || start;
+     pthread_mutex_unlock(&s_mu);
++#if TARGET_OS_VISION
++    /* Cached for the host's threads, which push events for this window and
++       must not call into SDL's window list to find its id. */
++    __atomic_store_n(&s_host_win, sdl ? (uint32_t)SDL_GetWindowID(sdl) : 0u, __ATOMIC_RELEASE);
++#endif
+     if (start) {
+         const char *dir = rt_settings_dir();
+         pthread_mutex_lock(&s_mu);
+@@ -680,7 +769,13 @@ void rt_input_event(const SDL_Event *e)
+     case SDL_EVENT_TEXT_INPUT: wid = e->text.windowID; break;
+     default: return;
+     }
++#if TARGET_OS_VISION
++    /* With no SDL window focused, SDL's keyboard sends with window 0; the
++       host's claim says those are the game's. */
++    if (wid != id && !(wid == 0 && host_claimed())) return;
++#else
+     if (wid != id) return;
++#endif
+     rt_present_rects r;
+     float d;
+     rt_input_geometry(&r, &d);
+@@ -743,10 +838,20 @@ void rt_input_pump_end(void)
+     int warp = 0, shape, rel_changed;
+     int32_t wx = 0, wy = 0, ox = 0, oy = 0;
+     int hf = (SDL_GetWindowFlags(s_win) & SDL_WINDOW_INPUT_FOCUS) != 0;
++    int claimed = 0;
++#if TARGET_OS_VISION
++    claimed = host_claimed();
++    if (claimed) host_snapshot();
++#endif
+     pthread_mutex_lock(&s_mu);
+     int n = rt_input_flush_move(&S, m, 1);
+     L.pumps++;
+     S.host_focus = hf;
++#if TARGET_OS_VISION
++    /* No SDL window has focus in an immersive space; the claim stands in
++       for it, so relative mode and warps follow the guest as on the Mac. */
++    if (claimed) S.host_focus = 1;
++#endif
+     if (S.warp_pending) {
+         warp = 1;
+         wx = S.warp_x;
+@@ -768,17 +873,25 @@ void rt_input_pump_end(void)
+             float d, x, y;
+             rt_input_geometry(&r, &d);
+             rt_input_unmap(&r, d, ox, oy, &x, &y);
+-            SDL_WarpMouseInWindow(s_win, x, y);
++            warp_to(x, y, claimed);
+         }
+-        if (!SDL_SetWindowRelativeMouseMode(s_win, rel != 0)) rt_log("input relative mode failed: %s", SDL_GetError());
++        relative_to(rel, claimed);
+         rt_log("input relative %s", rel ? "on" : "off");
+     }
++#if TARGET_OS_VISION
++    /* A claim that ended may have left SDL's relative mode behind the
++       guest's; without a claim this never differs. */
++    if (!claimed && s_sdl_rel != rel) {
++        relative_to(rel, 0);
++        rt_log("input relative %s after host claim", rel ? "on" : "off");
++    }
++#endif
+     if (warp) {
+         rt_present_rects r;
+         float d, x, y;
+         rt_input_geometry(&r, &d);
+         rt_input_unmap(&r, d, wx, wy, &x, &y);
+-        SDL_WarpMouseInWindow(s_win, x, y);
++        warp_to(x, y, claimed);
+     }
+     if (changed) {
+         if (shape == RT_CUR_HIDDEN) {
+@@ -910,9 +1023,137 @@ void rt_input_report(void)
+     uint32_t n = L.n, pumps = L.pumps, presents = L.presents;
+     int armed = L.armed;
+     pthread_mutex_unlock(&s_mu);
++#if TARGET_OS_VISION
++    if (__atomic_load_n(&s_host_ever, __ATOMIC_ACQUIRE)) {
++        pthread_mutex_lock(&s_mu);
++        uint32_t hm = H.moves, hb = H.buttons, hw = H.wheels;
++        pthread_mutex_unlock(&s_mu);
++        rt_log("input host moves %u buttons %u wheels %u claim %s", hm, hb, hw, host_claimed() ? "on" : "off");
++    }
++#endif
+     if (!armed) return;
+     rt_log("input latency n %u read p50 %.1fms/%uf max %.1fms/%uf present p50 %.1fms/%uf max %.1fms/%uf lost-px %lld "
+            "pumps/present %.2f",
+            n, rp, rpf, rm, rmf, pp, ppf, pm, pmf, (long long)(llabs(lx) + llabs(ly)),
+            presents ? (double)pumps / presents : 0.0);
+ }
++
++#if TARGET_OS_VISION
++/* The host's side of immersive input (runtime/host.h). Called from the
++   host's GameController and compositor threads, so these only touch the
++   atomics, s_mu and SDL_PushEvent, which is thread safe; the pump picks
++   the events up on the main thread like SDL's own. */
++
++void rt_host_input_claim(int on)
++{
++    on = on != 0;
++    if (__atomic_exchange_n(&s_host_claim, on, __ATOMIC_ACQ_REL) == on) return;
++    /* A claim made after the window lost focus is recovered by the next
++       pump (rt_input_host_regain); one that ends first has nothing left
++       to recover. */
++    __atomic_store_n(&s_host_regain, on, __ATOMIC_RELEASE);
++    if (on) {
++        __atomic_store_n(&s_host_seed, 1, __ATOMIC_RELEASE);
++        __atomic_store_n(&s_host_ever, 1, __ATOMIC_RELEASE);
++    }
++    rt_log("input host claim %s", on ? "on" : "off");
++}
++
++int rt_input_host_claimed(void) { return host_claimed(); }
++
++int rt_input_host_regain(void)
++{
++    if (!__atomic_exchange_n(&s_host_regain, 0, __ATOMIC_ACQ_REL)) return 0;
++    pthread_mutex_lock(&s_mu);
++    int lost = !S.focus;
++    pthread_mutex_unlock(&s_mu);
++    return lost && host_claimed();
++}
++
++static void host_clamp(void)
++{
++    if (!H.valid || H.w <= 0 || H.h <= 0) return;
++    H.vx = H.vx < 0 ? 0 : H.vx > (float)H.w ? (float)H.w : H.vx;
++    H.vy = H.vy < 0 ? 0 : H.vy > (float)H.h ? (float)H.h : H.vy;
++}
++
++void rt_host_mouse_motion(float dx, float dy)
++{
++    uint32_t id = __atomic_load_n(&s_host_win, __ATOMIC_ACQUIRE);
++    if (!id) return;
++    SDL_Event e;
++    memset(&e, 0, sizeof e);
++    e.type = SDL_EVENT_MOUSE_MOTION;
++    e.motion.windowID = id;
++    e.motion.which = RT_HOST_MOUSE_ID;
++    e.motion.xrel = dx;
++    e.motion.yrel = dy;
++    pthread_mutex_lock(&s_mu);
++    H.vx += dx;
++    H.vy += dy;
++    host_clamp();
++    e.motion.x = H.vx;
++    e.motion.y = H.vy;
++    H.moves++;
++    pthread_mutex_unlock(&s_mu);
++    SDL_PushEvent(&e);
++}
++
++void rt_host_mouse_button(int button, int down)
++{
++    uint32_t id = __atomic_load_n(&s_host_win, __ATOMIC_ACQUIRE);
++    if (!id || button < 1 || button > 5) return;
++    SDL_Event e;
++    memset(&e, 0, sizeof e);
++    e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
++    e.button.windowID = id;
++    e.button.which = RT_HOST_MOUSE_ID;
++    e.button.button = (Uint8)button;
++    e.button.down = down != 0;
++    e.button.clicks = 1;
++    pthread_mutex_lock(&s_mu);
++    e.button.x = H.vx;
++    e.button.y = H.vy;
++    H.buttons++;
++    pthread_mutex_unlock(&s_mu);
++    SDL_PushEvent(&e);
++}
++
++void rt_host_mouse_wheel(float dy)
++{
++    uint32_t id = __atomic_load_n(&s_host_win, __ATOMIC_ACQUIRE);
++    if (!id) return;
++    SDL_Event e;
++    memset(&e, 0, sizeof e);
++    e.type = SDL_EVENT_MOUSE_WHEEL;
++    e.wheel.windowID = id;
++    e.wheel.which = RT_HOST_MOUSE_ID;
++    e.wheel.y = dy;
++    e.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
++    /* A trackpad scrolls in fractions of a notch; whole notches are what
++       the guest counts, so the rest carries over. */
++    pthread_mutex_lock(&s_mu);
++    H.wheel += dy;
++    double t = trunc(H.wheel);
++    H.wheel -= t;
++    e.wheel.integer_y = (Sint32)t;
++    e.wheel.mouse_x = H.vx;
++    e.wheel.mouse_y = H.vy;
++    H.wheels++;
++    pthread_mutex_unlock(&s_mu);
++    SDL_PushEvent(&e);
++}
++
++int rt_host_cursor(float *u, float *v)
++{
++    pthread_mutex_lock(&s_mu);
++    int shown = S.focus && guest_shape(&S) != RT_CUR_HIDDEN;
++    float x = (float)((S.x + 0.5) / (S.client_w > 0 ? S.client_w : 1));
++    float y = (float)((S.y + 0.5) / (S.client_h > 0 ? S.client_h : 1));
++    pthread_mutex_unlock(&s_mu);
++    if (!shown) return 0;
++    *u = x < 0 ? 0 : x > 1 ? 1 : x;
++    *v = y < 0 ? 0 : y > 1 ? 1 : y;
++    return 1;
++}
++#endif
+diff --git a/runtime/main_hop.h b/runtime/main_hop.h
+index 2f0f243..b47879e 100644
+--- a/runtime/main_hop.h
++++ b/runtime/main_hop.h
+@@ -27,6 +27,18 @@
+  * so no SDL subsystem the runtime's thread starts (audio, from the dsound
+  * shim) can make that thread SDL's main thread instead.
+  */
++/*
++ * rt_input_host_claimed and rt_input_host_regain are the pump's side of the
++ * host's input claim (runtime/host.h), here because this header is the
++ * visionOS one that window.c and input.c already share. While claimed, the
++ * pump ignores the main window's focus loss. rt_input_host_regain returns 1
++ * once after a claim turns on if the game's input had lost focus by then,
++ * and the pump then delivers a focus gain; it is only asked once the main
++ * window exists.
++ */
++int rt_input_host_claimed(void);
++int rt_input_host_regain(void);
++
+ void rt_main_hop(void (*fn)(void *ctx), void *ctx);
+ int rt_window_pixels(void *sdl_window, int *w, int *h);
+ void rt_window_main_ready(void);
+diff --git a/runtime/window.c b/runtime/window.c
+index d2220d4..df28da6 100644
+--- a/runtime/window.c
++++ b/runtime/window.c
+@@ -613,6 +613,18 @@ static void pump(uint64_t now)
+     if (s_main_hwnd) rt_note_pump_gap(now - s_last_pump);
+     s_last_pump = now;
+     SDL_PumpEvents();
++#if TARGET_OS_VISION
++    /* Before the events, so host events queued since the claim are not
++       dropped for want of focus. */
++    rt_win *mw = s_main_hwnd ? rt_win_get(s_main_hwnd) : NULL;
++    if (mw && mw->sdl && rt_input_host_regain()) {
++        rt_log("input host claim regains focus");
++        rt_input_focus(1);
++        rt_dsound_focus(1);
++        rt_input_post(mw->hwnd, 0x001C, 1, 0);
++        rt_input_post(mw->hwnd, 0x0006, 1, 0);
++    }
++#endif
+     rt_input_script_step();
+     SDL_Event e;
+     while (SDL_PollEvent(&e)) {
+@@ -663,6 +675,14 @@ static void pump(uint64_t now)
+         case SDL_EVENT_WINDOW_FOCUS_LOST:
+             if (w) {
+                 int on = e.type == SDL_EVENT_WINDOW_FOCUS_GAINED;
++#if TARGET_OS_VISION
++                /* In an immersive space the game's window never has focus;
++                   the host holds it for the game. */
++                if (!on && w->hwnd == s_main_hwnd && rt_input_host_claimed()) {
++                    rt_log("window focus loss ignored, host holds input");
++                    break;
++                }
++#endif
+                 if (w->hwnd == s_main_hwnd) {
+                     rt_input_focus(on);
+                     rt_dsound_focus(on);
+-- 
+2.54.0 (Apple Git-157)
+

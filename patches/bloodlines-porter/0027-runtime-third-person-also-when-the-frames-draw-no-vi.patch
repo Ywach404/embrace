@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 00:50:01 -0600
+Subject: [PATCH] runtime: third person also when the frames draw no view model
+
+The game switches to third person by itself for melee weapons and bare fists (camera_prefs), and a headset run showed that never sets the CInput camera byte. The renderer now says whether the frames draw a view model, and none counts as third person, once one has been seen this session.
+---
+ runtime/input.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 9074731..0ea2b52 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1284,10 +1284,21 @@ static void dialogue_update(void)
+ #define CINPUT_VTABLE_RVA 0x224D4Cu
+ #define CINPUT_THIRDPERSON 0xF0u
+ 
++#if TARGET_OS_VISION
++int metal_d3d9_fullview_view_model(void);
++#endif
++
+ static void third_person_update(void)
+ {
+     uint32_t in = rt_hook_va("client", CINPUT_RVA);
+     int on = in && panel32(in) == rt_hook_va("client", CINPUT_VTABLE_RVA) && panel8(in + CINPUT_THIRDPERSON) != 0;
++#if TARGET_OS_VISION
++    /* The game also goes to third person by itself with a melee weapon or
++       bare fists (camera_prefs), which a headset run showed never touches
++       that byte. The renderer sees it instead: no view model in the frames
++       (0) is third person, once one has been seen this session. */
++    if (metal_d3d9_fullview_view_model() == 0) on = 1;
++#endif
+     pthread_mutex_lock(&s_mu);
+     int was = S.third_person;
+     S.third_person = on;

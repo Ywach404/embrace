@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:18:25 -0600
+Subject: [PATCH 1/4] runtime: add a metal graphics mode beside null and dxvk
+
+--gfx metal selects a third D3D9 backend at the bridge seam. The enum
+value is appended so the existing null and dxvk values do not move.
+---
+ runtime/main.c | 7 +++++--
+ runtime/rt.h   | 2 +-
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/main.c b/runtime/main.c
+index 0dd95f4..9165271 100644
+--- a/runtime/main.c
++++ b/runtime/main.c
+@@ -234,6 +234,9 @@ static int run(int argc, char **argv)
+         } else if (!strcmp(argv[i], "--gfx") && i + 1 < argc && !strcmp(argv[i + 1], "dxvk")) {
+             gfx = RT_GFX_DXVK;
+             i++;
++        } else if (!strcmp(argv[i], "--gfx") && i + 1 < argc && !strcmp(argv[i + 1], "metal")) {
++            gfx = RT_GFX_METAL;
++            i++;
+         } else if (!strcmp(argv[i], "--display") && i + 1 < argc) {
+             char *end;
+             display_arg = argv[++i];
+@@ -342,7 +345,7 @@ static int run(int argc, char **argv)
+     rt_hud_init();
+     if (rt_gfx_init(gfx, overlay)) return refuse("graphics files missing (see the rt: gfx line above); --gfx null runs without them");
+     if (capture_after > 0) rt_gfx_set_capture(capture_after);
+-    rt_stage(1, "gfx %s%s %s", gfx == RT_GFX_DXVK ? "dxvk" : "null", quiet ? " guest-quiet" : "", cmd);
++    rt_stage(1, "gfx %s%s %s", gfx == RT_GFX_DXVK ? "dxvk" : gfx == RT_GFX_METAL ? "metal" : "null", quiet ? " guest-quiet" : "", cmd);
+ 
+     rt_arena_use(rt_arena_new());
+     rt_load();
+@@ -422,7 +425,7 @@ int main(int argc, char **argv)
+     if (argc != 1) {
+         fprintf(stderr,
+                 "usage: %s [--list-imports | --probe-stub DLL NAME w0 w1 w2 w3 | --probe-read VA | --probe-load PATH "
+-                "[NAME|#N]... | --gfx-selftest [--overlay DIR] | --input-selftest | --m9-selftest CASE [--player] --overlay DIR | --audio-selftest [--game DIR] [--overlay DIR] | --up-selftest [--game DIR] [--overlay DIR] | --up-list-fixes [--game DIR] | --py21-compile DIR [--game DIR] [--mod NAME] | --run [--gfx dxvk|null] [--guest-quiet] [--nosound] [--audio-capture] [--player] [--novid] [--aspect 16:9|21:9|fit|engine|WxH] [--until console|menu] [--capture-after S] "
++                "[NAME|#N]... | --gfx-selftest [--overlay DIR] | --input-selftest | --m9-selftest CASE [--player] --overlay DIR | --audio-selftest [--game DIR] [--overlay DIR] | --up-selftest [--game DIR] [--overlay DIR] | --up-list-fixes [--game DIR] | --py21-compile DIR [--game DIR] [--mod NAME] | --run [--gfx dxvk|metal|null] [--guest-quiet] [--nosound] [--audio-capture] [--player] [--novid] [--aspect 16:9|21:9|fit|engine|WxH] [--until console|menu] [--capture-after S] "
+                 "[--close-after S] [--display N] [--input-script FILE] [--overlay DIR] [--game DIR] [-- ARGS]]\n",
+                 argv[0]);
+         return 2;
+diff --git a/runtime/rt.h b/runtime/rt.h
+index f08a192..9da2330 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -299,7 +299,7 @@ extern const rt_shim rt_d3d9_null_shims[];
+ uint64_t rt_pitch_of(uint32_t f, uint32_t w);
+ uint64_t rt_rows_of(uint32_t f, uint32_t h);
+ 
+-enum { RT_GFX_NULL, RT_GFX_DXVK };
++enum { RT_GFX_NULL, RT_GFX_DXVK, RT_GFX_METAL };
+ 
+ int rt_gfx_init(int mode, const char *overlay);
+ int rt_gfx_mode(void);

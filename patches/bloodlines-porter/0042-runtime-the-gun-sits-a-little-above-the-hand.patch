@@ -1,0 +1,29 @@
+From ab1527394dc853c02e8c1713d022d496dc483281 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 20:45:26 -0600
+Subject: [PATCH] runtime: the gun sits a little above the hand
+
+With the view model's origin at the hand the gun read as held too low on a headset run, and a rest three units down (RT_HANDAIM_REST=0,0,-3) felt right, so that is the default now. RT_HANDAIM_REST still sets it.
+---
+ runtime/handaim.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/handaim.c b/runtime/handaim.c
+index b14cbbf..c80db2f 100644
+--- a/runtime/handaim.c
++++ b/runtime/handaim.c
+@@ -131,7 +131,10 @@ static float units_per_m(void)
+    about the hand's place when the gun looks held cancels it. */
+ static const float *rest_offset(void)
+ {
+-    static float rest[3];
++    /* Three units down as the rest, so the gun sits that much above the
++       hand: at 0 it read as held too low on a headset run (2026-11-21),
++       and 3 felt right. */
++    static float rest[3] = {0.0f, 0.0f, -3.0f};
+     static int read;
+     if (!read) {
+         read = 1;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,187 @@
+From e0213bfbba9217f6b883558002d9838687e2bbf3 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 21:01:13 -0600
+Subject: [PATCH] runtime: health and blood for the host, from the game's hud
+
+Full view leaves the game's flat HUD out of sight, so the host needs the
+player's health and blood to draw by the hand. The pump reads them once a
+game frame from the HUD's own elements, found through the HUD manager's
+element list by their vtables (the health ankh and the blood bar), behind
+a check that the local player exists and is one, so a menu or a load reads
+as nothing. The maxima are the ones the HUD's paints fill against: health
+scaled by 0.01, blood taken ten times against 150. The read goes to the
+host packed in one 64 bit word with a valid bit, one load for a whole
+read on any thread, and the first read and first ten changes are logged so
+a run shows the real ranges.
+---
+ runtime/host.h  |  10 +++++
+ runtime/input.c | 109 ++++++++++++++++++++++++++++++++++++++++++++++++
+ runtime/input.h |   4 ++
+ 3 files changed, 123 insertions(+)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 0df61af..7df26e5 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -63,6 +63,16 @@ void rt_host_mouse_button(int button, int down);
+ void rt_host_mouse_wheel(float dy);
+ int rt_host_cursor(float *u, float *v);
+ 
++/*
++ * rt_host_vitals returns 1 when the player is in the world with the HUD
++ * up, and writes the health and blood the game's HUD shows with the
++ * values that fill each (100 and 15), for the host to draw by the hand:
++ * the game's own HUD is drawn flat and full view leaves it out of sight.
++ * It returns 0 in menus, while a level loads and before the HUD is built.
++ * Read once a game frame; any thread.
++ */
++int rt_host_vitals(int *health, int *health_max, int *blood, int *blood_max);
++
+ /*
+  * The game window's UIWindow (SDL's), borrowed, or NULL before the game's
+  * window exists. In an immersive space the host dismisses its own window
+diff --git a/runtime/input.c b/runtime/input.c
+index d7946ba..e153a4d 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1329,6 +1329,114 @@ static void third_person_update(void)
+     if (on != was) rt_log("camera %s", on ? "third person: stick look, full view, the world held still" : "first person");
+ }
+ 
++/* The player's health and blood, read from the game's own HUD so the host
++   can draw them by the hand (the game's HUD is flat and sits outside a
++   full view frame's field). C_BasePlayer::s_pLocalPlayer (client
++   +0x4A0D50) is set by the local player's constructor and cleared by its
++   destructor; its vtable is C_BaseHLPlayer's, or C_BasePlayer's during
++   teardown, and anything else (a menu, a load) reads as no player. The
++   HUD manager (pointer at +0x3EEC98, vtable +0x2295F4) keeps its elements
++   in a list at +0x170 of nodes {element, next}, each element the
++   IManagedHudElement part 0x170 into its object, as the HUD's build adds
++   them. The health ankh (that part's vtable +0x228B54) holds health at
++   +0x20, the value its SetHealth stores and its paint scales by 0.01, so
++   100 is full; the blood bar (+0x227EEC) holds blood at +0x20, which its
++   paint takes ten times, smoothed, against 150, so 15 is full. The bar
++   paints a second value (+0x24) instead when a flag in the player's info
++   is clear; which state that is has not been seen on a run yet. */
++#define LOCAL_PLAYER_RVA 0x4A0D50u
++#define LOCAL_PLAYER_HL_VTABLE_RVA 0x1E3904u
++#define LOCAL_PLAYER_BASE_VTABLE_RVA 0x22E5BCu
++#define HUD_MGR_RVA 0x3EEC98u
++#define HUD_MGR_VTABLE_RVA 0x2295F4u
++#define HUD_MGR_LIST 0x170u
++#define HUD_HEALTH_VTABLE_RVA 0x228B54u
++#define HUD_BLOOD_VTABLE_RVA 0x227EECu
++#define HUD_VALUE 0x20u
++/* The list holds the dozen or so elements the HUD builds; a walk longer
++   than this is a list being torn down, not one to follow. */
++#define HUD_LIST_MAX 64
++#define VITALS_HEALTH_MAX 100
++#define VITALS_BLOOD_MAX 15
++
++int rt_player_vitals(int *health, int *health_max, int *blood, int *blood_max)
++{
++    uint32_t slot = rt_hook_va("client", LOCAL_PLAYER_RVA);
++    if (!slot) return 0;
++    uint32_t player = panel32(slot);
++    if (!player) return 0;
++    uint32_t vt = panel32(player);
++    if (vt != rt_hook_va("client", LOCAL_PLAYER_HL_VTABLE_RVA) && vt != rt_hook_va("client", LOCAL_PLAYER_BASE_VTABLE_RVA))
++        return 0;
++    uint32_t mslot = rt_hook_va("client", HUD_MGR_RVA);
++    uint32_t mgr = mslot ? panel32(mslot) : 0;
++    if (!mgr || panel32(mgr) != rt_hook_va("client", HUD_MGR_VTABLE_RVA)) return 0;
++    uint32_t health_vt = rt_hook_va("client", HUD_HEALTH_VTABLE_RVA);
++    uint32_t blood_vt = rt_hook_va("client", HUD_BLOOD_VTABLE_RVA);
++    uint32_t health_el = 0, blood_el = 0;
++    uint32_t node = panel32(mgr + HUD_MGR_LIST);
++    /* Guest memory is one 4 GB arena, so any read lands; a pointer that
++       is not word aligned is no heap block and could run past its end. */
++    for (int i = 0; node && !(node & 3) && i < HUD_LIST_MAX && !(health_el && blood_el); i++) {
++        uint32_t el = panel32(node);
++        if (el && !(el & 3)) {
++            uint32_t evt = panel32(el);
++            if (evt == health_vt) health_el = el;
++            else if (evt == blood_vt) blood_el = el;
++        }
++        node = panel32(node + 4);
++    }
++    if (!health_el || !blood_el) return 0;
++    *health = (int32_t)panel32(health_el + HUD_VALUE);
++    *health_max = VITALS_HEALTH_MAX;
++    *blood = (int32_t)panel32(blood_el + HUD_VALUE);
++    *blood_max = VITALS_BLOOD_MAX;
++    return 1;
++}
++
++/* The last read, for the host's compositor thread: four fields of 15
++   bits and a valid bit in one word, so a reader takes a whole read with
++   one load and no sequence word. Values are clamped to 0..32767, far past
++   anything the HUD holds. */
++static uint64_t s_vitals;
++
++static uint64_t vitals_field(int v) { return (uint64_t)(v < 0 ? 0 : v > 0x7FFF ? 0x7FFF : v); }
++
++static void vitals_update(void)
++{
++    static int logged_valid, changes;
++    static int last_health = -1, last_blood = -1;
++    int h, hm, b, bm;
++    int ok = rt_player_vitals(&h, &hm, &b, &bm);
++    uint64_t w = ok ? (1ull << 63) | vitals_field(h) | vitals_field(hm) << 15 | vitals_field(b) << 30 |
++                          vitals_field(bm) << 45
++                    : 0;
++    __atomic_store_n(&s_vitals, w, __ATOMIC_RELEASE);
++    if (!ok) return;
++    /* The first read and the first few changes, so a run shows the real
++       ranges the gauges are drawn against. */
++    if (!logged_valid) {
++        logged_valid = 1;
++        rt_log("vitals: health %d/%d blood %d/%d", h, hm, b, bm);
++    } else if ((h != last_health || b != last_blood) && changes < 10) {
++        changes++;
++        rt_log("vitals: health %d/%d blood %d/%d%s", h, hm, b, bm, changes == 10 ? "; no more of these" : "");
++    }
++    last_health = h;
++    last_blood = b;
++}
++
++int rt_host_vitals(int *health, int *health_max, int *blood, int *blood_max)
++{
++    uint64_t w = __atomic_load_n(&s_vitals, __ATOMIC_ACQUIRE);
++    if (!(w >> 63)) return 0;
++    *health = (int)(w & 0x7FFF);
++    *health_max = (int)(w >> 15 & 0x7FFF);
++    *blood = (int)(w >> 30 & 0x7FFF);
++    *blood_max = (int)(w >> 45 & 0x7FFF);
++    return 1;
++}
++
+ int rt_input_head_allowed(const rt_input_state *s) { return !s->head_off && !s->third_person; }
+ 
+ /* Third person and a dialogue hold the head: it writes nothing, the
+@@ -1603,6 +1711,7 @@ void rt_input_pump_end(void)
+     if (!s_win) return;
+     dialogue_update();
+     third_person_update();
++    vitals_update();
+     if (s_pad_started) pad_pump();
+ #if TARGET_OS_VISION
+     head_pump();
+diff --git a/runtime/input.h b/runtime/input.h
+index 8a98361..6bfb7c7 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -177,6 +177,10 @@ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *
+    three floats at va (pitch, yaw, roll), one step, and the result
+    written back there. 1 when written. va 0 reads as no angles. */
+ int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va);
++/* The player's health and blood from the game's HUD, with the values that
++   fill each; 0 when there is no player in the world or no HUD (input.c).
++   Game thread only: it reads the client's memory as the game leaves it. */
++int rt_player_vitals(int *health, int *health_max, int *blood, int *blood_max);
+ int rt_input_release_all(rt_input_state *s, rt_wmsg *out, int cap);
+ int rt_input_flush_move(rt_input_state *s, rt_wmsg *out, int cap);
+ void rt_input_take(rt_input_state *s, uint32_t msg, uint32_t lp);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:50:59 -0600
+Subject: [PATCH] runtime: keep the tracked hands' poses, and hand= picks the
+ aiming hand
+
+The host gives each tracked controller's grip and aim pose, velocities and tracking state once a compositor frame; the runtime keeps the latest per side for hand aim, swings and the arm HUD to come. hand=left|right in controls.txt (RT_PAD_HAND) picks the aiming hand, which the host reads through rt_host_aim_hand.
+---
+ runtime/host.h           | 17 +++++++++++++++++
+ runtime/input.c          | 30 ++++++++++++++++++++++++++++++
+ runtime/input_selftest.c |  4 ++++
+ runtime/pad.c            |  7 ++++++-
+ runtime/pad.h            |  3 +++
+ 5 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 20e2c94..b034a11 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -96,6 +96,23 @@ void *rt_host_game_window(void);
+ void rt_host_head_pose(int on, float yaw_deg, float pitch_deg);
+ void rt_host_head_recentre(void);
+ 
++/*
++ * Tracked controllers (and later hands): the host gives each side's
++ * latest pose as the compositor reads it, once a compositor frame.
++ * side is 0 left, 1 right; state is 0 untracked, 1 orientation only,
++ * 2 position and orientation, 3 the same at low accuracy. grip and aim
++ * are column-major 4x4 transforms from the location to ARKit's origin,
++ * in metres; velocity in metres a second and angular velocity in
++ * radians a second, both in the origin's axes; time in seconds on
++ * ARKit's clock. Nothing reads them yet: they are kept, and counted for
++ * the log, for hand aim, swings and the arm HUD to come. Any thread.
++ * rt_host_aim_hand says which hand aims: 0 right, 1 left, from hand= in
++ * controls.txt (RT_PAD_HAND).
++ */
++void rt_host_hand_pose(int side, int state, const float grip[16], const float aim[16], const float velocity[3],
++                       const float angular_velocity[3], double time);
++int rt_host_aim_hand(void);
++
+ /*
+  * Writes one line from the host to the runtime's log, after "host: ", so
+  * what the host sees (GameController's own view of the controllers, say)
+diff --git a/runtime/input.c b/runtime/input.c
+index dd38c77..91cf988 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1383,6 +1383,36 @@ void rt_host_head_pose(int on, float yaw_deg, float pitch_deg)
+ 
+ void rt_host_head_recentre(void) { __atomic_fetch_add(&s_head_host_recentres, 1, __ATOMIC_ACQ_REL); }
+ 
++/* The host's latest tracked hand poses, one slot per side. A sequence
++   word around each write lets a reader that comes later take a whole
++   pose: odd while a write is under way. Nothing reads them yet. */
++typedef struct {
++    uint32_t seq;
++    int state;
++    float grip[16], aim[16], vel[3], ang[3];
++    double time;
++    uint32_t count;
++} rt_hand_slot;
++static rt_hand_slot s_hands[2];
++
++void rt_host_hand_pose(int side, int state, const float grip[16], const float aim[16], const float velocity[3],
++                       const float angular_velocity[3], double time)
++{
++    if (side < 0 || side > 1) return;
++    rt_hand_slot *h = &s_hands[side];
++    __atomic_fetch_add(&h->seq, 1, __ATOMIC_ACQ_REL);
++    h->state = state;
++    if (grip) memcpy(h->grip, grip, sizeof h->grip);
++    if (aim) memcpy(h->aim, aim, sizeof h->aim);
++    if (velocity) memcpy(h->vel, velocity, sizeof h->vel);
++    if (angular_velocity) memcpy(h->ang, angular_velocity, sizeof h->ang);
++    h->time = time;
++    h->count++;
++    __atomic_fetch_add(&h->seq, 1, __ATOMIC_ACQ_REL);
++}
++
++int rt_host_aim_hand(void) { return __atomic_load_n(&s_padv.pad.aim_left, __ATOMIC_RELAXED) ? 1 : 0; }
++
+ /* Whether the pad's right stick should turn the body this poll: the host
+    gives a pose and the game's angles are there to write. */
+ static int head_wanted(void)
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 63ba4cc..d56c1ab 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -2818,6 +2818,10 @@ static void pad_turn(void)
+     check(rt_pad_take_turn(&p) == 0, "inside the dead zone nothing turns", "%.4f", p.turn_deg);
+     check(rt_pad_tune(&p, "turn", "snap") == 0 && p.turn_mode == RT_PAD_TURN_SNAP && rt_pad_tune(&p, "turn", "sideways") == -2,
+           "turn=snap is taken, a bad value is not", "mode %d", p.turn_mode);
++    check(p.aim_left == 0, "the right hand aims by default", "%d", p.aim_left);
++    check(rt_pad_tune(&p, "hand", "left") == 0 && p.aim_left == 1 && rt_pad_tune(&p, "hand", "both") == -2 && p.aim_left == 1,
++          "hand=left is taken, a bad value is not", "aim_left %d", p.aim_left);
++    check(rt_pad_tune(&p, "hand", "right") == 0 && p.aim_left == 0, "hand=right puts the aim back on the right", "%d", p.aim_left);
+     p.rx = 32767;
+     rt_pad_move(&p, 0.01, &dx, &dy);
+     double s1 = rt_pad_take_turn(&p);
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 35d6686..54e51f4 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -341,6 +341,10 @@ int rt_pad_tune(rt_pad *p, const char *key, const char *v)
+         if (!strcmp(v, "smooth")) p->turn_mode = RT_PAD_TURN_SMOOTH;
+         else if (!strcmp(v, "snap")) p->turn_mode = RT_PAD_TURN_SNAP;
+         else return -2;
++    } else if (!strcmp(key, "hand")) {
++        if (!strcmp(v, "right")) p->aim_left = 0;
++        else if (!strcmp(v, "left")) p->aim_left = 1;
++        else return -2;
+     } else if (!strcmp(key, "turn_speed")) {
+         if (number(v, 1, 1000, &n)) return -2;
+         p->turn_speed = n;
+@@ -406,7 +410,8 @@ static int load_env(rt_pad *p)
+     static const char *const k_env[][2] = {{"RT_PAD_LOOK_SPEED", "look_speed"},     {"RT_PAD_CURSOR_SPEED", "cursor_speed"},
+                                            {"RT_PAD_CURSOR_POWER", "cursor_power"}, {"RT_PAD_CURSOR_DEAD", "cursor_dead"},
+                                            {"RT_PAD_CURSOR_LEFT", "cursor_left"},   {"RT_PAD_TURN", "turn"},
+-                                           {"RT_PAD_TURN_SPEED", "turn_speed"},     {"RT_PAD_SNAP_ANGLE", "snap_angle"}};
++                                           {"RT_PAD_TURN_SPEED", "turn_speed"},     {"RT_PAD_SNAP_ANGLE", "snap_angle"},
++                                           {"RT_PAD_HAND", "hand"}};
+     int bad = 0;
+     for (size_t i = 0; i < sizeof k_env / sizeof *k_env; i++) {
+         const char *v = getenv(k_env[i][0]);
+diff --git a/runtime/pad.h b/runtime/pad.h
+index f00fa07..3eb379d 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -124,6 +124,9 @@ typedef struct {
+        turn_deg collects the turn (degrees, positive to the left, as the
+        game's yaw) until input.c takes it. */
+     int head, turn_mode, snap_armed;
++    /* The aiming hand for tracked controllers: 0 right, 1 left (hand=
++       in controls.txt). Read by the host; the pad itself ignores it. */
++    int aim_left;
+     double turn_speed, snap_deg, turn_deg;
+     int cursor_speed, cursor_dead;
+     double cursor_power, cursor_left;

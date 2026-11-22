@@ -1,0 +1,1355 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 00:47:33 -0600
+Subject: [PATCH] runtime: step a highlight through dialogue answers with the
+ pad
+
+The dialogue HUD has no highlight and answers only to the number keys,
+so 0016 put answers 1 to 4 on fixed stick directions. That bakes the
+game's four answer cut-off into the controls, and the plan is to lift
+it once the game is first person. A list selector does not care how
+many answers there are.
+
+In dialogue mode the right stick's up and down flicks and the d-pad
+move a highlight through answers 0 to count-1, clamped. Nothing is
+highlighted when a dialogue opens, and the first move marks the first
+answer. A held step repeats after 0.4 s and then every 0.15 s; the
+stick still has to centre after a dialogue opens before it can move
+anything. Left, right and the stick's side flicks do nothing.
+
+The highlight is drawn by the game: the chosen slot's text (narrow,
+NUL terminated, 0x800 bytes at +0x122C + i*0x800) gets "> " in front,
+and sub_10553B50 formats every slot with "%d. %s" each frame, so the
+mark shows on the next frame. The whole block is saved first and put
+back the moment the highlight moves, clears or is confirmed, but only
+while the slot still holds exactly what was written; if the game wrote
+the slot since, its text is kept. The edits run in the input pump on
+the game thread, between frames. Each pump the count, the four slot
+texts and their type and flag words are compared with a snapshot, and
+any change other than ours (or history, single line, close, or the HUD
+going away) ends the highlight. The marked slot rewritten to its own
+text gets the mark again.
+
+Cross and RT confirm: the text goes back first, so the line the game
+copies into its history is the answer's own, then the number key is
+pressed and released. The game drops a pick within 0.5 s of the last
+(its time at +0x5A80); a change there is taken as a pick, and a
+confirm inside that window is held and keeps the mark. With nothing
+highlighted Cross is still space, the game's continue, and RT sends
+nothing, so it no longer opens the history. Circle clears the mark, or
+is Escape when there is none. Stepping follows the count the game
+reports; a slot past the four the game stores is not written, and a
+key past the four Key_Event takes is refused rather than picking the
+wrong answer.
+
+These are pad targets, so controls.txt keeps working: answerup,
+answerdown, answer and answerclear, the last two with an optional
+/fallback. The log reports "dialogue highlight N of M" on change, at
+most every 0.25 s while moving, and each confirm, hold and clear.
+
+The input self test drives a fake HUD in guest memory through every
+path: stepping and clamping, repeat timing, the prefix applied and
+restored on move, clear, confirm, close, history, count change and
+external rewrite, the confirm key and the guard, RT not clicking, and
+Circle's two meanings.
+---
+ runtime/input.c          | 299 +++++++++++++++++++++++--
+ runtime/input.h          |  29 +++
+ runtime/input_selftest.c | 469 +++++++++++++++++++++++++++++++++------
+ runtime/pad.c            | 136 +++++++++---
+ runtime/pad.h            |  23 +-
+ 5 files changed, 845 insertions(+), 111 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index a60dbde..885ed84 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -326,6 +326,267 @@ int rt_input_translate(rt_input_state *s, const SDL_Event *e, const rt_present_r
+     return n;
+ }
+ 
++/* The dialogue HUD (client CHudDialog) fields the answer highlight uses,
++   from its lifted code: Key_Event (sub_10555260) picks slot 0 to 3 on
++   the release of 1 to 4 through sub_105549F0, which needs idx < count
++   and ignores a pick within 0.5 s of the last (the time is the float at
++   +0x5A80, written only when a pick goes through). The answers are drawn
++   by sub_10553B50 every frame from the slot texts, through
++   Q_snprintf("%d. %s"), so an edit shows on the next frame. History
++   (+0x1B2) draws the past lines instead, and single-line mode (+0x1B3)
++   draws only the last line said; neither shows the answers. */
++#define DIALOGUE_ACTIVE 0x1B4u
++#define DIALOGUE_HISTORY 0x1B2u
++#define DIALOGUE_SINGLE 0x1B3u
++#define DIALOGUE_COUNT 0x1228u
++#define DIALOGUE_TEXT 0x122Cu
++#define DIALOGUE_TYPE 0x322Cu
++#define DIALOGUE_FLAGS 0x323Cu
++#define DIALOGUE_PICK_TIME 0x5A80u
++
++/* Host time since the last pick before a confirm is sent. The game's
++   own guard is 0.5 s on its clock; a pick it makes is seen here a pump
++   late, so the guard here is never shorter than the game's. */
++#define DIALOGUE_GUARD_NS 500000000ull
++/* A count past this is not a dialogue the selector should step through:
++   it is a panel in the middle of being torn down or rebuilt. */
++#define DIALOGUE_COUNT_MAX 64
++#define DIALOGUE_LOG_NS 250000000ull
++
++static uint32_t panel32(uint32_t va)
++{
++    uint32_t v;
++    memcpy(&v, rt_host(va), sizeof v);
++    return v;
++}
++
++static uint8_t panel8(uint32_t va) { return *(const uint8_t *)rt_host(va); }
++
++static char *slot_text(uint32_t va, int i) { return (char *)rt_host(va + DIALOGUE_TEXT + (uint32_t)i * RT_DLG_TEXT); }
++
++static uint32_t text_sum(const char *t)
++{
++    uint32_t h = 2166136261u;
++    for (size_t i = 0; i < RT_DLG_TEXT && t[i]; i++) h = (h ^ (uint8_t)t[i]) * 16777619u;
++    return h;
++}
++
++static int slots_of(int32_t count) { return count < 0 ? 0 : count > RT_DLG_SLOTS ? RT_DLG_SLOTS : (int)count; }
++
++static void sel_log(rt_dialogue_sel *g, uint64_t now)
++{
++    g->log_dirty = 0;
++    g->log_ns = now;
++    if (g->lit) rt_log("dialogue highlight %d of %d", g->idx + 1, g->count);
++}
++
++/* A move logs at once unless the last line was moments ago; a stick
++   held down a long list then logs where it rests, not every step. */
++static void sel_note(rt_dialogue_sel *g, uint64_t now)
++{
++    if (now - g->log_ns >= DIALOGUE_LOG_NS || !g->log_ns) sel_log(g, now);
++    else g->log_dirty = 1;
++}
++
++/* The edit stays ours only while the slot holds exactly what was
++   written. If the game wrote the slot since, its text is the new truth
++   and putting the old one back would clobber it. */
++static int sel_intact(const rt_dialogue_sel *g)
++{
++    return g->idx < RT_DLG_SLOTS && !memcmp(slot_text(g->va, g->idx), g->written, RT_DLG_TEXT);
++}
++
++static void sel_restore(rt_dialogue_sel *g)
++{
++    if (g->lit && g->idx < RT_DLG_SLOTS && sel_intact(g)) memcpy(slot_text(g->va, g->idx), g->saved, RT_DLG_TEXT);
++}
++
++static void sel_drop(rt_dialogue_sel *g, int restore, const char *why)
++{
++    if (!g->lit) return;
++    if (restore) sel_restore(g);
++    g->lit = 0;
++    g->log_dirty = 0;
++    g->resets++;
++    rt_log("dialogue highlight cleared (%s)", why);
++}
++
++/* The game's text is narrow and NUL terminated in a 0x800 buffer, and
++   the draw formats it with "%s", so the prefix goes in front and the
++   tail is cut to fit; the whole block is saved, so the cut is undone on
++   restore. */
++static void sel_write(rt_dialogue_sel *g)
++{
++    char *t = slot_text(g->va, g->idx);
++    memcpy(g->saved, t, RT_DLG_TEXT);
++    memset(g->written, 0, RT_DLG_TEXT);
++    size_t len = strnlen(g->saved, RT_DLG_TEXT - 1);
++    if (len > RT_DLG_TEXT - 3) len = RT_DLG_TEXT - 3;
++    g->written[0] = '>';
++    g->written[1] = ' ';
++    memcpy(g->written + 2, g->saved, len);
++    memcpy(t, g->written, RT_DLG_TEXT);
++}
++
++static void sel_snapshot(rt_dialogue_sel *g)
++{
++    int n = slots_of(g->count);
++    for (int i = 0; i < n; i++) {
++        g->sum[i] = text_sum(i == g->idx ? g->saved : slot_text(g->va, i));
++        g->type[i] = panel32(g->va + DIALOGUE_TYPE + 4u * (uint32_t)i);
++        g->flags[i] = panel32(g->va + DIALOGUE_FLAGS + 4u * (uint32_t)i);
++    }
++}
++
++static void sel_light(rt_dialogue_sel *g, uint32_t va, int32_t count, int idx, uint64_t now)
++{
++    g->lit = 1;
++    g->va = va;
++    g->count = count;
++    g->idx = idx;
++    if (idx < RT_DLG_SLOTS) sel_write(g);
++    sel_snapshot(g);
++    g->steps++;
++    sel_note(g, now);
++}
++
++/* The panel can be stepped: it is the HUD, active, and showing answers. */
++static int sel_ready(uint32_t va)
++{
++    return va && panel8(va + DIALOGUE_ACTIVE) && !panel8(va + DIALOGUE_HISTORY) && !panel8(va + DIALOGUE_SINGLE);
++}
++
++/* Once per pump, before the pad is read, on the game thread: the pump
++   runs between the game's frames, so nothing of the game's writes a slot
++   while it is read or edited here. Anything that changes the answers
++   other than our own edit ends the highlight, so a confirm can never
++   send the number of an answer the player did not see marked. A slot
++   rewritten to the same text it had (the game putting it back on its own
++   schedule) gets the marker again. */
++static void sel_sync(rt_input_state *s, uint64_t now)
++{
++    rt_dialogue_sel *g = &s->sel;
++    uint32_t va = s->dialogue_va;
++    if (va) {
++        uint32_t bits = panel32(va + DIALOGUE_PICK_TIME);
++        if (g->pick_va == va && bits != g->pick_bits) g->pick_ns = now;
++        g->pick_va = va;
++        g->pick_bits = bits;
++    }
++    if (!g->lit) return;
++    /* A HUD that is gone or replaced is never written: the memory may
++       belong to something else now. */
++    if (va != g->va) {
++        sel_drop(g, 0, "the panel went away");
++        return;
++    }
++    if (!panel8(va + DIALOGUE_ACTIVE)) {
++        sel_drop(g, 1, "dialogue closed");
++        return;
++    }
++    if (panel8(va + DIALOGUE_HISTORY)) {
++        sel_drop(g, 1, "history opened");
++        return;
++    }
++    if (panel8(va + DIALOGUE_SINGLE)) {
++        sel_drop(g, 1, "single line");
++        return;
++    }
++    int32_t count = (int32_t)panel32(va + DIALOGUE_COUNT);
++    if (count != g->count) {
++        sel_drop(g, 1, "the answer count changed");
++        return;
++    }
++    int n = slots_of(count), reapply = 0;
++    const char *why = NULL;
++    for (int i = 0; i < n && !why; i++) {
++        const char *t = slot_text(va, i);
++        if (panel32(va + DIALOGUE_TYPE + 4u * (uint32_t)i) != g->type[i] || panel32(va + DIALOGUE_FLAGS + 4u * (uint32_t)i) != g->flags[i])
++            why = "an answer's type changed";
++        else if (i != g->idx && text_sum(t) != g->sum[i])
++            why = "an answer's text changed";
++        else if (i == g->idx && !sel_intact(g))
++            reapply = 1;
++    }
++    if (why) {
++        sel_drop(g, 1, why);
++        return;
++    }
++    if (reapply && strncmp(slot_text(va, g->idx), g->saved, RT_DLG_TEXT)) {
++        sel_drop(g, 0, "the highlighted answer was rewritten");
++        return;
++    }
++    if (reapply) {
++        sel_write(g);
++        g->reapplies++;
++        if (now - g->reapply_log_ns >= 1000000000ull || !g->reapply_log_ns) {
++            g->reapply_log_ns = now;
++            rt_log("dialogue highlight reapplied (the game rewrote the answer; %u so far)", g->reapplies);
++        }
++    }
++    if (g->log_dirty && now - g->log_ns >= DIALOGUE_LOG_NS) sel_log(g, now);
++}
++
++static int key_event(SDL_Event *e, int scancode, int down)
++{
++    memset(e, 0, sizeof *e);
++    e->type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
++    e->key.scancode = (SDL_Scancode)scancode;
++    e->key.down = down;
++    return 1;
++}
++
++/* What a pad answer action does. Only a confirm sends the game anything:
++   the text goes back first, so the line the game copies into its history
++   on the pick is the answer's own, then the number key is pressed and
++   released together, since the HUD picks on the release. */
++static int sel_act(rt_input_state *s, int act, uint64_t now, SDL_Event *out, int cap)
++{
++    rt_dialogue_sel *g = &s->sel;
++    uint32_t va = s->dialogue_va;
++    switch (act) {
++    case RT_PAD_ACT_UP:
++    case RT_PAD_ACT_DOWN: {
++        if (!sel_ready(va)) return 0;
++        int32_t count = (int32_t)panel32(va + DIALOGUE_COUNT);
++        if (count <= 0 || count > DIALOGUE_COUNT_MAX) return 0;
++        /* The first move marks the first answer whichever way it goes:
++           nothing is marked, so there is no "next" to go to. */
++        int idx = !g->lit ? 0 : g->idx + (act == RT_PAD_ACT_UP ? -1 : 1);
++        if (idx < 0) idx = 0;
++        if (idx > count - 1) idx = count - 1;
++        if (g->lit && idx == g->idx && count == g->count) return 0;
++        sel_restore(g);
++        sel_light(g, va, count, idx, now);
++        return 0;
++    }
++    case RT_PAD_ACT_CLEAR: sel_drop(g, 1, "Circle"); return 0;
++    case RT_PAD_ACT_CONFIRM: {
++        if (!g->lit || cap < 2) return 0;
++        if (g->pick_ns && now - g->pick_ns < DIALOGUE_GUARD_NS) {
++            g->held++;
++            rt_log("dialogue confirm %d of %d held: the game ignores a pick within 0.5 s of the last", g->idx + 1, g->count);
++            return 0;
++        }
++        if (g->idx >= RT_DLG_KEYS) {
++            rt_log("dialogue confirm %d of %d refused: the game takes keys 1 to %d", g->idx + 1, g->count, RT_DLG_KEYS);
++            return 0;
++        }
++        int idx = g->idx, count = g->count;
++        sel_restore(g);
++        g->lit = 0;
++        g->log_dirty = 0;
++        g->confirms++;
++        g->pick_ns = now;
++        rt_log("dialogue confirm %d of %d", idx + 1, count);
++        key_event(&out[0], SDL_SCANCODE_1 + idx, 1);
++        key_event(&out[1], SDL_SCANCODE_1 + idx, 0);
++        return 2;
++    }
++    default: return 0;
++    }
++}
++
+ static rt_pad_pt pad_point(const rt_input_state *s, const rt_present_rects *r, float density)
+ {
+     rt_pad_pt p;
+@@ -376,10 +637,21 @@ int rt_input_pad_apply(rt_input_state *s, const SDL_Event *ev, int k, int dx, in
+ int rt_input_pad_pump(rt_input_state *s, rt_pad_dev *d, int active, uint64_t now_ns, const rt_present_rects *r, float density,
+                       rt_wmsg *out, int cap)
+ {
+-    SDL_Event ev[RT_PAD_EVENTS];
+-    int dx, dy, mode = rt_input_pad_mode(s);
++    SDL_Event ev[RT_PAD_EVENTS], go[RT_PAD_EVENTS + 2];
++    int dx, dy, mode = rt_input_pad_mode(s), n = 0;
++    sel_sync(s, now_ns);
++    d->pad.lit = s->sel.lit;
+     int k = rt_pad_poll(d, active, mode, pad_point(s, r, density), now_ns, ev, RT_PAD_EVENTS, &dx, &dy);
+-    return rt_input_pad_apply(s, ev, k, dx, dy, mode, r, density, out, cap);
++    /* Answer actions become what the selector sends, in their place in
++       the stream, so a key pressed before a confirm still lands first. */
++    for (int i = 0; i < k; i++) {
++        if (ev[i].type != SDL_EVENT_USER) {
++            if (n < RT_PAD_EVENTS + 2) go[n++] = ev[i];
++            continue;
++        }
++        n += sel_act(s, ev[i].user.code, now_ns, go + n, RT_PAD_EVENTS + 2 - n);
++    }
++    return rt_input_pad_apply(s, go, n, dx, dy, mode, r, density, out, cap);
+ }
+ 
+ int rt_input_pad_lost(rt_input_state *s, rt_pad_dev *d, const rt_present_rects *r, float density, rt_wmsg *out, int cap)
+@@ -864,30 +1136,25 @@ void rt_input_focus(int on)
+    reading as a dialogue. */
+ #define DIALOGUE_PTR_RVA 0x3EE138u
+ #define DIALOGUE_VTABLE_RVA 0x228FDCu
+-#define DIALOGUE_ACTIVE 0x1B4u
+-
+-static uint32_t guest32(uint32_t va)
+-{
+-    uint32_t v;
+-    memcpy(&v, rt_host(va), sizeof v);
+-    return v;
+-}
+ 
+-static int dialogue_probe(void)
++/* The HUD's address, or 0 when there is no live one. */
++static uint32_t dialogue_probe(void)
+ {
+     uint32_t slot = rt_hook_va("client", DIALOGUE_PTR_RVA);
+     if (!slot) return 0;
+-    uint32_t hud = guest32(slot);
+-    if (!hud || guest32(hud) != rt_hook_va("client", DIALOGUE_VTABLE_RVA)) return 0;
+-    return *(const uint8_t *)rt_host(hud + DIALOGUE_ACTIVE) != 0;
++    uint32_t hud = panel32(slot);
++    if (!hud || panel32(hud) != rt_hook_va("client", DIALOGUE_VTABLE_RVA)) return 0;
++    return hud;
+ }
+ 
+ static void dialogue_update(void)
+ {
+-    int on = dialogue_probe();
++    uint32_t hud = dialogue_probe();
++    int on = hud && panel8(hud + DIALOGUE_ACTIVE) != 0;
+     pthread_mutex_lock(&s_mu);
+     int was = S.dialogue;
+     S.dialogue = on;
++    S.dialogue_va = hud;
+     pthread_mutex_unlock(&s_mu);
+     if (on != was) rt_log("dialogue %s", on ? "open" : "closed");
+ }
+diff --git a/runtime/input.h b/runtime/input.h
+index dcab80a..fc8c5d9 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -46,6 +46,31 @@ typedef struct {
+     uint32_t msg, wp, lp;
+ } rt_wmsg;
+ 
++/* The dialogue HUD's answer slots: four texts of 0x800 bytes, which is
++   the game's layout today. RT_DLG_KEYS is how many number keys its
++   Key_Event takes. Both are the game's limits, not the selector's: the
++   highlight steps through the count the game reports. */
++#define RT_DLG_TEXT 0x800
++#define RT_DLG_SLOTS 4
++#define RT_DLG_KEYS 4
++
++/* The dialogue answer highlight, drawn by the game itself as a "> "
++   written into the chosen slot's own text. saved is the slot's 0x800
++   bytes before the edit and written is what was put there, so a restore
++   happens only while the slot still holds exactly our edit. */
++typedef struct {
++    int lit, idx;
++    int32_t count;
++    uint32_t va;
++    uint32_t sum[RT_DLG_SLOTS], type[RT_DLG_SLOTS], flags[RT_DLG_SLOTS];
++    uint32_t pick_va, pick_bits;
++    uint64_t pick_ns;
++    int log_dirty;
++    uint64_t log_ns, reapply_log_ns;
++    uint32_t steps, confirms, resets, reapplies, held;
++    char saved[RT_DLG_TEXT], written[RT_DLG_TEXT];
++} rt_dialogue_sel;
++
+ typedef struct {
+     int32_t x, y;
+     int32_t read_x, read_y;
+@@ -60,6 +85,10 @@ typedef struct {
+     /* The game's dialogue HUD is active: set by the pump's probe of the
+        guest's own flag, or directly by the self test. */
+     int dialogue;
++    /* The HUD's guest address once its vtable checks out, active or not;
++       0 when there is none. The answer highlight reads and edits it. */
++    uint32_t dialogue_va;
++    rt_dialogue_sel sel;
+     uint32_t cursor;
+     int show_count;
+     int applied;
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 806e3d3..04e6b71 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -962,7 +962,8 @@ static void padpump_ns(rt_input_state *s, rt_pad_dev *d, uint64_t ns)
+ 
+ /* SDL button, or -1 with the trigger axis; then what play, menu and
+    dialogue send: the message and, for keys and clicks, its wparam (0
+-   skips it). */
++   skips it). A message of 0 is a button that sends nothing there; in a
++   dialogue with nothing to step, the d-pad and RT are such buttons. */
+ static const struct {
+     int btn, axis;
+     const char *name;
+@@ -978,14 +979,14 @@ static const struct {
+     {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, -1, "R1", {WM_MOUSEWHEEL, WM_MOUSEWHEEL, WM_MOUSEWHEEL}, {0, 0, 0}},
+     {SDL_GAMEPAD_BUTTON_LEFT_STICK, -1, "L3", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x4C, 0x4C, 0x4C}},
+     {SDL_GAMEPAD_BUTTON_RIGHT_STICK, -1, "R3", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x11, 0x11, 0x11}},
+-    {SDL_GAMEPAD_BUTTON_DPAD_UP, -1, "d-pad up", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x31, 0x31, 0x31}},
+-    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1, "d-pad down", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x33, 0x33, 0x33}},
+-    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1, "d-pad left", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x34, 0x34, 0x34}},
+-    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1, "d-pad right", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x32, 0x32, 0x32}},
++    {SDL_GAMEPAD_BUTTON_DPAD_UP, -1, "d-pad up", {WM_KEYDOWN, WM_KEYDOWN, 0}, {0x31, 0x31, 0}},
++    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, -1, "d-pad down", {WM_KEYDOWN, WM_KEYDOWN, 0}, {0x33, 0x33, 0}},
++    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, -1, "d-pad left", {WM_KEYDOWN, WM_KEYDOWN, 0}, {0x34, 0x34, 0}},
++    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1, "d-pad right", {WM_KEYDOWN, WM_KEYDOWN, 0}, {0x32, 0x32, 0}},
+     {SDL_GAMEPAD_BUTTON_TOUCHPAD, -1, "touchpad", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
+     {SDL_GAMEPAD_BUTTON_MISC1, -1, "share", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
+     {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", {WM_RBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONDOWN}, {2, 2, 2}},
+-    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", {WM_LBUTTONDOWN, WM_LBUTTONDOWN, WM_LBUTTONDOWN}, {1, 1, 1}},
++    {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", {WM_LBUTTONDOWN, WM_LBUTTONDOWN, 0}, {1, 1, 0}},
+ };
+ 
+ static void press(SDL_JoystickID id, int i, int down)
+@@ -1004,6 +1005,12 @@ static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, in
+         press(id, (int)i, 1);
+         padpump(s, d, 10);
+         snprintf(name, sizeof name, "%s %s press", mn, k_padmap[i].name);
++        if (!msg) {
++            check(s_n == 0, name, "%s", dump());
++            press(id, (int)i, 0);
++            padpump(s, d, 10);
++            continue;
++        }
+         /* Escape also gives its WM_CHAR, so only the first message is held to. */
+         check(s_n >= 1 && s_n <= 2 && s_m[0].msg == msg && (msg == WM_MOUSEWHEEL || s_m[0].wp == wp), name, "%s", dump());
+         s_n = 0;
+@@ -1107,6 +1114,65 @@ static void rstick(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int x, i
+     padpump(s, d, 10);
+ }
+ 
++/* A fake dialogue HUD in guest memory, laid out as the game's: the
++   selector finds it through dialogue_va as the pump's probe would. */
++#define FAKE_VA 0x30000000u
++#define FAKE_SIZE 0x5A84u
++#define DIALOGUE_HISTORY_OFF 0x1B2u
++#define DIALOGUE_SINGLE_OFF 0x1B3u
++#define DIALOGUE_ACTIVE_OFF 0x1B4u
++#define DIALOGUE_COUNT_OFF 0x1228u
++#define DIALOGUE_TEXT_OFF 0x122Cu
++#define DIALOGUE_TYPE_OFF 0x322Cu
++#define DIALOGUE_FLAGS_OFF 0x323Cu
++#define DIALOGUE_PICK_OFF 0x5A80u
++
++static const char *const k_pad_answer[RT_DLG_SLOTS] = {"Who are you?", "What is this place?", "Go on.", "Goodbye."};
++static char s_fake[RT_DLG_SLOTS][RT_DLG_TEXT];
++
++static char *fake_slot(int i) { return (char *)rt_host(FAKE_VA + DIALOGUE_TEXT_OFF + (uint32_t)i * RT_DLG_TEXT); }
++
++static void fake8(uint32_t off, uint8_t v) { *(uint8_t *)rt_host(FAKE_VA + off) = v; }
++
++static void fake32(uint32_t off, uint32_t v) { memcpy(rt_host(FAKE_VA + off), &v, sizeof v); }
++
++/* As the game's Q_strncpy writes a slot: the text, then zeros. */
++static void fake_text(int i, const char *t)
++{
++    memset(s_fake[i], 0, RT_DLG_TEXT);
++    strncpy(s_fake[i], t, RT_DLG_TEXT - 1);
++    memcpy(fake_slot(i), s_fake[i], RT_DLG_TEXT);
++}
++
++static void fake_open(int32_t count)
++{
++    memset(rt_host(FAKE_VA), 0, FAKE_SIZE);
++    fake8(DIALOGUE_ACTIVE_OFF, 1);
++    fake32(DIALOGUE_COUNT_OFF, (uint32_t)count);
++    for (int i = 0; i < RT_DLG_SLOTS; i++) {
++        fake_text(i, k_pad_answer[i]);
++        fake32(DIALOGUE_TYPE_OFF + 4u * (uint32_t)i, (uint32_t)i + 1);
++    }
++}
++
++/* The slot showing the marker over its own text, or -1. */
++static int marked(void)
++{
++    for (int i = 0; i < RT_DLG_SLOTS; i++) {
++        const char *t = fake_slot(i);
++        if (t[0] == '>' && t[1] == ' ' && !strncmp(t + 2, s_fake[i], RT_DLG_TEXT - 3)) return i;
++    }
++    return -1;
++}
++
++/* Every slot but the one given holds the game's own bytes. */
++static int fake_clean_except(int keep)
++{
++    for (int i = 0; i < RT_DLG_SLOTS; i++)
++        if (i != keep && memcmp(fake_slot(i), s_fake[i], RT_DLG_TEXT)) return 0;
++    return 1;
++}
++
+ static void pad_dialogue(void)
+ {
+     rt_input_state s;
+@@ -1123,87 +1189,77 @@ static void pad_dialogue(void)
+ 
+     /* Entry from the probe's flag; a stick already looking, and the left
+        stick walking, as the dialogue opens. */
++    fake_open(3);
+     rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, -32767);
+     rstick(&s, &d, id, 0, -32767);
+     s_n = 0;
+     s.dialogue = 1;
++    s.dialogue_va = FAKE_VA;
+     padpump(&s, &d, 10);
+     check(rt_input_pad_mode(&s) == RT_PAD_DIALOGUE && d.pad.mode == RT_PAD_DIALOGUE, "the dialogue flag enters dialogue mode", "mode %d",
+           d.pad.mode);
+     /* The last look's move is flushed ahead of the key. */
+     int k1 = s_n == 2 && s_m[0].msg == WM_MOUSEMOVE;
+-    check((s_n == 1 || k1) && s_m[k1].msg == WM_KEYUP && s_m[k1].wp == 0x57,
+-          "entering a dialogue lifts the walk key and picks nothing for a stick already pushed", "%s", dump());
++    check((s_n == 1 || k1) && s_m[k1].msg == WM_KEYUP && s_m[k1].wp == 0x57, "entering a dialogue lifts the walk key", "%s", dump());
++    check(marked() == -1, "nothing is highlighted when a dialogue opens", "slot %d", marked());
+     s_n = 0;
+     int32_t lx = s.x, ly = s.y;
+     for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
+-    check(s_n == 0 && s.x == lx && s.y == ly, "a stick held since before the dialogue never picks, and neither stick looks or walks",
+-          "%s at %d,%d", dump(), s.x, s.y);
++    check(s_n == 0 && s.x == lx && s.y == ly && marked() == -1,
++          "a stick held since before the dialogue never steps, and neither stick looks or walks", "%s at %d,%d slot %d", dump(), s.x, s.y,
++          marked());
+     rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_LEFTY, 0);
+     rstick(&s, &d, id, 0, 0);
+     check(s_n == 0, "centring the stick sends nothing", "%s", dump());
+ 
+-    /* Each flick is its number key, laid out as the d-pad, once per push:
+-       held for half a second it neither repeats nor moves anything. */
++    /* Up and down flicks step and clamp; the first move marks the first
++       answer whichever way it goes. Nothing reaches the game. */
+     static const struct {
+-        int x, y;
+-        uint32_t vk;
++        int x, y, want;
+         const char *name;
+-    } k_flick[] = {{0, -32767, 0x31, "up is 1"},     {32767, 0, 0x32, "right is 2"}, {0, 32767, 0x33, "down is 3"},
+-                   {-32767, 0, 0x34, "left is 4"},   {9000, -30000, 0x31, "a diagonal goes to the axis further out (1)"},
+-                   {20000, -30000, 0x31, "a diagonal past half tilt on both axes still goes to the further (1)"},
+-                   {-30000, 20000, 0x34, "a diagonal goes to the axis further out (4)"}};
+-    char name[96];
++    } k_flick[] = {{0, -32767, 0, "the first move, up, marks the first answer"},
++                   {0, -32767, 0, "up at the first answer stays there"},
++                   {0, 32767, 1, "down steps to the second"},
++                   {9000, 30000, 2, "a diagonal goes to the axis further out (down)"},
++                   {0, 32767, 2, "down at the last answer stays there"},
++                   {-30000, -20000, 2, "a diagonal further out to the left does nothing"},
++                   {32767, 0, 2, "right does nothing"},
++                   {20000, -30000, 1, "a diagonal past half tilt on both axes goes to the further (up)"}};
+     for (size_t i = 0; i < sizeof k_flick / sizeof *k_flick; i++) {
+         s_n = 0;
+         rstick(&s, &d, id, k_flick[i].x, k_flick[i].y);
+-        snprintf(name, sizeof name, "dialogue flick %s", k_flick[i].name);
+-        check(s_n >= 1 && s_n <= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == k_flick[i].vk, name, "%s", dump());
+-        s_n = 0;
+-        for (int f = 0; f < 50; f++) padpump(&s, &d, 10);
+-        snprintf(name, sizeof name, "dialogue flick %s, held, does not repeat", k_flick[i].name);
+-        check(s_n == 0, name, "%s", dump());
+         rstick(&s, &d, id, 0, 0);
+-        snprintf(name, sizeof name, "dialogue flick %s, released, lifts the key the game picks on", k_flick[i].name);
+-        check(msgs_are(WM_KEYUP, k_flick[i].vk, 1), name, "%s", dump());
++        check(marked() == k_flick[i].want && s_n == 0, k_flick[i].name, "slot %d %s", marked(), dump());
+     }
+-    check((d.pad.logged[RT_PAD_DIALOGUE] >> RT_PAD_FLICK_UP & 0xFu) == 0xFu && !(d.pad.logged[RT_PAD_PLAY] >> RT_PAD_FLICK_UP & 0xFu),
+-          "each flick's first press is logged in dialogue", "%X", d.pad.logged[RT_PAD_DIALOGUE]);
++    check(fake_clean_except(1), "a move restores the answer it leaves", "slot texts changed");
++    check(((d.pad.logged[RT_PAD_DIALOGUE] >> RT_PAD_FLICK_UP) & 0x5u) == 0x5u && !((d.pad.logged[RT_PAD_PLAY] >> RT_PAD_FLICK_UP) & 0xFu),
++          "the up and down flicks' first presses are logged in dialogue", "%X", d.pad.logged[RT_PAD_DIALOGUE]);
+ 
+     /* Hysteresis: past half tilt fires, easing back to a third holds, and
+        only under the dead zone lets go. */
+-    s_n = 0;
+-    rstick(&s, &d, id, 0, -14000);
+-    check(s_n == 0, "a flick short of half tilt does not fire", "%s", dump());
++    rstick(&s, &d, id, 0, 14000);
++    check(marked() == 1, "a flick short of half tilt does not step", "slot %d", marked());
++    rstick(&s, &d, id, 0, 20000);
++    check(marked() == 2, "past half tilt it steps", "slot %d", marked());
+     rstick(&s, &d, id, 0, -20000);
+-    check(s_n >= 1 && s_m[0].wp == 0x31, "past half tilt it fires", "%s", dump());
+-    s_n = 0;
+-    rstick(&s, &d, id, 0, -11000);
+-    check(s_n == 0, "easing back above the release mark holds the key", "%s", dump());
+-    rstick(&s, &d, id, 0, -5000);
+-    check(msgs_are(WM_KEYUP, 0x31, 1), "under the release mark it lets go", "%s", dump());
+-    rstick(&s, &d, id, 0, 0);
+-
+-    /* Swinging from one flick to the next without centring picks once:
+-       the second answer needs the stick back first. */
+-    s_n = 0;
+-    rstick(&s, &d, id, 0, -32767);
+-    rstick(&s, &d, id, 32767, -4000);
+-    rstick(&s, &d, id, 32767, 0);
+-    check(s_n == 2 + (s_m[1].msg == WM_CHAR) && s_m[0].wp == 0x31 && s_m[s_n - 1].msg == WM_KEYUP && s_m[s_n - 1].wp == 0x31,
+-          "a swing from up to right without centring picks only 1", "%s", dump());
+-    s_n = 0;
+-    rstick(&s, &d, id, 0, 0);
+-    rstick(&s, &d, id, 32767, 0);
+-    check(s_n >= 1 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x32, "after centring the next flick picks", "%s", dump());
+-    s_n = 0;
++    check(marked() == 2, "swinging through without centring does not step", "slot %d", marked());
++    rstick(&s, &d, id, 0, 11000);
++    check(marked() == 2, "easing back above the release mark holds", "slot %d", marked());
++    rstick(&s, &d, id, 0, 5000);
++    rstick(&s, &d, id, 0, -20000);
++    check(marked() == 1, "under the release mark it lets go, and the next flick steps", "slot %d", marked());
+     rstick(&s, &d, id, 0, 0);
+ 
+-    /* The buttons in a dialogue. */
++    /* The buttons in a dialogue with no panel to step: the fallbacks. */
++    s.dialogue_va = 0;
++    padpump(&s, &d, 10);
++    check(marked() == 1 && !s.sel.lit, "a panel that goes away ends the highlight and is not written", "slot %d lit %d", marked(), s.sel.lit);
++    fake_open(3);
+     pad_map_mode(&s, &d, id, RT_PAD_DIALOGUE);
++    s.dialogue_va = FAKE_VA;
+ 
+     /* A menu opened over a dialogue takes the cursor; its close gives the
+-       flicks back. */
++       stick back. */
+     s.cursor = 0x00007F00u;
+     rt_input_relative_update(&s);
+     s_n = 0;
+@@ -1216,25 +1272,30 @@ static void pad_dialogue(void)
+     check(s.y < 512 && x0 == s.x, "over a dialogue the right stick moves the menu cursor", "%d,%d", s.x, s.y);
+     int keyed = 0;
+     for (int i = 0; i < s_n; i++) keyed |= s_m[i].msg == WM_KEYDOWN;
+-    check(!keyed, "and sends no number key", "%s", dump());
++    check(!keyed && marked() == -1, "and sends no number key nor steps", "%s", dump());
+     s.cursor = 0;
+     rt_input_relative_update(&s);
+     s_n = 0;
+     padpump(&s, &d, 10);
+-    check(d.pad.mode == RT_PAD_DIALOGUE && s_n == 0, "the menu closing returns to dialogue, unarmed", "mode %d %s", d.pad.mode, dump());
++    check(d.pad.mode == RT_PAD_DIALOGUE && s_n == 0 && marked() == -1, "the menu closing returns to dialogue, unarmed", "mode %d %s",
++          d.pad.mode, dump());
+     rstick(&s, &d, id, 0, 0);
+ 
+-    /* Exit with a flick held lifts its key, and play looks again. */
++    /* Exit with the stick held sends nothing, and play looks again. */
++    rstick(&s, &d, id, 0, 32767);
++    check(marked() == 0, "a flick marks the first answer again", "slot %d", marked());
++    rstick(&s, &d, id, 0, 0);
+     rstick(&s, &d, id, -32767, 0);
+     s_n = 0;
++    fake8(DIALOGUE_ACTIVE_OFF, 0);
+     s.dialogue = 0;
+     padpump(&s, &d, 10);
+-    check(d.pad.mode == RT_PAD_PLAY && s_n >= 1 && s_m[0].msg == WM_KEYUP && s_m[0].wp == 0x34,
+-          "the dialogue closing lifts a held flick's key", "mode %d %s", d.pad.mode, dump());
++    check(d.pad.mode == RT_PAD_PLAY && s_n == 0, "the dialogue closing with a flick held sends nothing", "mode %d %s", d.pad.mode, dump());
++    check(marked() == -1 && fake_clean_except(-1) && !s.sel.lit, "the dialogue closing restores the marked answer", "slot %d", marked());
+     s_n = 0;
+     int32_t px = s.x;
+     for (int i = 0; i < 5; i++) padpump(&s, &d, 10);
+-    check(s.x < px && s_n == 0, "after the dialogue the right stick looks again and picks nothing", "%d -> %d %s", px, s.x, dump());
++    check(s.x < px && s_n == 0, "after the dialogue the right stick looks again and steps nothing", "%d -> %d %s", px, s.x, dump());
+     rstick(&s, &d, id, 0, 0);
+ 
+     /* Lost focus is not a dialogue. */
+@@ -1243,6 +1304,272 @@ static void pad_dialogue(void)
+     check(rt_input_pad_mode(&s) == RT_PAD_PLAY, "without focus the dialogue flag is ignored", "%d", rt_input_pad_mode(&s));
+     s.focus = 1;
+     s.dialogue = 0;
++    s.dialogue_va = 0;
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
++/* A d-pad press of one pump and its release. */
++static void dpad(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int b)
++{
++    rt_pad_test_button(id, b, 1);
++    padpump(s, d, 10);
++    rt_pad_test_button(id, b, 0);
++    padpump(s, d, 10);
++}
++
++static void tap(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, int i)
++{
++    press(id, i, 1);
++    padpump(s, d, 10);
++    press(id, i, 0);
++    padpump(s, d, 10);
++}
++
++/* Where msg with wparam wp sits in what was sent, or -1. */
++static int sent_at(uint32_t msg, uint32_t wp)
++{
++    for (int i = 0; i < s_n; i++)
++        if (s_m[i].msg == msg && s_m[i].wp == wp) return i;
++    return -1;
++}
++
++static int sent_any(uint32_t msg)
++{
++    for (int i = 0; i < s_n; i++)
++        if (s_m[i].msg == msg) return 1;
++    return 0;
++}
++
++enum { PM_CROSS = 0, PM_CIRCLE = 1, PM_R2 = 17 };
++
++/* The answer highlight on a fake HUD in guest memory: what it writes,
++   what it puts back on every path, and what it sends the game. */
++static void pad_answers(void)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach("DualSense Wireless Controller");
++    fake_open(4);
++    s.dialogue = 1;
++    s.dialogue_va = FAKE_VA;
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    check(!strcmp(k_pad_answer[2], "Go on.") && !strcmp(fake_slot(2), "Go on."), "the fake panel holds its answers", "'%s'", fake_slot(2));
++
++    /* The marker is the game's own text with "> " in front, read by the
++       draw as "%d. %s" on its next frame. */
++    s_n = 0;
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == 0 && !strcmp(fake_slot(0), "> Who are you?") && s_n == 0, "d-pad down marks the first answer in its own text",
++          "'%s' %s", fake_slot(0), dump());
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == 2 && fake_clean_except(2), "d-pad down steps and restores what it leaves", "slot %d", marked());
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_UP);
++    check(marked() == 1 && fake_clean_except(1), "d-pad up steps back", "slot %d", marked());
++    check(s.sel.log_dirty, "a quick second move waits to be logged", "%d", s.sel.log_dirty);
++    for (int i = 0; i < 30; i++) padpump(&s, &d, 10);
++    check(!s.sel.log_dirty, "and is logged once the pause is over", "%d", s.sel.log_dirty);
++
++    /* Repeat: one step on the push, the next at 0.4 s, then every 0.15 s. */
++    tap(&s, &d, id, PM_CIRCLE);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_DPAD_DOWN, 1);
++    padpump(&s, &d, 10);
++    check(marked() == 0, "a held step moves once on the push", "slot %d", marked());
++    for (int i = 0; i < 39; i++) padpump(&s, &d, 10);
++    check(marked() == 0, "and not again before 0.4 s", "slot %d", marked());
++    padpump(&s, &d, 10);
++    check(marked() == 1, "it repeats at 0.4 s", "slot %d", marked());
++    for (int i = 0; i < 14; i++) padpump(&s, &d, 10);
++    check(marked() == 1, "and not again before another 0.15 s", "slot %d", marked());
++    padpump(&s, &d, 10);
++    check(marked() == 2, "then every 0.15 s", "slot %d", marked());
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    check(marked() == 3 && fake_clean_except(3), "held, it stops at the last answer", "slot %d", marked());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0);
++    padpump(&s, &d, 10);
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTY, -32767);
++    padpump(&s, &d, 10);
++    for (int i = 0; i < 40; i++) padpump(&s, &d, 10);
++    check(marked() == 1, "a held stick repeats the same way", "slot %d", marked());
++    rt_pad_test_axis(id, SDL_GAMEPAD_AXIS_RIGHTY, 0);
++    padpump(&s, &d, 10);
++
++    /* A d-pad held as a menu opens over the dialogue stops repeating. */
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_DPAD_DOWN, 1);
++    padpump(&s, &d, 10);
++    s.cursor = 0x00007F00u;
++    rt_input_relative_update(&s);
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    check(marked() == 2, "a held step does not repeat under a menu", "slot %d", marked());
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_DPAD_DOWN, 0);
++    padpump(&s, &d, 10);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    padpump(&s, &d, 10);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_UP);
++    check(marked() == 1, "and the highlight is still there after the menu", "slot %d", marked());
++
++    /* Cross confirms: the text first goes back, then the number key is
++       pressed and released, and the highlight is gone. */
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    s_n = 0;
++    press(id, PM_CROSS, 1);
++    padpump(&s, &d, 10);
++    int kd = sent_at(WM_KEYDOWN, 0x32), ku = sent_at(WM_KEYUP, 0x32);
++    check(kd >= 0 && ku > kd && sent_at(WM_KEYDOWN, 0x20) < 0 && marked() == -1 && fake_clean_except(-1) && !s.sel.lit,
++          "Cross on the second answer restores it and sends 2 down and up", "%s slot %d", dump(), marked());
++    s_n = 0;
++    press(id, PM_CROSS, 0);
++    padpump(&s, &d, 10);
++    check(s_n == 0, "Cross let go after a confirm sends nothing", "%s", dump());
++
++    /* The game ignores a pick within 0.5 s of the last, so a confirm
++       that soon is held back and keeps its highlight. */
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(s_n == 0 && marked() == 0 && s.sel.held == 1, "a confirm within 0.5 s of the last pick sends nothing and keeps the mark",
++          "%s slot %d", dump(), marked());
++    for (int i = 0; i < 50; i++) padpump(&s, &d, 10);
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(sent_at(WM_KEYDOWN, 0x31) >= 0 && sent_at(WM_KEYUP, 0x31) >= 0 && marked() == -1, "past 0.5 s it confirms the first answer",
++          "%s", dump());
++    /* A pick the game made itself (keyboard, continue) is seen by its
++       time changing, and starts the guard too. */
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake32(DIALOGUE_PICK_OFF, 0x42C80000u);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    tap(&s, &d, id, PM_R2);
++    check(s_n == 0 && marked() == 0, "a pick the game made starts the guard as well", "%s slot %d", dump(), marked());
++    for (int i = 0; i < 50; i++) padpump(&s, &d, 10);
++
++    /* RT confirms without the click that would open the history. */
++    s_n = 0;
++    tap(&s, &d, id, PM_R2);
++    check(sent_at(WM_KEYDOWN, 0x31) >= 0 && !sent_any(WM_LBUTTONDOWN) && marked() == -1, "RT confirms and does not click", "%s", dump());
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    s_n = 0;
++    tap(&s, &d, id, PM_R2);
++    check(s_n == 0, "RT with nothing marked sends nothing", "%s", dump());
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(sent_at(WM_KEYDOWN, 0x20) >= 0 && sent_at(WM_KEYUP, 0x20) >= 0, "Cross with nothing marked is space, the game's continue", "%s",
++          dump());
++
++    /* Circle's two meanings. */
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    s_n = 0;
++    tap(&s, &d, id, PM_CIRCLE);
++    check(s_n == 0 && marked() == -1 && fake_clean_except(-1), "Circle clears the mark and restores the text, sending nothing", "%s",
++          dump());
++    s_n = 0;
++    tap(&s, &d, id, PM_CIRCLE);
++    check(sent_at(WM_KEYDOWN, 0x1B) >= 0, "Circle with nothing marked is Escape", "%s", dump());
++
++    /* Every way the answers can change under the mark. */
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake32(DIALOGUE_COUNT_OFF, 3);
++    padpump(&s, &d, 10);
++    check(marked() == -1 && fake_clean_except(-1) && !s.sel.lit, "a count change clears the mark and restores the text", "slot %d",
++          marked());
++    fake32(DIALOGUE_COUNT_OFF, 4);
++    padpump(&s, &d, 10);
++
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake8(DIALOGUE_HISTORY_OFF, 1);
++    padpump(&s, &d, 10);
++    check(marked() == -1 && fake_clean_except(-1) && !s.sel.lit, "opening the history clears the mark and restores the text", "slot %d",
++          marked());
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == -1 && !s.sel.lit, "nothing is marked while the history shows", "slot %d", marked());
++    fake8(DIALOGUE_HISTORY_OFF, 0);
++    fake8(DIALOGUE_SINGLE_OFF, 1);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == -1 && !s.sel.lit, "nothing is marked in single-line mode", "slot %d", marked());
++    fake8(DIALOGUE_SINGLE_OFF, 0);
++
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake32(DIALOGUE_TYPE_OFF + 4 * 3, 9);
++    padpump(&s, &d, 10);
++    check(marked() == -1 && fake_clean_except(-1) && !s.sel.lit, "a type change clears the mark and restores the text", "slot %d",
++          marked());
++    fake32(DIALOGUE_TYPE_OFF + 4 * 3, 4);
++
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake_text(3, "Never mind.");
++    padpump(&s, &d, 10);
++    check(marked() == -1 && fake_clean_except(-1) && !s.sel.lit, "another answer's text changing clears the mark and restores the text",
++          "slot %d", marked());
++
++    /* The game writes the marked slot: with a new answer it is left as
++       the game wrote it, with the same answer the mark comes back. */
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake_text(0, "Something else.");
++    padpump(&s, &d, 10);
++    check(!s.sel.lit && !strcmp(fake_slot(0), "Something else."), "a new text in the marked slot clears the mark and is kept", "'%s'",
++          fake_slot(0));
++    fake_text(0, k_pad_answer[0]);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake_text(0, k_pad_answer[0]);
++    padpump(&s, &d, 10);
++    check(s.sel.lit && marked() == 0 && s.sel.reapplies == 1, "the same text written back over the mark gets the mark again", "slot %d %u",
++          marked(), s.sel.reapplies);
++    tap(&s, &d, id, PM_CIRCLE);
++    check(fake_clean_except(-1), "and still restores cleanly", "slot %d", marked());
++
++    /* A text at the buffer's limit keeps its NUL; the restore gives back
++       every byte. */
++    static char longest[0x800];
++    memset(longest, 'a', sizeof longest - 1);
++    fake_text(1, longest);
++    uint8_t before[0x800];
++    memcpy(before, fake_slot(1), sizeof before);
++    padpump(&s, &d, 10);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(marked() == 1 && strnlen(fake_slot(1), 0x800) == 0x7FF && !strncmp(fake_slot(1), "> aaa", 5),
++          "a full length answer is marked within its 0x800 bytes", "len %zu", strnlen(fake_slot(1), 0x800));
++    tap(&s, &d, id, PM_CIRCLE);
++    check(!memcmp(before, fake_slot(1), sizeof before), "and restored byte for byte", "differs");
++
++    /* More answers than the game's four: stepping follows the count, the
++       slots past four are not written, and their keys are refused rather
++       than picking a wrong answer. */
++    fake_open(6);
++    for (int i = 0; i < 60; i++) padpump(&s, &d, 10);
++    for (int i = 0; i < 6; i++) dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    check(s.sel.lit && s.sel.idx == 5 && marked() == -1 && fake_clean_except(-1), "stepping follows a count past four", "idx %d slot %d",
++          s.sel.idx, marked());
++    s_n = 0;
++    tap(&s, &d, id, PM_CROSS);
++    check(s_n == 0 && s.sel.lit, "a confirm past the game's four keys is refused", "%s", dump());
++    tap(&s, &d, id, PM_CIRCLE);
++
++    /* Closing clears and restores; the next dialogue starts unmarked. */
++    fake_open(2);
++    padpump(&s, &d, 10);
++    dpad(&s, &d, id, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
++    fake8(DIALOGUE_ACTIVE_OFF, 0);
++    s.dialogue = 0;
++    padpump(&s, &d, 10);
++    check(!s.sel.lit && fake_clean_except(-1), "closing the dialogue restores the text", "slot %d", marked());
++    fake8(DIALOGUE_ACTIVE_OFF, 1);
++    s.dialogue = 1;
++    padpump(&s, &d, 10);
++    check(marked() == -1 && !s.sel.lit, "a dialogue opening again starts unmarked", "slot %d", marked());
++
++    s.dialogue = 0;
++    s.dialogue_va = 0;
+     rt_pad_test_detach(id);
+     padpump(&s, &d, 10);
+ }
+@@ -1314,7 +1641,8 @@ static void pad_controls(void)
+         return;
+     }
+     fputs("# test\nmenu.south=space\nmenu.east=play\nwest=r\nmenu.dpup=up\ntouchpad=none\ncursor_speed=800\ncursor_power=2\n"
+-          "menu.bogus=x\nmenu.north=notakey\ndialogue.flickleft=5\ndialogue.east=play\ndialogue.flickup=nokey\n",
++          "menu.bogus=x\nmenu.north=notakey\ndialogue.flickleft=5\ndialogue.east=play\ndialogue.flickup=nokey\n"
++          "dialogue.dpdown=answerup\ndialogue.dpup=answerup/space\n",
+           f);
+     fclose(f);
+     rt_pad p;
+@@ -1322,7 +1650,7 @@ static void pad_controls(void)
+     unlink(path);
+     rmdir(dir);
+     const rt_pad_tgt *t = rt_pad_target(&p, 0, 1);
+-    check(bad == 3, "three bad controls lines are counted", "%d", bad);
++    check(bad == 4, "four bad controls lines are counted, a fallback on a step among them", "%d", bad);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "menu.south remaps Cross in menus only", "%d %d", t->kind, t->arg);
+     t = rt_pad_target(&p, 0, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
+@@ -1346,7 +1674,16 @@ static void pad_controls(void)
+     t = rt_pad_target(&p, 1, RT_PAD_MENU);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "menu.east=play still holds in menus", "%d", t->arg);
+     t = rt_pad_target(&p, RT_PAD_FLICK_UP, RT_PAD_DIALOGUE);
+-    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_1, "a bad dialogue target keeps the default flick", "%d", t->arg);
++    check(t->kind == RT_PADT_ANSWER_UP, "a bad dialogue target keeps the default flick", "%d", t->kind);
++    t = rt_pad_target(&p, 0, RT_PAD_DIALOGUE);
++    check(t->kind == RT_PADT_ANSWER && t->alt_kind == RT_PADT_KEY && t->alt_arg == SDL_SCANCODE_SPACE, "Cross confirms, else is space",
++          "%d %d %d", t->kind, t->alt_kind, t->alt_arg);
++    t = rt_pad_target(&p, RT_PAD_RT, RT_PAD_DIALOGUE);
++    check(t->kind == RT_PADT_ANSWER && t->alt_kind == RT_PADT_NONE, "RT confirms, else nothing", "%d %d", t->kind, t->alt_kind);
++    t = rt_pad_target(&p, 11, RT_PAD_DIALOGUE);
++    check(t->kind == RT_PADT_ANSWER_UP, "dialogue.dpdown=answerup reverses the d-pad", "%d", t->kind);
++    t = rt_pad_target(&p, RT_PAD_RT, RT_PAD_MENU);
++    check(t->kind == RT_PADT_MOUSE, "menus keep RT on the mouse", "%d", t->kind);
+     t = rt_pad_target(&p, RT_PAD_FLICK_UP, RT_PAD_PLAY);
+     check(t->kind == RT_PADT_NONE, "a flick is nothing outside a dialogue", "%d", t->kind);
+ }
+@@ -1372,7 +1709,11 @@ int rt_input_selftest(void)
+     pad_drive();
+     pad_curve();
+     pad_modes();
++    /* The answer highlight works on a fake HUD in guest memory, so this
++       one test needs the arena the game would have. */
++    rt_arena_use(rt_arena_new());
+     pad_dialogue();
++    pad_answers();
+     pad_controls();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 2ae7fdd..72fe72c 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -37,10 +37,9 @@ static const char *const k_default[RT_PAD_NBTN] = {"space", "e",      "i",    "f
+ /* Where menu and dialogue modes differ. In menus Cross clicks so the
+    Sense pair's thumb can work a screen without the trigger, Circle backs
+    out, and the triggers are pinned to the mouse so a play remap cannot
+-   take clicking away. The d-pad stays on 1 to 4 in every mode: dialogue
+-   answers are number keys, and the game binds the arrows to movement,
+-   which would walk the player behind the inventory panel. Anything not
+-   listed falls through to play. */
++   take clicking away. The d-pad stays on 1 to 4 in menus: the game binds
++   the arrows to movement, which would walk the player behind the
++   inventory panel. Anything not listed falls through to play. */
+ static const struct {
+     int mode, idx;
+     const char *target;
+@@ -51,19 +50,27 @@ static const struct {
+     {RT_PAD_MENU, RT_PAD_LT, "mouse2"},
+     {RT_PAD_MENU, RT_PAD_RT, "mouse1"},
+     /* The dialogue HUD (client CHudDialog::Key_Event) answers only to the
+-       number keys 1 to 4, picking on release, and has four answer slots;
+-       it takes no cursor, no hover and no arrows, so there is nothing to
+-       aim and no highlight to step. The right stick's four flicks send
+-       the keys directly, laid out as the d-pad already is, so a Sense
+-       pair and a gamepad read the same. Cross stays space: +jump is the
+-       game's own "continue" in a dialogue. Circle is Escape as in menus;
+-       the HUD ignores it and only the server's DialogCtrl closes a
+-       dialogue, so it cannot cut one short. */
+-    {RT_PAD_DIALOGUE, 1, "escape"},
+-    {RT_PAD_DIALOGUE, RT_PAD_FLICK_UP, "1"},
+-    {RT_PAD_DIALOGUE, RT_PAD_FLICK_RIGHT, "2"},
+-    {RT_PAD_DIALOGUE, RT_PAD_FLICK_DOWN, "3"},
+-    {RT_PAD_DIALOGUE, RT_PAD_FLICK_LEFT, "4"},
++       number keys, picking on release, and has no highlight of its own,
++       so input.c keeps one: the stick's up and down flicks and the d-pad
++       step it through the answers the game shows, and the answer is sent
++       as its number key on confirm. No answer sits on a fixed direction,
++       so a later lift of the game's four answer cut-off changes no
++       control. The answers are listed top to bottom in slot order, so up
++       is the lower slot. Cross confirms, else stays space: +jump is the
++       game's own "continue" in a dialogue. RT confirms and nothing else,
++       because mouse1 opens the history over the answers. Circle clears
++       the highlight, else is Escape as in menus; the HUD ignores Escape
++       and only the server's DialogCtrl closes a dialogue. Left and right
++       pick nothing. */
++    {RT_PAD_DIALOGUE, 0, "answer/space"},
++    {RT_PAD_DIALOGUE, 1, "answerclear/escape"},
++    {RT_PAD_DIALOGUE, RT_PAD_RT, "answer"},
++    {RT_PAD_DIALOGUE, 10, "answerup"},
++    {RT_PAD_DIALOGUE, 11, "answerdown"},
++    {RT_PAD_DIALOGUE, 12, "none"},
++    {RT_PAD_DIALOGUE, 13, "none"},
++    {RT_PAD_DIALOGUE, RT_PAD_FLICK_UP, "answerup"},
++    {RT_PAD_DIALOGUE, RT_PAD_FLICK_DOWN, "answerdown"},
+ };
+ 
+ static const char *const k_mode_names[RT_PAD_NMODES] = {"play", "menu", "dialogue"};
+@@ -98,8 +105,38 @@ const char *rt_pad_button_name(int idx) { return idx >= 0 && idx < RT_PAD_NBTN ?
+ 
+ const char *rt_pad_mode_name(int mode) { return mode >= 0 && mode < RT_PAD_NMODES ? k_mode_names[mode] : "?"; }
+ 
++static int parse_target(const char *v, rt_pad_tgt *t);
++
++/* answer and answerclear take an optional /target for when nothing is
++   highlighted; that target is a plain one, never another action. */
++static int parse_answer(const char *v, rt_pad_tgt *t)
++{
++    static const struct {
++        const char *name;
++        int kind;
++    } k_act[] = {{"answerup", RT_PADT_ANSWER_UP},
++                 {"answerdown", RT_PADT_ANSWER_DOWN},
++                 {"answerclear", RT_PADT_ANSWER_CLEAR},
++                 {"answer", RT_PADT_ANSWER}};
++    for (size_t i = 0; i < sizeof k_act / sizeof *k_act; i++) {
++        size_t n = strlen(k_act[i].name);
++        if (strncmp(v, k_act[i].name, n) || (v[n] && v[n] != '/')) continue;
++        *t = (rt_pad_tgt){k_act[i].kind, 0, RT_PADT_NONE, 0};
++        if (!v[n]) return 0;
++        rt_pad_tgt alt;
++        if (k_act[i].kind != RT_PADT_ANSWER && k_act[i].kind != RT_PADT_ANSWER_CLEAR) return -1;
++        if (parse_target(v + n + 1, &alt) || alt.kind > RT_PADT_WHEEL) return -1;
++        t->alt_kind = alt.kind;
++        t->alt_arg = alt.arg;
++        return 0;
++    }
++    return 1;
++}
++
+ static int parse_target(const char *v, rt_pad_tgt *t)
+ {
++    int a = parse_answer(v, t);
++    if (a <= 0) return a;
+     if (!strcmp(v, "none")) {
+         *t = (rt_pad_tgt){RT_PADT_NONE, 0};
+         return 0;
+@@ -121,6 +158,15 @@ static int parse_target(const char *v, rt_pad_tgt *t)
+ static const char *target_name(const rt_pad_tgt *t, char *b, size_t n)
+ {
+     const rt_key *k;
++    if (t->kind >= RT_PADT_ANSWER_UP) {
++        static const char *const k_act[] = {"answerup", "answerdown", "answer", "answerclear"};
++        const char *a = k_act[t->kind - RT_PADT_ANSWER_UP];
++        if (t->kind < RT_PADT_ANSWER || t->alt_kind == RT_PADT_NONE) return a;
++        char ab[16];
++        rt_pad_tgt alt = {t->alt_kind, t->alt_arg, RT_PADT_NONE, 0};
++        snprintf(b, n, "%s/%s", a, target_name(&alt, ab, sizeof ab));
++        return b;
++    }
+     switch (t->kind) {
+     case RT_PADT_KEY: k = rt_input_key((uint32_t)t->arg); return k ? k->name : "?";
+     case RT_PADT_MOUSE: snprintf(b, n, "mouse%d", t->arg == 1 ? 1 : t->arg == 3 ? 2 : 3); return b;
+@@ -295,6 +341,13 @@ static int emit(const rt_pad_tgt *t, int down, rt_pad_pt pt, SDL_Event *out, int
+     if (cap < 1 || t->kind == RT_PADT_NONE) return 0;
+     SDL_Event *e = out;
+     memset(e, 0, sizeof *e);
++    /* An action happens on the press; its release has nothing to undo. */
++    if (t->kind >= RT_PADT_ANSWER_UP) {
++        if (!down) return 0;
++        e->type = SDL_EVENT_USER;
++        e->user.code = RT_PAD_ACT_UP + (t->kind - RT_PADT_ANSWER_UP);
++        return 1;
++    }
+     switch (t->kind) {
+     case RT_PADT_KEY:
+         e->type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+@@ -326,7 +379,7 @@ static void log_first(rt_pad *p, int idx, const rt_pad_tgt *t)
+     uint32_t bit = 1u << idx;
+     if (p->logged[p->mode] & bit) return;
+     p->logged[p->mode] |= bit;
+-    char lab[24] = "", tb[16];
++    char lab[24] = "", tb[40];
+     if (k_sdl[idx] >= 0) {
+         int kind = rt_pad_kind();
+         SDL_GamepadButtonLabel l =
+@@ -338,17 +391,40 @@ static void log_first(rt_pad *p, int idx, const rt_pad_tgt *t)
+ }
+ 
+ /* A release sends what the press sent: Cross held as space when a menu
+-   opens must lift space, not click. */
++   opens must lift space, not click. An answer action with nothing
++   highlighted is its fallback for the whole press, so Cross pressed as
++   space lifts space even if a highlight appears before it is let go. */
+ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     if (idx < 0 || idx >= RT_PAD_NBTN || p->down[idx] == (down != 0)) return 0;
+     p->down[idx] = down != 0;
+     if (!down) return emit(&p->held[idx], 0, pt, out, cap);
+-    p->held[idx] = *rt_pad_target(p, idx, p->mode);
++    rt_pad_tgt t = *rt_pad_target(p, idx, p->mode);
++    if ((t.kind == RT_PADT_ANSWER || t.kind == RT_PADT_ANSWER_CLEAR) && !p->lit) t = (rt_pad_tgt){t.alt_kind, t.alt_arg, RT_PADT_NONE, 0};
++    p->held[idx] = t;
++    p->step_at[idx] = p->now_ns + RT_PAD_STEP_DELAY_NS;
+     log_first(p, idx, &p->held[idx]);
+     return emit(&p->held[idx], 1, pt, out, cap);
+ }
+ 
++/* A held step, stick or d-pad, repeats after a pause. Each repeat is
++   timed from the pump that sent it, not from the schedule, so a hitch
++   does not release a burst of steps at once. Only in a dialogue: a
++   d-pad held as a menu opens over one must not step the answers behind
++   the menu. */
++int rt_pad_repeat(rt_pad *p, SDL_Event *out, int cap)
++{
++    int n = 0;
++    if (p->mode != RT_PAD_DIALOGUE) return 0;
++    for (int i = 0; i < RT_PAD_NBTN && n < cap; i++) {
++        int k = p->held[i].kind;
++        if (!p->down[i] || (k != RT_PADT_ANSWER_UP && k != RT_PADT_ANSWER_DOWN) || p->now_ns < p->step_at[i]) continue;
++        p->step_at[i] = p->now_ns + RT_PAD_STEP_RATE_NS;
++        n += emit(&p->held[i], 1, (rt_pad_pt){0, 0}, out + n, cap - n);
++    }
++    return n;
++}
++
+ static int dir_key(rt_pad *p, int d, int on, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     if (p->dir[d] == on) return 0;
+@@ -360,7 +436,7 @@ static int dir_key(rt_pad *p, int d, int on, rt_pad_pt pt, SDL_Event *out, int c
+    that is further out wins, a held flick lets go only when its own axis
+    comes back under the release mark, and after entering a dialogue
+    nothing fires until the stick has been back to the centre: a player
+-   looking around as the dialogue opens must not pick an answer. */
++   looking around as the dialogue opens must not move the highlight. */
+ static int flick_of(rt_pad *p)
+ {
+     int ax = abs(p->rx), ay = abs(p->ry);
+@@ -375,10 +451,10 @@ static int flick_of(rt_pad *p)
+     return -1;
+ }
+ 
+-/* One press per flick and no repeat: the game picks on the key's
+-   release, so a held stick picks once, and a second answer needs the
+-   stick to come back first. Called once both axes are read, so a
+-   diagonal is judged whole rather than by whichever axis came first. */
++/* A flick is a press for as long as the stick is out, so a held flick
++   repeats as a held d-pad does (rt_pad_repeat). Called once both axes
++   are read, so a diagonal is judged whole rather than by whichever axis
++   came first. */
+ int rt_pad_flick(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap)
+ {
+     int f = p->mode == RT_PAD_DIALOGUE ? flick_of(p) : -1, n = 0;
+@@ -417,8 +493,8 @@ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, in
+     return n;
+ }
+ 
+-/* Leaving play lifts any held movement key, leaving a dialogue lifts a
+-   held flick's number key, and either way the carried fraction is
++/* Leaving play lifts any held movement key, leaving a dialogue lets go
++   of a held flick, and either way the carried fraction is
+    dropped: it was in the other mode's units. A dialogue starts unarmed,
+    so the stick that was looking has to centre before it can pick. */
+ int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap)
+@@ -486,8 +562,8 @@ void rt_pad_cursor_velocity(const rt_pad *p, int x, int y, double *vx, double *v
+     *vy = uy * s;
+ }
+ 
+-/* A dialogue neither looks nor moves a cursor: the right stick is its
+-   flicks, and the HUD has no pointer to move. */
++/* A dialogue neither looks nor moves a cursor: the right stick steps
++   the highlight, and the HUD has no pointer to move. */
+ void rt_pad_move(rt_pad *p, double dt, int *dx, int *dy)
+ {
+     if (p->mode == RT_PAD_PLAY) {
+@@ -629,11 +705,13 @@ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_
+         if (d->gp) d->last_ns = now_ns;
+         return n;
+     }
++    d->pad.now_ns = now_ns;
+     n += rt_pad_mode(&d->pad, mode, pt, out + n, cap - n);
+     for (int i = 0; i < RT_PAD_NBTN; i++)
+         if (k_sdl[i] >= 0) n += rt_pad_button(&d->pad, i, SDL_GetGamepadButton(d->gp, (SDL_GamepadButton)k_sdl[i]), pt, out + n, cap - n);
+     for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++) n += rt_pad_axis(&d->pad, a, SDL_GetGamepadAxis(d->gp, (SDL_GamepadAxis)a), pt, out + n, cap - n);
+     n += rt_pad_flick(&d->pad, pt, out + n, cap - n);
++    n += rt_pad_repeat(&d->pad, out + n, cap - n);
+     /* Real elapsed time, not whole milliseconds: at 120 Hz truncating to
+        8 ms would run the cursor 4% slow. Long stalls are capped so a
+        hitch does not fling it. */
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 8832f51..8248593 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -7,12 +7,18 @@
+ 
+ enum { RT_PAD_XBOX, RT_PAD_PLAYSTATION };
+ 
+-enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL };
++/* The answer kinds are the dialogue selector's own actions, not guest
++   input: the pad hands them to input.c as SDL user events, and the
++   selector there decides what the game is sent. */
++enum { RT_PADT_NONE, RT_PADT_KEY, RT_PADT_MOUSE, RT_PADT_WHEEL, RT_PADT_ANSWER_UP, RT_PADT_ANSWER_DOWN, RT_PADT_ANSWER, RT_PADT_ANSWER_CLEAR };
++
++/* The user event code of each answer action, and its button in data1. */
++enum { RT_PAD_ACT_UP = 1, RT_PAD_ACT_DOWN, RT_PAD_ACT_CONFIRM, RT_PAD_ACT_CLEAR };
+ 
+ /* The triggers keep 14 and 15 so controls.txt and the m9 rows read as
+    before; the touchpad and Xbox share button come after them. The four
+    flicks are the right stick pushed one way in a dialogue: buttons with
+-   no SDL source, so they map, release and log like any other. */
++   no SDL source, so they map, release, repeat and log like any other. */
+ enum { RT_PAD_LT = 14, RT_PAD_RT = 15, RT_PAD_TOUCHPAD = 16, RT_PAD_MISC1 = 17, RT_PAD_FLICK_UP = 18, RT_PAD_FLICK_RIGHT = 19,
+        RT_PAD_FLICK_DOWN = 20, RT_PAD_FLICK_LEFT = 21, RT_PAD_NBTN = 22 };
+ 
+@@ -33,6 +39,11 @@ enum { RT_PAD_PLAY, RT_PAD_MENU, RT_PAD_DIALOGUE, RT_PAD_NMODES };
+ #define RT_PAD_FLICK_OFF RT_PAD_DEAD
+ #define RT_PAD_MAX 4
+ 
++/* A held step repeats like a keyboard: a pause long enough that one push
++   moves one answer, then a pace a reader can follow. */
++#define RT_PAD_STEP_DELAY_NS 400000000ull
++#define RT_PAD_STEP_RATE_NS 150000000ull
++
+ /* The menu cursor, in guest client pixels per second at full tilt. At
+    the default power half tilt is about 18% of that, so an inventory slot
+    can be hit without overshooting and a full push still crosses the
+@@ -42,8 +53,11 @@ enum { RT_PAD_PLAY, RT_PAD_MENU, RT_PAD_DIALOGUE, RT_PAD_NMODES };
+ #define RT_PAD_CURSOR_DEAD 3000
+ #define RT_PAD_CURSOR_LEFT 0.5
+ 
++/* An answer or clear action falls back to alt when nothing is
++   highlighted, so Cross still continues and Circle still backs out. */
+ typedef struct {
+     int kind, arg;
++    int alt_kind, alt_arg;
+ } rt_pad_tgt;
+ 
+ typedef struct {
+@@ -62,6 +76,10 @@ typedef struct {
+     int mode;
+     uint32_t logged[RT_PAD_NMODES];
+     int flick, flick_armed;
++    /* Set by input.c before each poll: an answer is highlighted, so the
++       answer actions act rather than fall back. */
++    int lit;
++    uint64_t now_ns, step_at[RT_PAD_NBTN];
+     uint8_t down[RT_PAD_NBTN];
+     uint8_t dir[4];
+     int rx, ry, lx, ly;
+@@ -99,6 +117,7 @@ const rt_pad_tgt *rt_pad_target(const rt_pad *p, int idx, int mode);
+ int rt_pad_button(rt_pad *p, int idx, int down, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_axis(rt_pad *p, int axis, int value, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_flick(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
++int rt_pad_repeat(rt_pad *p, SDL_Event *out, int cap);
+ int rt_pad_mode(rt_pad *p, int mode, rt_pad_pt pt, SDL_Event *out, int cap);
+ int rt_pad_release(rt_pad *p, rt_pad_pt pt, SDL_Event *out, int cap);
+ void rt_pad_look(rt_pad *p, uint32_t ms, int *dx, int *dy);
+-- 
+2.54.0 (Apple Git-157)
+

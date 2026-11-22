@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 22:28:12 -0600
+Subject: [PATCH] runtime: the left trigger fires a power with f7, bound at
+ launch
+
+The game binds vdiscipline_last only to MOUSE2, and the client's mouse handler drops button changes the way it dropped the right trigger's (0025), so a power fired once and then not again. In play the left trigger now sends f7, and the runtime binds f7 to vdiscipline_last on the game's command line. Menus keep mouse2.
+---
+ runtime/input_selftest.c | 6 +++---
+ runtime/pad.c            | 7 +++++--
+ runtime/trace.c          | 5 ++++-
+ 3 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 95f4a2a..430c424 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1084,7 +1084,7 @@ static void pad_halves(void)
+     rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFTX, -32767);
+     rt_pad_test_axis(l, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 20000);
+     padpump(&s, &d, 10);
+-    check(s_n == 2 && has_msg(WM_KEYDOWN, 0x41) && has_msg(WM_RBUTTONDOWN, 0), "the late left half walks and takes L2", "%s", dump());
++    check(s_n == 2 && has_msg(WM_KEYDOWN, 0x41) && has_msg(WM_KEYDOWN, 0x76), "the late left half walks and takes L2", "%s", dump());
+ 
+     /* A pair arriving after its halves replaces them with no double
+        input: what both report held stays held, once. Buttons and sticks
+@@ -1095,7 +1095,7 @@ static void pad_halves(void)
+     rt_pad_test_axis(r, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0);
+     rt_pad_test_button(r, SDL_GAMEPAD_BUTTON_SOUTH, 1);
+     padpump(&s, &d, 10);
+-    check(s_n == 3 && has_msg(WM_RBUTTONUP, 0) && has_msg(WM_KEYUP, 0x0D) && has_msg(WM_KEYDOWN, 0x20),
++    check(s_n == 3 && has_msg(WM_KEYUP, 0x76) && has_msg(WM_KEYUP, 0x0D) && has_msg(WM_KEYDOWN, 0x20),
+           "the halves let go of both triggers and hold Cross", "%s", dump());
+     s_n = 0;
+     SDL_JoystickID lr = rt_pad_test_attach(SENSE_LR);
+@@ -1224,7 +1224,7 @@ static const struct {
+     {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, -1, "d-pad right", {WM_KEYDOWN, WM_KEYDOWN, 0}, {0x32, 0x32, 0}},
+     {SDL_GAMEPAD_BUTTON_TOUCHPAD, -1, "touchpad", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
+     {SDL_GAMEPAD_BUTTON_MISC1, -1, "share", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x52, 0x52}},
+-    {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", {WM_RBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONDOWN}, {2, 2, 2}},
++    {-1, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, "L2", {WM_KEYDOWN, WM_RBUTTONDOWN, WM_KEYDOWN}, {0x76, 2, 0x76}},
+     {-1, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, "R2", {WM_KEYDOWN, WM_LBUTTONDOWN, 0}, {0x0D, 1, 0}},
+ };
+ 
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 54e51f4..5477d58 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -34,9 +34,12 @@ static const int k_sdl[RT_PAD_NBTN] = {
+    mouse1: the client's mouse handler skips button changes while either
+    of two state flags is up but records them anyway, so a release that
+    lands then is lost and an automatic weapon empties its magazine. Keys
+-   skip that handler. Menus keep mouse1 below. */
++   skip that handler. Menus keep mouse1 below. LT in play is f7 for the
++   same reason: the game's only bind for vdiscipline_last is MOUSE2, which
++   that handler drops the same way, so a power fired once and then not
++   again; the runtime binds f7 to it at launch (trace.c). */
+ static const char *const k_default[RT_PAD_NBTN] = {"space", "e",      "i",    "f",    "c",    "escape", "wheeldown", "wheelup",
+-                                                   "l",     "lctrl",  "1",    "3",    "4",    "2",      "mouse2",    "return",
++                                                   "l",     "lctrl",  "1",    "3",    "4",    "2",      "f7",        "return",
+                                                    "r",     "r",      "none", "none", "none", "none"};
+ 
+ /* Where menu and dialogue modes differ. In menus Cross clicks so the
+diff --git a/runtime/trace.c b/runtime/trace.c
+index 3ffaafc..3f2b0bf 100644
+--- a/runtime/trace.c
++++ b/runtime/trace.c
+@@ -125,7 +125,10 @@ uint64_t rt_frames_start_ns(void) { return s_t12 ? s_t12 : s_t11 ? s_t11 : s_qui
+ 
+ static const char *const k_default_args[] = {"-window", "-w",     "1280",   "-h",    "1024",        "-dxlevel",
+                                              "90",      "-nojoy",   "-noip",  "-nolan", "-dev",
+-                                             "-condebug", "+mm_verbose", "1", "+echo", "M3_CONSOLE_READY"};
++                                             "-condebug", "+mm_verbose", "1", "+echo", "M3_CONSOLE_READY",
++                                             /* the pad's LT in play (pad.c): the game binds
++                                                vdiscipline_last only to MOUSE2 */
++                                             "+bind", "F7", "vdiscipline_last"};
+ 
+ const char *const *rt_default_args(int quiet, int *n)
+ {
