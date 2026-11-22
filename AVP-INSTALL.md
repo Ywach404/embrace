@@ -14,6 +14,8 @@ renderer and full-view stereo.
   and pointing) or any gamepad visionOS supports, such as a DualSense
 - Your own installed copy of Vampire: The Masquerade, Bloodlines for PC
   (see Game files)
+- Python 3 (the porter's build and `scripts/visionos-tree.sh` use it; the
+  one in Xcode's command line tools is enough)
 - Homebrew, with:
   `brew install meson ninja cmake pkg-config glslang sdl3 ffmpeg xcodegen`
 - About 10 GB of free disk space for the build
@@ -60,9 +62,14 @@ which is gitignored. Run every command from the checkout's root.
 
 3. **Produce Bloodlines Porter's native game build from your own legally
    obtained, installed copy**, following that project's documentation at
-   the pinned commit (v1.0.0, `dc88522`), with its output in
-   `build/s1-porter/all`. This repository's scripts read that folder and
-   nothing else of the game.
+   the pinned commit (v1.0.0, `dc88522`), in a Python environment with the
+   porter's pinned tools. Two settings this repository needs: write the
+   build's output to `build/s1-porter/all` in this checkout (the porter's
+   own default is elsewhere), and keep any helper files the porter
+   generates outside `third_party/bloodlines-porter`, since the scripts here
+   refuse a porter tree with local changes. The step is done when
+   `build/s1-porter/all` holds `modules.txt` and `link.c`. This
+   repository's scripts read that folder and nothing else of the game.
 
 4. **Build the Mac tree**: the porter with this repository's patch series
    applied (to a copy; `third_party/` is never written), the Metal renderer
@@ -91,6 +98,11 @@ which is gitignored. Run every command from the checkout's root.
    ```sh
    VTMB_TEAM=<your team id> app/visionos/build.sh signed
    ```
+
+   The first signed build registers your bundle identifier and the two
+   memory capabilities with Apple, so an Apple account in that team must be
+   signed in to Xcode (Settings, Accounts). The two entitlements need a
+   paid Apple Developer Program membership.
 
    The app is at
    `build/s3-visionos/app/DerivedData/Build/Products/Release-xros/XRHost.app`.
