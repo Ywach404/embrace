@@ -94,6 +94,7 @@ mtl_sc *mtl_sc_new(const void *code, uint32_t bytes, char *err, size_t errlen);
 void mtl_sc_free(mtl_sc *s);
 const mtl_sc_info *mtl_sc_get_info(const mtl_sc *s);
 const char *mtl_sc_hash(const mtl_sc *s); /* 32 hex digits of SHA-256 over the bytecode */
+const uint32_t *mtl_sc_tokens(const mtl_sc *s, size_t *n); /* the bytecode the handle keeps, n tokens */
 
 /* MSL for the shader, from the cache directory when one is given and it
    holds this hash, else translated now and written there. The entry

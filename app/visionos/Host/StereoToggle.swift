@@ -2,8 +2,8 @@ import Foundation
 import GameController
 
 /// Flips the immersive view between full-view stereo and the virtual screen:
-/// both thumbstick clicks pressed together on the pad, or F8 on a paired
-/// keyboard.
+/// both thumbstick clicks pressed together on the pad and let go within
+/// a moment, or F8 on a paired keyboard.
 ///
 /// The chord is one the game has no use for, and it is read here as well as
 /// by the game: SDL sees both clicks too, which the pad layer takes as two
@@ -23,6 +23,7 @@ final class StereoToggle: @unchecked Sendable {
 
     private var timer: DispatchSourceTimer?
     private var chordWasDown = false
+    private var chordSince: UInt64 = 0
     private var keyWasDown = false
 
     /// Called on the main thread once the space is open.
@@ -51,8 +52,14 @@ final class StereoToggle: @unchecked Sendable {
             if left.isPressed && right.isPressed { chord = true }
         }
         let key = GCKeyboard.coalesced?.keyboardInput?.button(forKeyCode: .F8)?.isPressed ?? false
-        // On the press, not while held, so holding the chord flips once.
-        if (chord && !chordWasDown) || (key && !keyWasDown) {
+        // The chord flips on its release after a quick press: held for a
+        // second and a half it opens the layout edit (LayoutEditor)
+        // instead, so it must not flip on the way there. F8 flips on its
+        // press.
+        let now = DispatchTime.now().uptimeNanoseconds
+        if chord && !chordWasDown { chordSince = now }
+        let quickRelease = !chord && chordWasDown && now - chordSince < 800_000_000
+        if quickRelease || (key && !keyWasDown) {
             let on = metal_d3d9_stereo_enabled() == 0
             metal_d3d9_stereo_enable(on ? 1 : 0)
             ScreenCompositor.log("stereo toggle: " + (on ? "full-view stereo" : "the virtual screen"))

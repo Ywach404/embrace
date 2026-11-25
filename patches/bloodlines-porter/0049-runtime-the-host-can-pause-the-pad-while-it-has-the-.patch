@@ -1,0 +1,79 @@
+From 35766bc2ea0938d20f8aa785fda7c5a75db0766f Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:52:45 -0600
+Subject: [PATCH] runtime: the host can pause the pad while it has the
+ controllers
+
+The host's layout edit uses the controllers' triggers, sticks and face
+buttons to move pieces of its own display. While it is open the pad sends
+the game nothing, and lets go of what was held as it opened, so the stick
+clicks that open it do not stay down in the game.
+---
+ runtime/host.h |  3 +++
+ runtime/pad.c  | 13 ++++++++++++-
+ runtime/pad.h  |  1 +
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 3cc700e..80c4a42 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -148,6 +148,9 @@ int rt_host_aim_hand(void);
+  * the pad takes it as that half's shoulder button. side: 0 left, 1 right.
+  * Any thread. */
+ void rt_host_pad_grip(int side, int down);
++/* While on, the pad sends the game no input, having let go of what was
++ * held: the host's layout edit has the controllers. Any thread. */
++void rt_host_pad_pause(int on);
+ /* Puts the guest's cursor at (u, v), 0 to 1 across its client area, where
+  * a controller's ray meets the menu's screen; the pad's stick leaves the
+  * cursor alone for a quarter second after. Any thread. */
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 4ac9d83..43acf6f 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -909,6 +909,13 @@ static atomic_int s_grip[2];
+ 
+ void rt_host_pad_grip(int side, int down) { atomic_store(&s_grip[side ? 1 : 0], down != 0); }
+ 
++/* The host's layout edit takes the controllers for itself while it is
++   open: the pad sends the game nothing, and lets go of whatever was held
++   as it opened, so the chord's own stick clicks do not stay down. */
++static atomic_int s_paused;
++
++void rt_host_pad_pause(int on) { atomic_store(&s_paused, on != 0); }
++
+ static uint32_t live(SDL_Gamepad *gp)
+ {
+     uint32_t b = 0;
+@@ -1101,10 +1108,14 @@ int rt_pad_poll(rt_pad_dev *d, int active, int mode, rt_pad_pt pt, uint64_t now_
+         drive(d, i, "used last");
+         drv = i;
+     }
+-    if (!d->gp || !active) {
++    int paused = atomic_load(&s_paused);
++    if (!d->gp || !active || paused) {
+         if (d->gp) d->last_ns = now_ns;
++        if (paused && d->gp && !d->paused) n += rt_pad_release(&d->pad, pt, out + n, cap - n);
++        d->paused = paused;
+         return n;
+     }
++    d->paused = 0;
+     d->pad.now_ns = now_ns;
+     n += rt_pad_mode(&d->pad, mode, pt, out + n, cap - n);
+     for (int i = 0; i < RT_PAD_NBTN; i++)
+diff --git a/runtime/pad.h b/runtime/pad.h
+index 3eb379d..c4ee34c 100644
+--- a/runtime/pad.h
++++ b/runtime/pad.h
+@@ -163,6 +163,7 @@ typedef struct {
+     rt_pad_slot slot[RT_PAD_MAX];
+     int nslots;
+     uint64_t last_ns;
++    int paused;
+ } rt_pad_dev;
+ 
+ int rt_pad_detect(SDL_GamepadType type, const char *name);
+-- 
+2.54.0 (Apple Git-157)
+

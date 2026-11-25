@@ -15,6 +15,15 @@ targets:
     sources:
       - path: Host
       - path: Assets.xcassets
+      # Our own gloves (assets/hands, made by its build_gloves.py), at the
+      # bundle's root where the compositor looks: the models with their
+      # textures inside, and their poses. Not the .blend or the script.
+      - path: ../../assets/hands/glove_right.usdz
+        buildPhase: resources
+      - path: ../../assets/hands/glove_left.usdz
+        buildPhase: resources
+      - path: ../../assets/hands/poses.json
+        buildPhase: resources
     configFiles:
       Debug: Link.xcconfig
       Release: Link.xcconfig

@@ -15,6 +15,9 @@
 #ifndef MTL_D3D9_H
 #define MTL_D3D9_H
 
+/* Palm vertex pairs kept per hand per frame (draw.m, arm_hands). */
+#define MTL_ARM_PAIRS 192
+
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -330,6 +333,38 @@ typedef struct mtl_device {
     int fv_cam_ok;
     int fv_vm_ever, fv_vm_state, fv_vm_run;
     uint32_t fv_sky_logs, fv_vm_logs, fv_screen_logs;
+    /* The third person aim (mtl_fv_aim): the frame's main view projection
+       and viewport from the scan of whichever list drew it, and where the
+       open list's Present is. Game thread only. */
+    float fv_aim_rows[4][4], fv_aim_vp[6];
+    int fv_aim_ok;
+    /* The arms' hands from their own draws (draw.m, arm_hands): the arm
+       textures the last scan found, this frame's bind pose hands from the
+       runtime (asked at the frame's first arm draw), and per hand the
+       pairs of a palm vertex's bind place and where the frame drew it in
+       the world. Game thread only. */
+    void *fv_arm_tex[2];
+    /* Every texture the arms have been drawn with this session: the arms
+       keep their materials whatever the weapon, so a draw on one of them
+       with skinning is the arms even in a frame whose scan has not run
+       yet, or with another shader (a muzzle flash's light). */
+    void *fv_arm_known[4];
+    int fv_arm_known_n;
+    int fv_arm_bind_asked, fv_arm_bind_mask;
+    float fv_arm_bind[32];
+    float fv_arm_a[2][MTL_ARM_PAIRS][3], fv_arm_b[2][MTL_ARM_PAIRS][3];
+    int fv_arm_n[2];
+    /* The first arm draw's own view projection, c8 to c11: the hands are
+       handed on through it so they land where full view shows the arms,
+       which have their own field of view. */
+    float fv_arm_rows[4][4];
+    int fv_arm_rows_ok;
+    /* The frame's first view model draw's rows and depth range (mtl_fv_scan),
+       for the scene depth's view model pixels. */
+    float fv_vm_rows[4][4], fv_vm_vp[2];
+    int fv_vm_ok;
+    uint32_t fv_present_off;
+    int fv_present_set;
     /* Textures the game copies the back buffer into (StretchRect), each
        retained: in stereo the right eye replays into twins of them, so an
        eye never reads the other's picture (Celerity's trail lays last
@@ -419,6 +454,7 @@ uint64_t mtl_submit(mtl_device *d, int present); /* closes the open list; return
 void mtl_wait_serial(mtl_device *d, uint64_t serial); /* closes the list if it is the open one, then waits */
 void mtl_drain(mtl_device *d);
 int mtl_threaded(const mtl_device *d);
+int mtl_frames_shot_soon(const mtl_device *d); /* a full view shot may take the frame being recorded */
 uint8_t *mtl_rec_base(mtl_device *d); /* the open list's commands, for an offset into it (moves as it grows) */
 
 /* draw.m */
@@ -427,6 +463,9 @@ void mtl_fill_draw(void);
    sky's world draws in it (full view puts them at infinity) and notes
    whether the frame drew a view model. cmds is the list's commands. */
 void mtl_fv_scan(mtl_device *d, uint8_t *cmds, int present);
+/* After the scan of the list with the Present: the third person aim into
+   its Present (draw.m). */
+void mtl_fv_aim(mtl_device *d, uint8_t *cmds);
 int mtl_draw_init(mtl_device *d);
 void mtl_draw_destroy(mtl_device *d);
 void mtl_draw_finish(mtl_device *d); /* saves the pipeline cache and logs its summary, keeping the device usable */

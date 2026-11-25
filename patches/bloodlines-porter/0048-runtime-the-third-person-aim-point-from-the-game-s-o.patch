@@ -1,0 +1,196 @@
+From 7b4dc598c6db7100b452dc6672ccd73302e795e2 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:42:59 -0600
+Subject: [PATCH] runtime: the third person aim point from the game's own sweep
+
+The camera's ray sat below the game's mark at every range, so the eye
+is the default again and the camera is the opt in (RT_AIM_FROM=camera).
+
+The eye's MASK_SHOT ray still met different things than the mark: the
+mark comes from CInput's camera think, which sweeps a 10 unit box 2000
+units from the eye along the player's eye angles (yaw moved by a
+setting) with mask 0x0600408B, skipping the local player, and hands the
+point to the active weapon. The runtime now calls that same function
+(client +0xFCEC0) with the same inputs at the frame's Present and gives
+the renderer its point, logging the eye ray's distance beside it.
+---
+ runtime/input.c | 130 +++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 112 insertions(+), 18 deletions(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 4df3f2a..34aa7d9 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1622,6 +1622,76 @@ int rt_player_aim_trace(const float eye[3], const float dir[3], float *t, int *h
+     return 1;
+ }
+ 
++/* The game's own third person aim point, from the very function that
++   finds it. CInput's camera think (client +0xFF1A0 on) takes the player's
++   eye (GetAbsOrigin, vtable +0x24, plus the view offset +0x148), the
++   player's eye angles (vtable +0x30C) with their yaw moved by a setting's
++   value (the object at client +0x4D2594: its vtable +0x4 says whether to
++   skip it, its float at +0x28 is the amount), and calls client +0xFCEC0
++   (eye, angles, far end, hit), which sweeps a 10 unit box (mins -5, maxs
++   5) 2000 units along those angles with mask 0x0600408B through a filter
++   that passes the local player, and writes where it stopped. That point
++   goes to the active weapon (+0x16C4, its vtable +0x1E8, through +0xFCCA0)
++   as where it aims: the mark. The ray-only MASK_SHOT trace from the eye
++   met different things (it passed the near taxi mirror the box catches,
++   and ran past 2000), so this calls the same function with the same
++   inputs and hands its point on. */
++#define CLIENT_AIM_SWEEP_RVA 0xFCEC0u
++#define CLIENT_YAW_SETTING_RVA 0x4D2594u
++#define PLAYER_EYE_ANGLES_VT 0x30Cu
++#define AIM_SWEEP_LEN 2000.0f
++
++int rt_player_mark_trace(float eye[3], float dir[3], float *t, int *hit, float ang_out[3])
++{
++    static uint32_t mem;
++    if (!aim_trace_on() || !rt_guest_call_ready()) return 0;
++    uint32_t slot = rt_hook_va("client", LOCAL_PLAYER_RVA), sweep = rt_hook_va("client", CLIENT_AIM_SWEEP_RVA);
++    uint32_t setting_slot = rt_hook_va("client", CLIENT_YAW_SETTING_RVA);
++    uint32_t player = slot ? panel32(slot) : 0;
++    if (!player || !sweep) return 0;
++    uint32_t angles_fn = panel32(panel32(player) + PLAYER_EYE_ANGLES_VT);
++    if (!angles_fn) return 0;
++    if (!mem && !(mem = rt_heap_alloc(0x40, 1))) return 0;
++    /* eye +0x00, angles +0x10, far end +0x20, hit +0x30 */
++    uint32_t e_va = mem, a_va = mem + 0x10, far_va = mem + 0x20, hit_va = mem + 0x30;
++    float o[3], v[3], a[3];
++    memcpy(o, rt_host(player + PLAYER_ABS_ORIGIN), sizeof o);
++    memcpy(v, rt_host(player + PLAYER_VIEW_OFFSET), sizeof v);
++    for (int i = 0; i < 3; i++) eye[i] = o[i] + v[i];
++    uint32_t ap = rt_guest_thiscall(angles_fn, player, 0, NULL);
++    if (!ap) return 0;
++    memcpy(a, rt_host(ap), sizeof a);
++    uint32_t setting = setting_slot ? panel32(setting_slot) : 0;
++    if (setting) {
++        uint32_t skip_fn = panel32(panel32(setting) + 4);
++        if (skip_fn && !(rt_guest_thiscall(skip_fn, setting, 0, NULL) & 0xFFu)) {
++            float add;
++            memcpy(&add, rt_host(setting + 0x28), sizeof add);
++            if (isfinite(add)) a[1] += add;
++        }
++    }
++    if (!finite3(eye) || !finite3(a)) return 0;
++    memcpy(rt_host(e_va), eye, 3 * sizeof *eye);
++    memcpy(rt_host(a_va), a, sizeof a);
++    memset(rt_host(far_va), 0, 0x20);
++    uint32_t args[4] = {e_va, a_va, far_va, hit_va};
++    rt_guest_call(sweep, 4, args);
++    float h[3];
++    memcpy(h, rt_host(hit_va), sizeof h);
++    if (!finite3(h)) return 0;
++    float p = a[0] * (float)M_PI / 180.0f, y = a[1] * (float)M_PI / 180.0f;
++    dir[0] = cosf(p) * cosf(y);
++    dir[1] = cosf(p) * sinf(y);
++    dir[2] = -sinf(p);
++    float d = 0.0f;
++    for (int i = 0; i < 3; i++) d += (h[i] - eye[i]) * dir[i];
++    if (!(d >= 0.0f) || d > AIM_SWEEP_LEN + 1.0f) return 0;
++    *t = d;
++    *hit = d < AIM_SWEEP_LEN - 0.5f;
++    memcpy(ang_out, a, sizeof a);
++    return 1;
++}
++
+ /* The trace made with the ray the renderer took last, on the same thread
+    and in the same call (aim_for_renderer). */
+ static int s_trace_ok, s_trace_hit;
+@@ -1698,24 +1768,20 @@ int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3])
+    frame's: read at the pump, it would be the frame before's. */
+ void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]));
+ void metal_d3d9_fullview_aim_trace_source(int (*fn)(float *t, int *hit));
+-/* Where the game's third person mark is: on the camera's own forward, the
+-   middle of the frame, not the eye's aim. In third person the camera
+-   (CInput +0x164 off the eye, turned to +0x170) looks about 8 degrees
+-   further down than the engine's view angles (a headset run, 2026-11-23:
+-   camera pitch 9.6 against the aim's 1.4, 5.3 against -4.5, every line),
+-   and a ray from the eye along the view angles landed higher and farther
+-   than the game's mark at every range; the mark sits on the frame's
+-   middle. So the shot is traced from the camera along the camera's angles
+-   and the renderer is handed that ray. RT_AIM_FROM=eye goes back to the
+-   eye and the view angles. */
++/* Which ray the shot is traced along. The eye along the engine's view
++   angles is the game's: the depth search on it sat on the game's mark in
++   most of A.'s checks. The camera's own forward (CInput +0x164 off the
++   eye, turned to +0x170), the frame's middle, sat below and nearer the
++   mark in every check (a headset run, 2026-11-23), so it is only an
++   opt in: RT_AIM_FROM=camera. */
+ static int aim_from_eye(void)
+ {
+     static int v = -1;
+     if (v < 0) {
+         const char *e = getenv("RT_AIM_FROM");
+-        v = e && !strcmp(e, "eye");
+-        rt_log("aim: the shot traced from the %s", v ? "eye along the view angles (RT_AIM_FROM=eye)"
+-                                                    : "camera along its own angles, the frame's middle");
++        v = !(e && !strcmp(e, "camera"));
++        rt_log("aim: the shot traced from the %s", v ? "eye along the view angles"
++                                                    : "camera along its own angles (RT_AIM_FROM=camera)");
+     }
+     return v;
+ }
+@@ -1724,25 +1790,53 @@ static int aim_for_renderer(float eye[3], float dir[3])
+ {
+     s_trace_ok = 0;
+     if (!aim_take(eye, dir)) return 0;
+-    float e[3], d[3], cam[3], ang[3];
++    float e[3], d[3], cam[3], ang[3], mark_ang[3] = {0, 0, 0};
++    float ray_eye[3], ray_dir[3], ray_t = 0.0f;
++    int ray_hit = 0, ray_ok = 0, mark = 0;
++    memcpy(ray_eye, eye, sizeof ray_eye);
++    memcpy(ray_dir, dir, sizeof ray_dir);
+     if (!aim_from_eye() && rt_player_aim(e, d, cam, ang)) {
+         float p = ang[0] * (float)M_PI / 180.0f, y = ang[1] * (float)M_PI / 180.0f;
+         memcpy(eye, cam, sizeof cam);
+         dir[0] = cosf(p) * cosf(y);
+         dir[1] = cosf(p) * sinf(y);
+         dir[2] = -sinf(p);
++        s_trace_ok = rt_player_aim_trace(eye, dir, &s_trace_t, &s_trace_hit);
++    } else {
++        /* The game's own sweep first; the eye's MASK_SHOT ray beside it,
++           for the log, and in its place when the sweep cannot run. */
++        ray_ok = rt_player_aim_trace(ray_eye, ray_dir, &ray_t, &ray_hit);
++        mark = rt_player_mark_trace(e, d, &s_trace_t, &s_trace_hit, mark_ang);
++        if (mark) {
++            memcpy(eye, e, sizeof e);
++            memcpy(dir, d, sizeof d);
++            s_trace_ok = 1;
++        } else if (ray_ok) {
++            s_trace_t = ray_t;
++            s_trace_hit = ray_hit;
++            s_trace_ok = 1;
++        }
+     }
+-    s_trace_ok = rt_player_aim_trace(eye, dir, &s_trace_t, &s_trace_hit);
+     static int logged;
+     static uint64_t last_ns;
+     uint64_t now = rt_now_ns();
+-    if (logged < 40 && now - last_ns >= 2000000000ull) {
++    if (logged < 60 && now - last_ns >= 1000000000ull) {
+         logged++;
+         last_ns = now;
+-        if (s_trace_ok)
++        if (mark) {
++            float va[3];
++            uint32_t vva = rt_hook_va("engine", VIEW_ANGLES_RVA);
++            memcpy(va, vva ? rt_host(vva) : (void *)mark_ang, sizeof va);
++            rt_log("aim trace: the game's sweep %s at t %.1f (%.1f %.1f %.1f), angles %.2f %.2f against the view's "
++                   "%.2f %.2f; the eye's ray %s t %.1f%s",
++                   s_trace_hit ? "stops" : "runs to its end", s_trace_t, eye[0] + dir[0] * s_trace_t,
++                   eye[1] + dir[1] * s_trace_t, eye[2] + dir[2] * s_trace_t, mark_ang[0], mark_ang[1], va[0], va[1],
++                   ray_ok ? (ray_hit ? "hits at" : "meets nothing,") : "none,", ray_ok ? ray_t : 0.0f,
++                   logged == 60 ? "; no more of these" : "");
++        } else if (s_trace_ok)
+             rt_log("aim trace: %s at t %.1f (%.1f %.1f %.1f)%s", s_trace_hit ? "hits" : "meets nothing", s_trace_t,
+                    eye[0] + dir[0] * s_trace_t, eye[1] + dir[1] * s_trace_t, eye[2] + dir[2] * s_trace_t,
+-                   logged == 40 ? "; no more of these" : "");
++                   logged == 60 ? "; no more of these" : "");
+         else rt_log("aim trace: none (not on the guest thread, or off)");
+     }
+     return 1;
+-- 
+2.54.0 (Apple Git-157)
+

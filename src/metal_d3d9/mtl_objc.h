@@ -26,7 +26,7 @@ typedef struct {
     float panel[2];        /* the HUD panel's half tangents */
     float aura[2];         /* a camera-held effect's panel, the same (RT_FULLVIEW_AURA_DEG) */
     float sky_scale;       /* the 3D sky's eye offset per the world's (RT_FULLVIEW_SKY, 1/16; 0 at infinity) */
-    int arm[2];            /* the arm HUD: each side's gauge on its card, not the panel (draw.m, arm_side) */
+    int arm[2];            /* the arm HUD: each side's gauge on its card (1) or left to the orbs (2), not the panel (draw.m, arm_side) */
 } mtl_fullview_frame;
 
 typedef struct mtl_emit {
@@ -51,6 +51,11 @@ typedef struct mtl_emit {
     float pose[3];
     /* Full view: both eyes' terms, and which eye this replay is. */
     mtl_fullview_frame fv;
+    /* The third person aim of the Present being emitted (draw.m,
+       mtl_fv_aim), from its recorded command. */
+    mtl_aim_ray aim;
+    mtl_vm_hands hands;
+    mtl_vm_depth vmz;
     int eye;
     /* The pass open now, to reopen it after a camera-held effect's own
        small pass (draw.m, emit_aura), and whether that pass is open. */
@@ -84,6 +89,28 @@ void mtl_immersive_present(mtl_device *d, mtl_emit *e, void *back, void *right, 
 /* The head pose the runtime last gave (metal_d3d9_immersive_view_pose),
    as valid, yaw, pitch: read where Present is recorded. */
 void mtl_immersive_pose_now(float pose[3]);
+/* The shot's ray from the runtime (metal_d3d9_fullview_aim_source), read
+   now, on the game thread at Present: 1 in third person with a player. */
+int mtl_immersive_aim(float eye[3], float dir[3]);
+/* The view model's hands from the runtime (metal_d3d9_fullview_hands_source),
+   read at the Present's submit: the mask, 0 for none. */
+int mtl_immersive_hands(float pts[18]);
+/* The arms' bind pose hands (metal_d3d9_fullview_hands_bind_source), read
+   on the game thread when the first arm draw of a frame is recorded. */
+int mtl_immersive_hands_bind(float out[32]);
+/* The engine's trace of that ray (metal_d3d9_fullview_aim_trace_source),
+   asked right after it: 1 with its distance and whether it met anything. */
+int mtl_immersive_aim_trace(float *t, int *hit);
+/* draw.m: reads the depth texture at each probe's pixel into out (one
+   float each, the raw stored depth; 1 for a probe off the image), in a
+   small compute pass on cb. 0 when it could not be encoded. */
+int mtl_aim_gather(mtl_device *d, void *cb, void *depth, const mtl_aim_probes *p, void *out);
+/* Each eye's depth as metres along its forward into out, a two slice
+   R16Float array (draw.m): terms are the left eye's A, B, the right's,
+   then the viewport's depth min and range and metres per unit. */
+int mtl_scene_depth(mtl_device *d, void *cb, void *left, void *right, const float terms[16], void *out);
+/* frame.m: the right eye's depth texture, as its replay left it. */
+void *mtl_frames_right_depth(const mtl_device *d);
 /* Whether frames are replayed once per eye: stereo asked for, and the
    ring in use. Latched by the replaying thread at each frame's start. */
 int mtl_stereo_on(void);
@@ -125,9 +152,28 @@ typedef struct {
     void *tex;
     uint32_t x[2], w[2], h;
     int drawn[2];
+    /* take only, with the orbs (an arm side in mode 2): each side's
+       picture, the game's own texture retained for the taker to release
+       (0 the weapon's, 1 the discipline's), or NULL; and when their
+       labels were drawn, tex is the labels' target, whole, and label[k]
+       each side's glyphs on it (u0, v0, u1, v1 in its pixels, top left
+       first), label_on[k] 0 for none. Never set by last. */
+    void *icon[2];
+    float label[2][4];
+    int label_on[2];
 } mtl_arm_frame;
 void mtl_arm_take(mtl_device *d, mtl_arm_frame *out);
 void mtl_arm_last(mtl_device *d, mtl_arm_frame *out);
+
+/* draw.m: the game's crosshair as a full view frame drew it, or would
+   have (immersive.h, crosshair_shown): whether any of its draws came, the
+   centre of their box and its x half extent in the game's NDC. take, at
+   a frame's Present: that frame's, and the next frame starts empty. */
+typedef struct {
+    int shown;
+    float ndc[2], half;
+} mtl_crosshair_frame;
+void mtl_crosshair_take(mtl_device *d, mtl_crosshair_frame *out);
 
 /* frame.m: what the replay counts, read when the device is released. */
 void mtl_frames_note_dropped(mtl_device *d);

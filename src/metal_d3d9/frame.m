@@ -138,6 +138,21 @@ static void atomic_max(_Atomic uint64_t *m, uint64_t v)
 
 int mtl_threaded(const mtl_device *d) { return d->fq && d->fq->threaded; }
 
+void *mtl_frames_right_depth(const mtl_device *d) { return d->fq ? d->fq->right[1] : NULL; }
+
+/* Whether a frame being recorded now may be the one shot: the game thread
+   runs a few frames ahead of the replay that opens the shot, so from a
+   few frames before it until it is taken. Read from the game thread, the
+   counters the render thread moves loosely: a frame early or late costs
+   only a box the dump prints as unknown. */
+int mtl_frames_shot_soon(const mtl_device *d)
+{
+    const mtl_frames *f = d->fq;
+    if (!f || !f->threaded || f->shot_cfg != 1) return 0;
+    if (!__atomic_load_n(&f->shot_left, __ATOMIC_RELAXED)) return 0;
+    return __atomic_load_n(&f->fullview_frames, __ATOMIC_RELAXED) + 4 >= __atomic_load_n(&f->shot_next, __ATOMIC_RELAXED);
+}
+
 uint8_t *mtl_rec_base(mtl_device *d) { return d->fq->cur->cmd; }
 
 /* Lists */
@@ -689,6 +704,7 @@ uint64_t mtl_submit(mtl_device *d, int present)
        next list starts from what this one stored. */
     mtl_end_pass(d);
     mtl_fv_scan(d, f->cur->cmd, present);
+    if (present) mtl_fv_aim(d, f->cur->cmd);
     mtl_seg *s = f->cur, *next = seg_new(f);
     if (!next) {
         mtl_log("out of memory starting a command list");

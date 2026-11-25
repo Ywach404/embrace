@@ -110,6 +110,29 @@ static atomic_int s_fv_logged;
 /* And each slot's full view frame, under the rule s_slot_view keeps. */
 static int s_slot_fv[MTL_HANDOFF_SLOTS];
 static float s_slot_tan[MTL_HANDOFF_SLOTS][2][4];
+/* Its HUD panel's half tangents and the game's crosshair on it (draw.m,
+   crosshair), latched with the frame as its pose is. */
+static float s_slot_panel[MTL_HANDOFF_SLOTS][2];
+static mtl_crosshair_frame s_slot_xhair[MTL_HANDOFF_SLOTS];
+/* The third person aim: the runtime's reader, and each slot's samples,
+   the GPU's pixels and reads at them (a shared buffer of
+   MTL_AIM_BUF_FLOATS, made once), and the search's answer with the projection that turns it
+   into tangents, written by the frame's completion before it is
+   published. */
+static _Atomic(int (*)(float *, float *)) s_aim_fn;
+static _Atomic(int (*)(float *, int *)) s_aim_trace_fn;
+static _Atomic(int (*)(float *)) s_hands_fn;
+static _Atomic(int (*)(float *)) s_hands_bind_fn;
+static mtl_aim_ray s_slot_ray[MTL_HANDOFF_SLOTS];
+static mtl_aim_probes s_slot_probes[MTL_HANDOFF_SLOTS];
+static void *s_slot_aim_buf[MTL_HANDOFF_SLOTS];
+static int s_slot_aim_on[MTL_HANDOFF_SLOTS];
+static mtl_aim_hit s_slot_hit[MTL_HANDOFF_SLOTS];
+/* The view model's hands each slot's frame drew, and its projection. */
+static mtl_vm_hands s_slot_hands[MTL_HANDOFF_SLOTS];
+static mtl_stereo_proj_full s_slot_hands_p[MTL_HANDOFF_SLOTS];
+static int s_slot_hit_ok[MTL_HANDOFF_SLOTS];
+static mtl_stereo_proj_full s_slot_aim_p[MTL_HANDOFF_SLOTS];
 /* The arm HUD (draw.m, arm_side): on unless RT_ARM_HUD=0, and each side
    as the compositor last said it can show that side's card. Each slot's
    copy of the cards, its own texture remade only while the slot is the
@@ -119,6 +142,21 @@ static atomic_int s_arm_side[2];
 static void *s_slot_arm[MTL_HANDOFF_SLOTS];
 static int s_slot_arm_on[MTL_HANDOFF_SLOTS][2];
 static float s_slot_arm_uv[MTL_HANDOFF_SLOTS][2][4];
+/* With the orbs: each slot's pictures, the game's own textures (0 the
+   weapon's, 1 the discipline's), retained while the slot holds them
+   (draw.m, orb_note), and each side's label on the slot's copy of the
+   labels' target: on, and its uv there. */
+static void *s_slot_icon[MTL_HANDOFF_SLOTS][2];
+/* The scene's depth (metal_d3d9_fullview_scene_depth): asked for, and each
+   slot's target, made at a quarter of the frame's pixels the first time
+   and again when the frame's size changes, and whether it holds this
+   slot's frame. */
+static atomic_int s_scene_depth;
+static void *s_slot_scene[MTL_HANDOFF_SLOTS];
+static int s_slot_scene_on[MTL_HANDOFF_SLOTS];
+static int s_slot_scene_vm[MTL_HANDOFF_SLOTS];
+static int s_slot_label_on[MTL_HANDOFF_SLOTS][2];
+static float s_slot_label_uv[MTL_HANDOFF_SLOTS][2][4];
 
 static uint64_t now_ns(void)
 {
@@ -139,9 +177,11 @@ static void init_once(void)
     const char *u = getenv("RT_STEREO_UNITS_PER_M");
     double upm = u && *u ? atof(u) : 1.0 / 0.0254;
     s_units_per_m = upm > 0 ? (float)upm : (float)(1.0 / 0.0254);
-    const char *arm = getenv("RT_ARM_HUD");
-    s_arm_env = !(arm && !strcmp(arm, "0"));
-    if (!s_arm_env) mtl_log("full view: arm HUD off (RT_ARM_HUD=0), the gauges stay on the panel");
+    /* The gauges leave the panel for the orbs (the default) or for the
+       old cards (RT_ARM_HUD=1); with neither they stay on it. */
+    const char *arm = getenv("RT_ARM_HUD"), *orb = getenv("RT_ORB_HUD");
+    s_arm_env = (arm && !strcmp(arm, "1")) || !(orb && !strcmp(orb, "0"));
+    if (!s_arm_env) mtl_log("full view: no orbs nor cards (RT_ORB_HUD=0), the gauges stay on the panel");
     const char *sd = getenv("RT_STEREO_SCREEN_DEG");
     s_screen_deg = sd && *sd ? (float)atof(sd) : 0.0f;
     float h = 0.032f * s_units_per_m;
@@ -296,13 +336,42 @@ D9_EXPORT void metal_d3d9_immersive_hand_pose(int side, int state, const float g
     atomic_fetch_add_explicit(&s_hands[side].seq, 1, memory_order_acq_rel);
 }
 
+D9_EXPORT void metal_d3d9_fullview_scene_depth(int on)
+{
+    if (atomic_exchange_explicit(&s_scene_depth, on ? 1 : 0, memory_order_relaxed) != (on ? 1 : 0))
+        mtl_log("full view: the scene's depth %s", on ? "handed to the compositor" : "no longer handed on");
+}
+
+static id<MTLTexture> slot_scene_texture(id<MTLDevice> dev, int slot, uint32_t w, uint32_t h)
+{
+    id<MTLTexture> t = (__bridge id<MTLTexture>)s_slot_scene[slot];
+    uint32_t sw = w / 2 > 0 ? w / 2 : 1, sh = h / 2 > 0 ? h / 2 : 1;
+    if (t && t.width == sw && t.height == sh) return t;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float
+                                                                                  width:sw
+                                                                                 height:sh
+                                                                              mipmapped:NO];
+    td.textureType = MTLTextureType2DArray;
+    td.arrayLength = 2;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> n = [dev newTextureWithDescriptor:td];
+    if (!n) return nil;
+    n.label = [NSString stringWithFormat:@"immersive slot %d scene depth", slot];
+    if (s_slot_scene[slot]) CFRelease(s_slot_scene[slot]);
+    s_slot_scene[slot] = (void *)CFBridgingRetain(n);
+    return n;
+}
+
 D9_EXPORT void metal_d3d9_fullview_arm_hud(int side, int on)
 {
     if (side < 0 || side > 1) return;
-    on = on != 0;
+    on = on < 0 ? 0 : on > 2 ? 2 : on;
     if (atomic_exchange_explicit(&s_arm_side[side], on, memory_order_relaxed) != on)
         mtl_log("full view: the %s gauge %s", side ? "right" : "left",
-                on ? "on its card at the controller" : "on the panel (no card for it)");
+                on == 2   ? "left to its orb at the controller"
+                : on == 1 ? "on its card at the controller"
+                          : "on the panel (no controller for it)");
 }
 
 void mtl_immersive_pose_now(float pose[3])
@@ -482,6 +551,78 @@ D9_EXPORT void metal_d3d9_fullview_set_views(const float tan[8], const float eye
 
 void mtl_immersive_view_model(int drawn) { atomic_store_explicit(&s_view_model, drawn ? 1 : 0, memory_order_relaxed); }
 
+D9_EXPORT void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]))
+{
+    atomic_store_explicit(&s_aim_fn, fn, memory_order_release);
+}
+
+D9_EXPORT void metal_d3d9_fullview_aim_trace_source(int (*fn)(float *t, int *hit))
+{
+    atomic_store_explicit(&s_aim_trace_fn, fn, memory_order_release);
+}
+
+int mtl_immersive_aim_trace(float *t, int *hit)
+{
+    int (*fn)(float *, int *) = atomic_load_explicit(&s_aim_trace_fn, memory_order_acquire);
+    return fn ? fn(t, hit) != 0 : 0;
+}
+
+D9_EXPORT void metal_d3d9_fullview_hands_source(int (*fn)(float pts[18]))
+{
+    atomic_store_explicit(&s_hands_fn, fn, memory_order_release);
+}
+
+D9_EXPORT void metal_d3d9_fullview_hands_bind_source(int (*fn)(float out[32]))
+{
+    atomic_store_explicit(&s_hands_bind_fn, fn, memory_order_release);
+}
+
+int mtl_immersive_hands_bind(float out[32])
+{
+    int (*fn)(float *) = atomic_load_explicit(&s_hands_bind_fn, memory_order_acquire);
+    return fn ? fn(out) & 3 : 0;
+}
+
+int mtl_immersive_hands(float pts[18])
+{
+    int (*fn)(float *) = atomic_load_explicit(&s_hands_fn, memory_order_acquire);
+    return fn ? fn(pts) & 3 : 0;
+}
+
+int mtl_immersive_aim(float eye[3], float dir[3])
+{
+    int (*fn)(float *, float *) = atomic_load_explicit(&s_aim_fn, memory_order_acquire);
+    return fn ? fn(eye, dir) != 0 : 0;
+}
+
+/* The search's answer, the first time and then on a change between hit
+   and no hit or every two seconds, the first 60 times: the ray, the hit
+   along it and in the frame, and the frame's camera from its own rows
+   beside the eye, which a run compares with the runtime's aim line. */
+static void aim_log(const mtl_aim_ray *r, const mtl_aim_probes *p, const mtl_aim_hit *h, int ok)
+{
+    static int logged, last = -2;
+    static uint64_t last_ns;
+    uint64_t now = now_ns();
+    int state = ok ? h->hit : -1;
+    if (logged >= 60 || (state == last && now - last_ns < 2000000000ull)) return;
+    logged++;
+    last = state;
+    last_ns = now;
+    float cam[3] = {0, 0, 0};
+    int cam_ok = mtl_stereo_camera_from_rows(r->rows[0], r->rows[1], r->rows[3], cam);
+    float dx = cam[0] - r->eye[0], dy = cam[1] - r->eye[1], dz = cam[2] - r->eye[2];
+    char how[64];
+    if (p) snprintf(how, sizeof how, "sample %d, %d hidden, %d of %d on the image", h->k, h->hidden, p->on_image, p->n);
+    else snprintf(how, sizeof how, "the engine's trace");
+    mtl_log("full view: aim %s t %.1f (%s) at %.1f %.1f %.1f, NDC %.4f %.4f "
+            "w %.1f; ray from %.1f %.1f %.1f along %.3f %.3f %.3f, the frame's camera %s%.1f %.1f %.1f, %.1f from the "
+            "eye%s",
+            !ok ? "gives no point:" : h->hit ? "hits at" : "finds no surface, the far end at", h->t, how, h->p[0], h->p[1], h->p[2], h->ndc[0], h->ndc[1], h->w, r->eye[0], r->eye[1],
+            r->eye[2], r->dir[0], r->dir[1], r->dir[2], cam_ok ? "" : "(none) ", cam[0], cam[1], cam[2],
+            sqrtf(dx * dx + dy * dy + dz * dz), logged == 60 ? "; no more of these" : "");
+}
+
 D9_EXPORT int metal_d3d9_fullview_view_model(void) { return atomic_load_explicit(&s_view_model, memory_order_relaxed); }
 
 D9_EXPORT void metal_d3d9_immersive_view_play(int play) { atomic_store_explicit(&s_play, play != 0, memory_order_relaxed); }
@@ -546,7 +687,7 @@ void mtl_fullview_latch(float aspect, mtl_fullview_frame *out)
     out->aura[1] = out->aura[0] / aspect;
     out->sky_scale = s_fv_sky_scale;
     for (int k = 0; k < 2; k++)
-        out->arm[k] = s_arm_env && !out->game_eye && atomic_load_explicit(&s_arm_side[k], memory_order_relaxed);
+        out->arm[k] = s_arm_env && !out->game_eye ? atomic_load_explicit(&s_arm_side[k], memory_order_relaxed) : 0;
     out->on = 1;
     if (!atomic_exchange(&s_fv_logged, 1))
         mtl_log("full view: first frame, the game at %.1f by %.1f degrees, left eye image %.3f %.3f %.3f %.3f, right "
@@ -656,12 +797,23 @@ void mtl_immersive_present(mtl_device *d, mtl_emit *e, void *back, void *right, 
        explain. A lock and a compare, once a frame. */
     metal_d3d9_space_watchdog();
     /* Taken whatever happens below, so a frame's cards are never handed
-       on with the next frame's. */
+       on with the next frame's, nor its crosshair. */
     mtl_arm_frame arm;
     mtl_arm_take(d, &arm);
-    if (!back) return;
-    int slot = mtl_handoff_begin(&s_ring);
-    if (slot < 0) return; /* counted as skipped */
+    mtl_crosshair_frame xh;
+    mtl_crosshair_take(d, &xh);
+    int slot = back ? mtl_handoff_begin(&s_ring) : -1;
+    if (slot < 0) {
+        for (int k = 0; k < 2; k++)
+            if (arm.icon[k]) CFRelease(arm.icon[k]);
+        return; /* counted as skipped when there was a frame */
+    }
+    /* The slot is the writer's now: its pictures are this frame's, or none. */
+    for (int k = 0; k < 2; k++) {
+        if (s_slot_icon[slot][k]) CFRelease(s_slot_icon[slot][k]);
+        s_slot_icon[slot][k] = e->fv.on ? arm.icon[k] : NULL;
+        if (arm.icon[k] && !e->fv.on) CFRelease(arm.icon[k]);
+    }
     id<MTLTexture> bb = (__bridge id<MTLTexture>)back, rb = (__bridge id<MTLTexture>)right;
     if (rb && (rb.width != bb.width || rb.height != bb.height || rb.pixelFormat != bb.pixelFormat)) rb = nil;
     id<MTLTexture> t = slot_texture((__bridge id<MTLDevice>)d->mtl, slot, bb, rb ? 2 : 1);
@@ -718,11 +870,118 @@ void mtl_immersive_present(mtl_device *d, mtl_emit *e, void *back, void *right, 
             memset(uv, 0, 4 * sizeof *uv);
         }
     }
+    for (int k = 0; k < 2; k++) {
+        s_slot_label_on[slot][k] = st && arm.label_on[k];
+        if (s_slot_label_on[slot][k]) {
+            s_slot_label_uv[slot][k][0] = arm.label[k][0] / (float)at.width;
+            s_slot_label_uv[slot][k][1] = arm.label[k][1] / (float)at.height;
+            s_slot_label_uv[slot][k][2] = arm.label[k][2] / (float)at.width;
+            s_slot_label_uv[slot][k][3] = arm.label[k][3] / (float)at.height;
+        }
+    }
     [bl endEncoding];
+    /* The third person aim: the shot's ray sampled through the frame's
+       view projection into the right eye's image (its replay is the last
+       to write its depth), and the depth there read on the GPU in this
+       command buffer; the search runs at its completion below. The check
+       (game_eye) draws each eye with the game's projection at the camera,
+       so its correction is the identity. */
+    s_slot_aim_on[slot] = 0;
+    s_slot_hit_ok[slot] = 0;
+    memset(&s_slot_hands[slot], 0, sizeof s_slot_hands[slot]);
+    if (rb && e->fv.on && e->hands.mask &&
+        mtl_stereo_proj_from_rows(e->hands.rows[0], e->hands.rows[1], e->hands.rows[2], e->hands.rows[3],
+                                  &s_slot_hands_p[slot]))
+        s_slot_hands[slot] = e->hands;
+    if (rb && e->fv.on && e->aim.ok) {
+        const mtl_aim_ray *r = &e->aim;
+        mtl_stereo_proj_full gp;
+        mtl_stereo_fix fix;
+        if (mtl_stereo_proj_from_rows(r->rows[0], r->rows[1], r->rows[2], r->rows[3], &gp)) {
+            if (e->fv.game_eye) mtl_stereo_identity(&fix);
+            else mtl_stereo_correction3(&gp, &e->fv.eye_p[1], e->fv.eye_t[1], &fix);
+            if (!s_slot_aim_buf[slot]) {
+                id<MTLBuffer> b = [(__bridge id<MTLDevice>)d->mtl newBufferWithLength:MTL_AIM_BUF_FLOATS * sizeof(float)
+                                                                               options:MTLResourceStorageModeShared];
+                b.label = [NSString stringWithFormat:@"immersive slot %d aim depths", slot];
+                s_slot_aim_buf[slot] = b ? (void *)CFBridgingRetain(b) : NULL;
+            }
+            s_slot_ray[slot] = *r;
+            s_slot_aim_p[slot] = gp;
+            /* The engine traced the shot itself: its point is the answer,
+               and no depth is read. */
+            if (r->traced) s_slot_aim_on[slot] = 1;
+            else if (mtl_aim_probe(r, &fix, &s_slot_probes[slot]) &&
+                     mtl_aim_gather(d, e->cb, mtl_frames_right_depth(d), &s_slot_probes[slot], s_slot_aim_buf[slot]))
+                s_slot_aim_on[slot] = 1;
+        }
+    }
+    /* The scene's depth: each eye's depth buffer as metres along its
+       forward, from the frame's view projection and each eye's correction
+       as the aim's are made. The left eye's depth is the game's own
+       surface, the right's its twin (frame.m, right_eye_ready). */
+    s_slot_scene_on[slot] = 0;
+    if (rb && e->fv.on && e->aim.ok && atomic_load_explicit(&s_scene_depth, memory_order_relaxed) && d->auto_ds &&
+        d->auto_ds->tex && mtl_frames_right_depth(d)) {
+        const mtl_aim_ray *r = &e->aim;
+        mtl_stereo_proj_full gp;
+        float terms[16] = {0};
+        int ok = mtl_stereo_proj_from_rows(r->rows[0], r->rows[1], r->rows[2], r->rows[3], &gp);
+        for (int k = 0; ok && k < 2; k++) {
+            mtl_stereo_fix fix;
+            if (e->fv.game_eye) mtl_stereo_identity(&fix);
+            else mtl_stereo_correction3(&gp, &e->fv.eye_p[k], e->fv.eye_t[k], &fix);
+            ok = mtl_stereo_depth_terms(r->rows, &fix, &terms[2 * k], &terms[2 * k + 1]);
+        }
+        terms[4] = r->vp[4];
+        terms[5] = r->vp[5] - r->vp[4];
+        terms[6] = 1.0f / s_units_per_m;
+        terms[7] = 0.0f;
+        /* The view model's pixels by its own terms: Source draws it into a
+           depth range of its own (the front of the buffer), with its own
+           field of view, so the world's terms put the gun a few
+           centimetres from the eye and the gloves took all of it as what
+           is held (A.'s run, 2026-11-25: fingers through the grip). Told
+           apart by depth when its range is its own. */
+        const mtl_vm_depth *vz = &e->vmz;
+        mtl_stereo_proj_full vp;
+        int vm_own = vz->ok && vz->vp[1] > vz->vp[0] &&
+                     (vz->vp[1] < r->vp[5] - 1e-4f || vz->vp[0] > r->vp[4] + 1e-4f) &&
+                     mtl_stereo_proj_from_rows(vz->rows[0], vz->rows[1], vz->rows[2], vz->rows[3], &vp);
+        for (int k = 0; vm_own && k < 2; k++) {
+            mtl_stereo_fix fix;
+            if (e->fv.game_eye) mtl_stereo_identity(&fix);
+            else mtl_stereo_correction3(&vp, &e->fv.eye_p[k], e->fv.eye_t[k], &fix);
+            vm_own = mtl_stereo_depth_terms(vz->rows, &fix, &terms[8 + 2 * k], &terms[9 + 2 * k]);
+        }
+        if (vm_own) {
+            terms[12] = vz->vp[0];
+            terms[13] = vz->vp[1] - vz->vp[0];
+            terms[14] = 1.0f;
+        }
+        s_slot_scene_vm[slot] = vm_own;
+        static int told = -1;
+        if (told != vm_own) {
+            told = vm_own;
+            mtl_log("full view: the view model's depth %s (its range %.3f to %.3f, the world's %.3f to %.3f)",
+                    vm_own ? "by its own projection" : "by the world's", vz->ok ? vz->vp[0] : 0.0, vz->ok ? vz->vp[1] : 0.0,
+                    r->vp[4], r->vp[5]);
+        }
+        id<MTLTexture> zt = (__bridge id<MTLTexture>)d->auto_ds->tex;
+        id<MTLTexture> st = ok ? slot_scene_texture((__bridge id<MTLDevice>)d->mtl, slot, (uint32_t)zt.width,
+                                                    (uint32_t)zt.height)
+                               : nil;
+        if (st && mtl_scene_depth(d, e->cb, d->auto_ds->tex, mtl_frames_right_depth(d), terms, (__bridge void *)st))
+            s_slot_scene_on[slot] = 1;
+    }
     s_write_slot = slot;
     s_slot_fv[slot] = rb && e->fv.on;
     if (s_slot_fv[slot]) memcpy(s_slot_tan[slot], e->fv.tan, sizeof s_slot_tan[slot]);
     else memset(s_slot_tan[slot], 0, sizeof s_slot_tan[slot]);
+    if (s_slot_fv[slot]) memcpy(s_slot_panel[slot], e->fv.panel, sizeof s_slot_panel[slot]);
+    else memset(s_slot_panel[slot], 0, sizeof s_slot_panel[slot]);
+    if (s_slot_fv[slot] && xh.shown) s_slot_xhair[slot] = xh;
+    else memset(&s_slot_xhair[slot], 0, sizeof s_slot_xhair[slot]);
     if (rb) {
         float a = e->screen_a > 0.0f ? e->screen_a : MTL_STEREO_DEFAULT_A;
         s_slot_view[slot][0] = 1.0f / a;
@@ -738,6 +997,16 @@ void mtl_immersive_present(mtl_device *d, mtl_emit *e, void *back, void *right, 
        never returns a slot still being written. */
     [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
         if (b.status == MTLCommandBufferStatusCompleted) {
+            if (s_slot_aim_on[slot] && s_slot_ray[slot].traced) {
+                int ok = mtl_aim_traced(&s_slot_ray[slot], &s_slot_hit[slot]);
+                s_slot_hit_ok[slot] = ok;
+                aim_log(&s_slot_ray[slot], NULL, &s_slot_hit[slot], ok);
+            } else if (s_slot_aim_on[slot]) {
+                const float *depth = (const float *)[(__bridge id<MTLBuffer>)s_slot_aim_buf[slot] contents] + MTL_AIM_DEPTH_AT;
+                int ok = mtl_aim_search(&s_slot_ray[slot], &s_slot_probes[slot], depth, &s_slot_hit[slot]);
+                s_slot_hit_ok[slot] = ok;
+                aim_log(&s_slot_ray[slot], &s_slot_probes[slot], &s_slot_hit[slot], ok);
+            }
             /* GPUStartTime and GPUEndTime are host time in seconds, the
                mach_absolute_time clock the other stamps use. */
             mtl_handoff_times tm = {
@@ -820,7 +1089,63 @@ D9_EXPORT int metal_d3d9_immersive_acquire(metal_d3d9_shown_frame *out)
     out->fullview = sv && s_slot_fv[v.slot];
     if (out->fullview) memcpy(out->eye_tan, s_slot_tan[v.slot], sizeof out->eye_tan);
     else memset(out->eye_tan, 0, sizeof out->eye_tan);
+    const mtl_crosshair_frame *xh = out->fullview ? &s_slot_xhair[v.slot] : NULL;
+    out->panel[0] = out->fullview ? s_slot_panel[v.slot][0] : 0.0f;
+    out->panel[1] = out->fullview ? s_slot_panel[v.slot][1] : 0.0f;
+    out->crosshair_shown = xh && xh->shown;
+    out->crosshair_ndc[0] = out->crosshair_shown ? xh->ndc[0] : 0.0f;
+    out->crosshair_ndc[1] = out->crosshair_shown ? xh->ndc[1] : 0.0f;
+    out->crosshair_half = out->crosshair_shown ? xh->half : 0.0f;
+    /* The aim's point as the compositor places it: tangents off the
+       drawn forward and metres along it (mtl_stereo_world_point, no
+       extent). A point the projection gives nothing for is not shown. */
+    float wp[4] = {0, 0, 0, 0};
+    const mtl_aim_hit *h = out->fullview && s_slot_hit_ok[v.slot] ? &s_slot_hit[v.slot] : NULL;
+    out->aim_shown = h && mtl_stereo_world_point(&s_slot_aim_p[v.slot], h->ndc[0], h->ndc[1], 0.0f, h->w,
+                                                 s_units_per_m, wp);
+    out->aim_hit = out->aim_shown && h->hit;
+    out->aim_tan[0] = out->aim_shown ? wp[0] : 0.0f;
+    out->aim_tan[1] = out->aim_shown ? wp[1] : 0.0f;
+    out->aim_m = out->aim_shown ? wp[3] : 0.0f;
+    out->aim_t = out->aim_shown ? h->t : 0.0f;
+    /* The view model's hands the same way: each point through the frame's
+       rows to its NDC and w, then tangents and metres. */
+    const mtl_vm_hands *vh = out->fullview ? &s_slot_hands[v.slot] : NULL;
+    for (int k = 0; k < 2; k++) {
+        int ok = vh && (vh->mask >> k & 1);
+        for (int j = 0; ok && j < 3; j++) {
+            float c[4], hp[4];
+            mtl_aim_clip(vh->rows, vh->pts + 9 * k + 3 * j, c);
+            ok = c[3] > 1e-3f && mtl_stereo_world_point(&s_slot_hands_p[v.slot], c[0] / c[3], c[1] / c[3], 0.0f, c[3],
+                                                         s_units_per_m, hp);
+            out->vm_hand_tan[3 * k + j][0] = ok ? hp[0] : 0.0f;
+            out->vm_hand_tan[3 * k + j][1] = ok ? hp[1] : 0.0f;
+            out->vm_hand_m[3 * k + j] = ok ? hp[3] : 0.0f;
+        }
+        out->vm_hand_shown[k] = ok;
+        float pc[4], pp[4];
+        int pok = ok;
+        if (pok) {
+            mtl_aim_clip(vh->rows, vh->palm + 3 * k, pc);
+            pok = pc[3] > 1e-3f && mtl_stereo_world_point(&s_slot_hands_p[v.slot], pc[0] / pc[3], pc[1] / pc[3], 0.0f, pc[3],
+                                                          s_units_per_m, pp);
+        }
+        out->vm_palm_tan[k][0] = pok ? pp[0] : 0.0f;
+        out->vm_palm_tan[k][1] = pok ? pp[1] : 0.0f;
+        out->vm_palm_m[k] = pok ? pp[3] : 0.0f;
+        if (!ok)
+            for (int j = 0; j < 3; j++) out->vm_hand_tan[3 * k + j][0] = out->vm_hand_tan[3 * k + j][1] = out->vm_hand_m[3 * k + j] = 0.0f;
+    }
+    out->scene_depth = out->fullview && s_slot_scene_on[v.slot] ? s_slot_scene[v.slot] : NULL;
+    out->scene_depth_vm = out->scene_depth && s_slot_scene_vm[v.slot];
+    out->weapon_texture = out->fullview ? s_slot_icon[v.slot][0] : NULL;
+    out->icon_texture = out->fullview ? s_slot_icon[v.slot][1] : NULL;
     int arm = out->fullview && (s_slot_arm_on[v.slot][0] || s_slot_arm_on[v.slot][1]);
+    for (int k = 0; k < 2; k++) {
+        out->label_shown[k] = arm && s_slot_label_on[v.slot][k];
+        if (out->label_shown[k]) memcpy(out->label_uv[k], s_slot_label_uv[v.slot][k], sizeof out->label_uv[k]);
+        else memset(out->label_uv[k], 0, sizeof out->label_uv[k]);
+    }
     out->arm_texture = arm ? s_slot_arm[v.slot] : NULL;
     for (int k = 0; k < 2; k++) {
         out->arm_shown[k] = arm && s_slot_arm_on[v.slot][k];

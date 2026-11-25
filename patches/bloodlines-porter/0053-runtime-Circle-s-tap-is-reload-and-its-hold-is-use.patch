@@ -1,0 +1,143 @@
+From 683ec6b228305575ffc85e2dab8867147e8624da Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:30:30 -0600
+Subject: [PATCH] runtime: Circle's tap is reload and its hold is use
+
+A. wants reload on a plain tap of Circle: reloading happens far more
+often in a fight than opening a door or talking, and the hold time
+delayed every reload. Use moves to Circle held, so it stays reachable
+on the Sense pair. Menus and dialogue keep Circle as before.
+---
+ runtime/input_selftest.c | 26 +++++++++++++-------------
+ runtime/pad.c            | 12 ++++++------
+ 2 files changed, 19 insertions(+), 19 deletions(-)
+
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 942403b..66cdd10 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1210,7 +1210,7 @@ static const struct {
+     uint32_t msg[RT_PAD_NMODES], wp[RT_PAD_NMODES];
+ } k_padmap[] = {
+     {SDL_GAMEPAD_BUTTON_SOUTH, -1, "Cross", {WM_KEYDOWN, WM_LBUTTONDOWN, WM_KEYDOWN}, {0x20, 1, 0x20}},
+-    {SDL_GAMEPAD_BUTTON_EAST, -1, "Circle", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x45, 0x1B, 0x1B}},
++    {SDL_GAMEPAD_BUTTON_EAST, -1, "Circle", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x52, 0x1B, 0x1B}},
+     {SDL_GAMEPAD_BUTTON_WEST, -1, "Square", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x49, 0x49, 0x49}},
+     {SDL_GAMEPAD_BUTTON_NORTH, -1, "Triangle", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x46, 0x46, 0x46}},
+     {SDL_GAMEPAD_BUTTON_BACK, -1, "Create", {WM_KEYDOWN, WM_KEYDOWN, WM_KEYDOWN}, {0x43, 0x43, 0x43}},
+@@ -1246,7 +1246,7 @@ static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, in
+         padpump(s, d, 10);
+         snprintf(name, sizeof name, "%s %s press", mn, k_padmap[i].name);
+         /* Options, Square and Circle in play have holds (the view toggle,
+-           the head look switch and reload), so they are a tap on the
++           the head look switch and use), so they are a tap on the
+            release (pad_hold, pad_headlook). */
+         if (mode == RT_PAD_PLAY && (k_padmap[i].btn == SDL_GAMEPAD_BUTTON_START || k_padmap[i].btn == SDL_GAMEPAD_BUTTON_WEST ||
+                                     k_padmap[i].btn == SDL_GAMEPAD_BUTTON_EAST)) {
+@@ -2343,9 +2343,9 @@ static void pad_hold_one(const char *pad)
+     padpump(&s, &d, 10);
+ }
+ 
+-/* Circle in play: a tap is use (e) on the release, a hold past
+-   RT_PAD_HOLD_NS is one r (+reload), the Sense pair's only way to it,
+-   and its release sends no use. */
++/* Circle in play: a tap is reload (r) on the release, the Sense
++   pair's only way to it, and a hold past RT_PAD_HOLD_NS is one e
++   (+use), whose release sends no reload. */
+ static void pad_reload_one(const char *pad)
+ {
+     rt_input_state s;
+@@ -2365,21 +2365,21 @@ static void pad_reload_one(const char *pad)
+     padpump(&s, &d, 100);
+     rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 0);
+     padpump(&s, &d, 10);
+-    snprintf(name, sizeof name, "%s: a Circle tap is use (e) on the release", pad);
+-    check(s_n >= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x45 && s_m[s_n - 1].msg == WM_KEYUP && s_m[s_n - 1].wp == 0x45, name, "%s",
++    snprintf(name, sizeof name, "%s: a Circle tap is reload (r) on the release", pad);
++    check(s_n >= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x52 && s_m[s_n - 1].msg == WM_KEYUP && s_m[s_n - 1].wp == 0x52, name, "%s",
+           dump());
+     s_n = 0;
+     rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 1);
+     padpump(&s, &d, 10);
+     padpump(&s, &d, 600);
+-    int reload = s_n == 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x52 && s_m[1].msg == WM_KEYUP && s_m[1].wp == 0x52;
++    int use = s_n == 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x45 && s_m[1].msg == WM_KEYUP && s_m[1].wp == 0x45;
+     s_n = 0;
+     for (int i = 0; i < 10; i++) padpump(&s, &d, 100);
+     int quiet = s_n == 0;
+     rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 0);
+     padpump(&s, &d, 10);
+-    snprintf(name, sizeof name, "%s: Circle held is one reload (r), and its release no use", pad);
+-    check(reload && quiet && s_n == 0, name, "reload %d quiet %d %s", reload, quiet, dump());
++    snprintf(name, sizeof name, "%s: Circle held is one use (e), and its release no reload", pad);
++    check(use && quiet && s_n == 0, name, "use %d quiet %d %s", use, quiet, dump());
+     rt_pad_test_detach(id);
+     padpump(&s, &d, 10);
+ }
+@@ -2630,7 +2630,7 @@ static void pad_controls(void)
+     t = rt_pad_target(&p, 0, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_SPACE, "play south keeps its default", "%d", t->arg);
+     t = rt_pad_target(&p, 1, 1);
+-    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "menu.east=play hands Circle back to its play key", "%d", t->arg);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_R, "menu.east=play hands Circle back to its play key", "%d", t->arg);
+     t = rt_pad_target(&p, 2, 0);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_R, "west remaps Square in play", "%d", t->arg);
+     t = rt_pad_target(&p, 2, 1);
+@@ -2645,9 +2645,9 @@ static void pad_controls(void)
+     t = rt_pad_target(&p, RT_PAD_FLICK_LEFT, RT_PAD_DIALOGUE);
+     check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_5, "dialogue.flickleft remaps a flick", "%d %d", t->kind, t->arg);
+     t = rt_pad_target(&p, 1, RT_PAD_DIALOGUE);
+-    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "dialogue.east=play hands Circle back to its play key there", "%d", t->arg);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_R, "dialogue.east=play hands Circle back to its play key there", "%d", t->arg);
+     t = rt_pad_target(&p, 1, RT_PAD_MENU);
+-    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_E, "menu.east=play still holds in menus", "%d", t->arg);
++    check(t->kind == RT_PADT_KEY && t->arg == SDL_SCANCODE_R, "menu.east=play still holds in menus", "%d", t->arg);
+     t = rt_pad_target(&p, RT_PAD_FLICK_UP, RT_PAD_DIALOGUE);
+     check(t->kind == RT_PADT_ANSWER_UP, "a bad dialogue target keeps the default flick", "%d", t->kind);
+     t = rt_pad_target(&p, 0, RT_PAD_DIALOGUE);
+diff --git a/runtime/pad.c b/runtime/pad.c
+index e293dc1..0ddf92f 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -28,7 +28,7 @@ static const int k_sdl[RT_PAD_NBTN] = {
+ /* Keys are the game's own binds (cfg/config.cfg): i is slot6, the
+    general inventory; c is +chareditor; l is +questlog; e is +use; f is
+    vm_feed; r is +reload. Square takes the inventory, which moves reload
+-   to the touchpad and the Xbox share button, and to Circle held (below)
++   to the touchpad and the Xbox share button, and to Circle's tap (below)
+    for the Sense pair, which has neither. L3 in play sends nothing:
+    both stick clicks together are the host's (the view switch, the
+    layout editor), and the quest log and the sheet are reached from the
+@@ -43,7 +43,7 @@ static const int k_sdl[RT_PAD_NBTN] = {
+    same reason: the game's only bind for vdiscipline_last is MOUSE2, which
+    that handler drops the same way, so a power fired once and then not
+    again; the runtime binds f7 to it at launch (trace.c). */
+-static const char *const k_default[RT_PAD_NBTN] = {"space", "e",      "i",    "f",    "c",    "escape", "wheeldown", "wheelup",
++static const char *const k_default[RT_PAD_NBTN] = {"space", "r",      "i",    "f",    "c",    "escape", "wheeldown", "wheelup",
+                                                    "none",  "lctrl",  "1",    "3",    "4",    "2",      "f7",        "return",
+                                                    "r",     "r",      "none", "none", "none", "none"};
+ 
+@@ -94,16 +94,16 @@ static const struct {
+    camera in first person; its tap is still the inventory, sent on the
+    release. Square because every pad has it, its tap opens a screen so a
+    release-time open costs nothing, and no game action wants it held.
+-   Circle held is reload, the only way to it on the Sense pair; its tap
+-   is still use, sent on the release, which only delays a door or a
+-   pickup by the length of the tap. */
++   Circle's tap is reload, the only way to it on the Sense pair, sent on
++   the release; Circle held is use, for doors, pickups and talking,
++   which are rarer than a reload in a fight and wait the hold time. */
+ static const struct {
+     int idx;
+     const char *target;
+ } k_hold_default[] = {
+     {5, "z"},
+     {2, "headlook"},
+-    {1, "r"},
++    {1, "e"},
+ };
+ 
+ /* No chord is on by default. The Sense pair has no Create (visionOS
+-- 
+2.54.0 (Apple Git-157)
+

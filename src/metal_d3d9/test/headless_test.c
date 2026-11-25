@@ -9,7 +9,7 @@
  * METHODS_FILE lists "Interface::Method" names, one per line (the methods
  * a run reached); each must resolve to an implementation, not a stop.
  *
- * SHADER_DIR is the S2b probe's input set (build/s2-shaders/in: the game's
+ * SHADER_DIR is the game's shader set (build/s2-shaders/in: the game's
  * own shader combos as .dxso files and index.json). With it the test also
  * draws offscreen with real game shaders (unlitgeneric, vs_1_1 and ps_1_1)
  * over synthetic geometry and checks pixels: a DXT1 textured quad, alpha
@@ -2579,6 +2579,42 @@ static void scene_arm_ff(void *dev)
     present(dev);
 }
 
+/* The game's crosshair as full view sees it, POSITIONT with an 8x8
+   texture: a large quad over the middle (green, half the view across,
+   too wide for a crosshair), a small one off the middle (blue), and last
+   the crosshair itself, a small quad centred on the view (red, pixels
+   120..136 by 90..102, so NDC x half extent 8 / 128). Textured so the
+   stage reads its colour: each texture is one colour throughout. */
+static void scene_crosshair_ff(void *dev, void *green, void *blue, void *red)
+{
+    VT(dev, SLOT_IDirect3DDevice9_SetVertexShader, HR (*)(void *, void *))(dev, NULL);
+    VT(dev, SLOT_IDirect3DDevice9_SetPixelShader, HR (*)(void *, void *))(dev, NULL);
+    rs(dev, 22, 1);
+    rs(dev, 137, 0);
+    tss(dev, 0, 1, 2);
+    tss(dev, 0, 2, 2);
+    tss(dev, 0, 4, 2);
+    tss(dev, 0, 5, 2);
+    rs(dev, 7, 0);
+    clear(dev, 0, NULL, 0x7, 0xFF000000u);
+    static const uint8_t k_decl[] = {0, 0, 0,  0, 3, 0, 9, 0, /* FLOAT4 POSITIONT */
+                                     0, 0, 16, 0, 2, 0, 5, 0, /* FLOAT3 TEXCOORD0, as screen_quad writes */
+                                     0xFF, 0, 0, 0, 17, 0, 0, 0};
+    void *decl = set_decl(dev, k_decl);
+    static const float q[3][4] = {{80, 60, 176, 132}, {24, 24, 40, 36}, {120, 90, 136, 102}};
+    void *t[3] = {green, blue, red};
+    for (int i = 0; i < 3; i++) {
+        set_tex0(dev, t[i]);
+        screen_quad(dev, q[i][0], q[i][1], q[i][2], q[i][3], 0.5f, 0.5f, 0);
+    }
+    set_tex0(dev, NULL);
+    tss(dev, 0, 2, 0);
+    tss(dev, 0, 5, 0);
+    rs(dev, 7, 1);
+    present(dev);
+    release(decl);
+}
+
 /* The 3D sky as the source engine draws it in la_hub_1: a world draw into
    the back buffer from the sky's own camera far away (the yellow quad of
    scene_stereo_ff, seen from a view 500 units over), with no depth clear
@@ -3453,6 +3489,61 @@ static void fullview_tests(void *d3d)
                   mode, right_r, ok[2]);
         }
 
+        /* The game's crosshair: the small textured quad at the middle
+           leaves both eyes, and the slot says where it was and how big on
+           the panel, for the compositor's reticle; the wide quad over the
+           middle and the small one off it stay. A frame without it says
+           none. */
+        {
+            uint32_t argb[3] = {0xFF00FF00u, 0xFF0000FFu, 0xFFFF0000u}, side[3] = {64, 8, 8};
+            void *tx[3];
+            int made = 1;
+            for (int i = 0; i < 3; i++) {
+                tx[i] = new_texture(dev, side[i], side[i], 1, 21, 1, NULL);
+                if (tx[i]) fill(tx[i], -1, &argb[i], 4, side[i], side[i], 0);
+                made &= tx[i] != NULL;
+            }
+            metal_d3d9_shown_frame sx, sn;
+            memset(&sx, 0, sizeof sx);
+            memset(&sn, 0, sizeof sn);
+            uint32_t lx = 0, ln = 0, eye_g = 0, eye_b = 0, eye_r = 0;
+            if (made) {
+                uint64_t want_ = handed(&r) + 2;
+                clear(dev, 0, NULL, 0x1, 0xFF000000u);
+                present(dev);
+                scene_crosshair_ff(dev, tx[0], tx[1], tx[2]);
+                lx = take_shown(&r, want_, l, rr, &sx);
+                for (int e = 0; e < 2; e++)
+                    for (uint32_t i = 0; i < SW * SH; i++) {
+                        uint32_t v = (e ? rr : l)[i];
+                        eye_g += near(v, 0, 255, 0, 8), eye_b += near(v, 0, 0, 255, 8), eye_r += near(v, 255, 0, 0, 8);
+                    }
+                save_png(threaded ? "fullview-crosshair-threaded-left" : "fullview-crosshair-inline-left", l);
+                want_ = handed(&r) + 2;
+                clear(dev, 0, NULL, 0x1, 0xFF000000u);
+                present(dev);
+                scene_overlay_ff(dev);
+                ln = take_shown(&r, want_, l, rr, &sn);
+            }
+            for (int i = 0; i < 3; i++) release(tx[i]);
+            const float px0 = tanf(METAL_D3D9_FULLVIEW_HUD_DEG * 0.5f * (float)M_PI / 180.0f);
+            /* D3D9's pixel centres: a POSITIONT pixel edge is half a pixel
+               up and left of the same NDC, so the quad's centre is too. */
+            const float hx = -0.5f / (SW * 0.5f), hy = 0.5f / (SH * 0.5f);
+            int where = sx.crosshair_shown == 1 && fabsf(sx.crosshair_ndc[0] - hx) < 1e-4f &&
+                        fabsf(sx.crosshair_ndc[1] - hy) < 1e-4f && sx.crosshair_half == 0.0f &&
+                        fabsf(sx.panel[0] - px0) < 1e-5f && fabsf(sx.panel[1] - px0 / aspect) < 1e-5f;
+            CHECK(made && lx == 2 && sx.fullview == 1 && where && !eye_r && eye_g > 0 && eye_b > 0,
+                  "full view crosshair (%s): the small textured quad at the middle leaves both eyes (%u red px), the "
+                  "wide one over it and the small one off it stay (%u green, %u blue px); the slot has it at NDC "
+                  "(%.4f, %.4f) half %.4f (want %.4f, %.4f and 0, a lone quad being no accuracy ring) on the panel %.4f by %.4f",
+                  mode, eye_r, eye_g, eye_b, (double)sx.crosshair_ndc[0], (double)sx.crosshair_ndc[1],
+                  (double)sx.crosshair_half, (double)hx, (double)hy, (double)sx.panel[0],
+                  (double)sx.panel[1]);
+            CHECK(ln == 2 && sn.fullview == 1 && !sn.crosshair_shown && sn.crosshair_half == 0.0f,
+                  "full view crosshair (%s): a frame with no crosshair says none (%d)", mode, sn.crosshair_shown);
+        }
+
         /* The 3D sky: drawn before the world's depth clear, so in each eye
            from the eye's offset divided by the sky's scale (16), the
            world's quads from the whole offset. Threaded only: inline mode
@@ -3563,6 +3654,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s LIB [METHODS_FILE]\n", argv[0]);
         return 2;
     }
+    /* The game's crosshair is left out by default, which is what the
+       crosshair test checks; a setting from the shell would change that,
+       so it is cleared before the backend reads it once. */
+    unsetenv("RT_GAME_CROSSHAIR");
     void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!lib) {
         fprintf(stderr, "dlopen %s: %s\n", argv[1], dlerror());

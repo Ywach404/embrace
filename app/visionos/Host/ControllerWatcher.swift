@@ -63,6 +63,13 @@ final class ControllerWatcher: @unchecked Sendable {
     /// fires (headset run, 2026-11-21), as the other port read its halves'
     /// state every tick rather than wait for one.
     private var grips: [(button: GCPressedStateInput, side: Int32)] = []
+    /// And each half's trigger, its grip's travel and the buttons under its
+    /// thumb, read on the same tick for the hands' poses (`HandControls`).
+    private var fingers: [(trigger: GCButtonElement?, grip: GCButtonElement, thumb: [GCButtonElement], side: Int32)] = []
+    /// And what the layout edit reads (`EditInput`): the stick's travel,
+    /// its click, and the lower and upper face buttons.
+    private var editElements: [(stick: GCDirectionPadElement?, click: GCButtonElement?, lower: GCButtonElement?,
+                                upper: GCButtonElement?, menu: GCButtonElement?, side: Int32)] = []
     private var gripDown: [Bool] = [false, false]
     private var gripLines = 0
     private var gripTimer: Timer?
@@ -225,6 +232,13 @@ final class ControllerWatcher: @unchecked Sendable {
         }
         grips.removeAll { $0.side == side }
         grips.append((grip.pressedInput, side))
+        let buttons = controller.input.buttons
+        let thumb = [buttons[.thumbstickButton], buttons[.a], buttons[.b], buttons[.x], buttons[.y]].compactMap { $0 }
+        fingers.removeAll { $0.side == side }
+        fingers.append((controller.input.buttons[.trigger], grip, thumb, side))
+        editElements.removeAll { $0.side == side }
+        editElements.append((controller.input.dpads[.thumbstick], buttons[.thumbstickButton], buttons[.a] ?? buttons[.x],
+                             buttons[.b] ?? buttons[.y], buttons[.menu], side))
         if gripTimer == nil {
             gripTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.pollGrips() }
@@ -234,6 +248,30 @@ final class ControllerWatcher: @unchecked Sendable {
     }
 
     private func pollGrips() {
+        for e in editElements {
+            EditInput.shared.set(
+                side: Int(e.side),
+                EditButtons(
+                    stickX: e.stick.map { Float($0.xyAxes.value.x) } ?? 0,
+                    stickY: e.stick.map { Float($0.xyAxes.value.y) } ?? 0,
+                    stickClick: e.click?.pressedInput.isPressed ?? false,
+                    lower: e.lower?.pressedInput.isPressed ?? false,
+                    upper: e.upper?.pressedInput.isPressed ?? false,
+                    menu: e.menu?.pressedInput.isPressed ?? false
+                )
+            )
+        }
+        for f in fingers {
+            func value(_ b: GCButtonElement?) -> Float {
+                guard let b else { return 0 }
+                return max(b.pressedInput.value, b.pressedInput.isPressed ? 1 : 0)
+            }
+            let touched = f.thumb.contains { ($0.touchedInput?.isTouched ?? false) || $0.pressedInput.isPressed }
+            HandControls.shared.set(
+                side: Int(f.side),
+                HandControlState(trigger: value(f.trigger), grip: value(f.grip), thumb: touched ? 1 : 0)
+            )
+        }
         for g in grips {
             let down = g.button.isPressed
             let i = Int(g.side)

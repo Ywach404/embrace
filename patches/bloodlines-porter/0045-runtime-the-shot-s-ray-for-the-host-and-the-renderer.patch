@@ -1,0 +1,221 @@
+From ac1f30359dcde6201c1b3a19c3297326fdfe66ec Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 11:51:05 -0600
+Subject: [PATCH] runtime: the shot's ray for the host and the renderer
+
+In third person the game draws its crosshair as a mark in the world whose
+shape and spread change per weapon, so placing a reticle by recognising
+that mark breaks with every weapon. The shot itself is simpler: it leaves
+the player's eye along the engine's view angles. rt_player_aim reads both
+from the game behind the local player and CInput vtable checks, only in
+third person: the eye is the abs origin GetAbsOrigin returns (+0x23C)
+plus m_vecViewOffset (+0x148, from its RecvProps), and the direction is
+the view angles at engine +0x314868, which CreateMove copies into the
+usercmd unchanged. The third person camera (CInput +0x164 offset, +0x170
+angles) rides along for the log and the host; the renderer takes the
+camera from the frame's own view projection.
+
+The renderer reads the ray through metal_d3d9_fullview_aim_source at the
+frame's own Present, so the ray and the depth it is searched against
+belong to one frame; the pump publishes it too, with a sequence word,
+for rt_host_aim_ray on any thread. Changes of validity and a line every
+two seconds are logged, the first 40, beside the renderer's hit.
+---
+ runtime/host.h  |  11 ++++
+ runtime/input.c | 135 ++++++++++++++++++++++++++++++++++++++++++++++++
+ runtime/input.h |   4 ++
+ 3 files changed, 150 insertions(+)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index fa7b90c..3cc700e 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -67,6 +67,17 @@ int rt_host_cursor(float *u, float *v);
+  * reticle at the game's aim point rather than at the aiming hand. Any
+  * thread. */
+ int rt_host_third_person(void);
++/*
++ * rt_host_aim_ray returns 1 in third person with the player in the world,
++ * and writes the ray the player's shot leaves along, in the game's world
++ * (units, z up): eye, where it starts (the player's abs origin and view
++ * offset), and dir, unit length along the engine's view angles, which the
++ * shot's usercmd takes; and the third person camera as the game sets it
++ * up before its own adjustments, cam its origin and cam_ang its pitch,
++ * yaw and roll in degrees. 0 otherwise (first person, menus, loads). Read
++ * once a game frame; any thread.
++ */
++int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3]);
+ /*
+  * rt_host_vitals returns 1 when the player is in the world with the HUD
+  * up, and writes the health and blood the game's HUD shows with the
+diff --git a/runtime/input.c b/runtime/input.c
+index 4e524f1..fc66a9d 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1497,6 +1497,133 @@ int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va)
+     return 1;
+ }
+ 
++/* Third person aim: the ray the player's shot leaves along, for the host
++   and the renderer to put a reticle where it lands whatever the weapon,
++   rather than where the game draws its crosshair (a mark in the world
++   whose shape and spread change per weapon). The shot leaves the eye:
++   the local player's abs origin, which GetAbsOrigin (vtable +0x24, client
++   +0x9F5C0) returns as the object's own +0x23C with nothing computed, plus
++   m_vecViewOffset at +0x148 (its RecvProps register [0], [1] and [2] at
++   +0x148, +0x14C, +0x150), the sum the player's eye position, CAM_Think
++   (CInput vtable +0x70) and the view's own setup all take. It goes along
++   the engine's view angles: CInput::CreateMove (vtable +0x0C) copies
++   GetViewAngles into the usercmd's viewangles (+0x14) and writes them
++   back with SetViewAngles, with nothing of the camera's in between, and
++   in third person the stick drives them (RT_HEAD_HOLD). The camera the
++   frame is drawn from is that eye moved by CInput +0x164 and turned to
++   CInput +0x170 (vtable +0x7C, applied to the view setup's origin +0x38
++   and angles +0x50); its vtable +0x84 runs after with both and may pull
++   the camera in, so it is published for the log and the host, and the
++   renderer takes the camera from the frame's own view projection. */
++#define PLAYER_ABS_ORIGIN 0x23Cu
++#define PLAYER_VIEW_OFFSET 0x148u
++#define CINPUT_CAM_OFFSET 0x164u
++#define CINPUT_CAM_ANGLES 0x170u
++
++static int finite3(const float v[3]) { return isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]); }
++
++int rt_player_aim(float eye[3], float dir[3], float cam[3], float cam_ang[3])
++{
++    uint32_t in = rt_hook_va("client", CINPUT_RVA);
++    if (!in || panel32(in) != rt_hook_va("client", CINPUT_VTABLE_RVA) ||
++        !(panel8(in + CINPUT_THIRDPERSON) != 0 || panel8(in + CINPUT_MELEE_THIRD) != 0))
++        return 0;
++    uint32_t slot = rt_hook_va("client", LOCAL_PLAYER_RVA), va = rt_hook_va("engine", VIEW_ANGLES_RVA);
++    uint32_t player = slot ? panel32(slot) : 0;
++    if (!player || !va) return 0;
++    uint32_t vt = panel32(player);
++    if (vt != rt_hook_va("client", LOCAL_PLAYER_HL_VTABLE_RVA) && vt != rt_hook_va("client", LOCAL_PLAYER_BASE_VTABLE_RVA))
++        return 0;
++    float o[3], v[3], a[3], off[3];
++    memcpy(o, rt_host(player + PLAYER_ABS_ORIGIN), sizeof o);
++    memcpy(v, rt_host(player + PLAYER_VIEW_OFFSET), sizeof v);
++    memcpy(a, rt_host(va), sizeof a);
++    memcpy(off, rt_host(in + CINPUT_CAM_OFFSET), sizeof off);
++    memcpy(cam_ang, rt_host(in + CINPUT_CAM_ANGLES), 3 * sizeof *cam_ang);
++    if (!finite3(o) || !finite3(v) || !finite3(a) || !finite3(off) || !finite3(cam_ang)) return 0;
++    for (int i = 0; i < 3; i++) eye[i] = o[i] + v[i], cam[i] = eye[i] + off[i];
++    /* The engine's convention: pitch positive looks down, yaw turns from
++       +x towards +y, z up. */
++    float p = a[0] * (float)M_PI / 180.0f, y = a[1] * (float)M_PI / 180.0f;
++    dir[0] = cosf(p) * cosf(y);
++    dir[1] = cosf(p) * sinf(y);
++    dir[2] = -sinf(p);
++    return 1;
++}
++
++/* The last read, for the host on any thread: a sequence word, odd while
++   the game thread writes, around the valid flag and the four vectors. */
++static uint32_t s_aim_seq;
++static float s_aim[13];
++
++static int aim_take(float eye[3], float dir[3])
++{
++    static int logged, was_ok = -1;
++    static uint64_t last_ns;
++    float cam[3], ang[3], e[3], d[3];
++    int ok = rt_player_aim(e, d, cam, ang);
++    float w[13] = {(float)ok};
++    if (ok) {
++        memcpy(w + 1, e, sizeof e);
++        memcpy(w + 4, d, sizeof d);
++        memcpy(w + 7, cam, sizeof cam);
++        memcpy(w + 10, ang, sizeof ang);
++    }
++    uint32_t q = __atomic_load_n(&s_aim_seq, __ATOMIC_RELAXED);
++    __atomic_store_n(&s_aim_seq, q + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    for (int i = 0; i < 13; i++) {
++        uint32_t b;
++        memcpy(&b, &w[i], 4);
++        __atomic_store_n((uint32_t *)&s_aim[i], b, __ATOMIC_RELAXED);
++    }
++    __atomic_store_n(&s_aim_seq, q + 2, __ATOMIC_RELEASE);
++    /* On a change of validity and every two seconds while valid, the
++       first 40 times, so a run shows the ray beside the renderer's hit. */
++    uint64_t now = rt_now_ns();
++    if (logged < 40 && (ok != was_ok || (ok && now - last_ns >= 2000000000ull))) {
++        logged++;
++        last_ns = now;
++        if (ok)
++            rt_log("aim: eye %.1f %.1f %.1f dir %.3f %.3f %.3f, camera %.1f %.1f %.1f angles %.1f %.1f%s", e[0], e[1],
++                   e[2], d[0], d[1], d[2], cam[0], cam[1], cam[2], ang[0], ang[1], logged == 40 ? "; no more of these" : "");
++        else rt_log("aim: none (not third person, or no player)");
++    }
++    was_ok = ok;
++    if (ok && eye) memcpy(eye, e, sizeof e), memcpy(dir, d, sizeof d);
++    return ok;
++}
++
++int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3])
++{
++    for (int tries = 0; tries < 8; tries++) {
++        uint32_t a = __atomic_load_n(&s_aim_seq, __ATOMIC_ACQUIRE);
++        if (a & 1) continue;
++        float w[13];
++        for (int i = 0; i < 13; i++) {
++            uint32_t b = __atomic_load_n((uint32_t *)&s_aim[i], __ATOMIC_RELAXED);
++            memcpy(&w[i], &b, 4);
++        }
++        __atomic_thread_fence(__ATOMIC_ACQUIRE);
++        if (__atomic_load_n(&s_aim_seq, __ATOMIC_RELAXED) != a) continue;
++        if (!(w[0] > 0.5f)) return 0;
++        memcpy(eye, w + 1, 3 * sizeof *eye);
++        memcpy(dir, w + 4, 3 * sizeof *dir);
++        memcpy(cam, w + 7, 3 * sizeof *cam);
++        memcpy(cam_ang, w + 10, 3 * sizeof *cam_ang);
++        return 1;
++    }
++    return 0;
++}
++
++#if TARGET_OS_VISION
++/* The renderer reads the ray at the frame's own Present, on the game
++   thread, so the ray and the depth it is searched against are one
++   frame's: read at the pump, it would be the frame before's. */
++void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]));
++static int aim_for_renderer(float eye[3], float dir[3]) { return aim_take(eye, dir); }
++#endif
++
+ #if TARGET_OS_VISION
+ void metal_d3d9_immersive_view_pose(int valid, float yaw_deg, float pitch_deg);
+ void metal_d3d9_immersive_view_play(int play);
+@@ -1723,6 +1850,14 @@ void rt_input_pump_end(void)
+     dialogue_update();
+     third_person_update();
+     vitals_update();
++    aim_take(NULL, NULL);
++#if TARGET_OS_VISION
++    static int aim_registered;
++    if (!aim_registered) {
++        aim_registered = 1;
++        metal_d3d9_fullview_aim_source(aim_for_renderer);
++    }
++#endif
+     if (s_pad_started) pad_pump();
+ #if TARGET_OS_VISION
+     head_pump();
+diff --git a/runtime/input.h b/runtime/input.h
+index 6bfb7c7..6192290 100644
+--- a/runtime/input.h
++++ b/runtime/input.h
+@@ -181,6 +181,10 @@ int rt_input_head_apply(rt_headlook *h, rt_headlook_in *in, uint32_t va);
+    fill each; 0 when there is no player in the world or no HUD (input.c).
+    Game thread only: it reads the client's memory as the game leaves it. */
+ int rt_player_vitals(int *health, int *health_max, int *blood, int *blood_max);
++/* The player's shot ray and the third person camera (rt_host_aim_ray);
++   0 unless the camera is in third person with a player in the world
++   (input.c). Game thread only. */
++int rt_player_aim(float eye[3], float dir[3], float cam[3], float cam_ang[3]);
+ int rt_input_release_all(rt_input_state *s, rt_wmsg *out, int cap);
+ int rt_input_flush_move(rt_input_state *s, rt_wmsg *out, int cap);
+ void rt_input_take(rt_input_state *s, uint32_t msg, uint32_t lp);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,126 @@
+From 1b97ee5ba63bf8e65b8a2919c2f473dc4ffe0a30 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:15:32 -0600
+Subject: [PATCH] runtime: the weapon in hand for the host
+
+The host keeps each glove's place per weapon, set by the player in the
+layout editor with that weapon out, since with the hand aim the drawn
+gun's grip sits at a fixed place from the controller per weapon.
+rt_host_weapon gives the folder the first person model sits in under
+weapons/ (rifle_steyraug), from the view model's header name at +0x0C,
+updated once a game frame.
+---
+ runtime/host.h    |  7 +++++++
+ runtime/input.c   |  1 +
+ runtime/rt.h      |  2 ++
+ runtime/vmbones.c | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 57 insertions(+)
+
+diff --git a/runtime/host.h b/runtime/host.h
+index 80c4a42..f099b3e 100644
+--- a/runtime/host.h
++++ b/runtime/host.h
+@@ -87,6 +87,13 @@ int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3]);
+  * Read once a game frame; any thread.
+  */
+ int rt_host_vitals(int *health, int *health_max, int *blood, int *blood_max);
++/*
++ * rt_host_weapon writes the weapon in the player's hands as the folder
++ * its first person model sits in (rifle_steyraug, pistol_deagle), for the
++ * host to keep a glove's place per weapon, and returns 1; it writes an
++ * empty string and returns 0 with no weapon model. Any thread.
++ */
++int rt_host_weapon(char *out, int n);
+ 
+ /*
+  * The game window's UIWindow (SDL's), borrowed, or NULL before the game's
+diff --git a/runtime/input.c b/runtime/input.c
+index f710c7e..95cd825 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -2094,6 +2094,7 @@ void rt_input_pump_end(void)
+         }
+     }
+ #endif
++    rt_vm_weapon_update();
+     if (s_pad_started) pad_pump();
+ #if TARGET_OS_VISION
+     head_pump();
+diff --git a/runtime/rt.h b/runtime/rt.h
+index b5e8d12..f3286f9 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -500,6 +500,8 @@ int rt_vm_hands(float pts[18]);
+ /* The arms' hands in the model's bind pose, for the renderer to find them
+    in the arms' own draws: per hand 16 floats (vmbones.c). */
+ int rt_vm_hands_bind(float out[32]);
++/* Once a game frame: the weapon in hand for rt_host_weapon. */
++void rt_vm_weapon_update(void);
+ /* A bone name's hand: 1 right, 2 left, 0 not a hand bone. */
+ int rt_vm_bone_hand(const char *name);
+ 
+diff --git a/runtime/vmbones.c b/runtime/vmbones.c
+index 1c236d5..c85b4ac 100644
+--- a/runtime/vmbones.c
++++ b/runtime/vmbones.c
+@@ -2,6 +2,7 @@
+ #include "rt.h"
+ 
+ #include <ctype.h>
++#include <stdatomic.h>
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -426,3 +427,49 @@ int rt_vm_hands_bind(float out[32])
+     }
+     return mask;
+ }
++
++/* The weapon in the player's hands, for the host to keep a glove's place
++   per weapon: the folder its view model sits in under weapons/ (for
++   weapons/rifle_steyraug/view/v_rifle_steyraug.mdl, rifle_steyraug).
++   Updated on the game thread once a frame (rt_vm_weapon_update); the host
++   reads a copy (rt_host_weapon). The header's name is at +0x0C, after its
++   id, version and checksum. */
++static char s_weapon[2][48];
++static _Atomic int s_weapon_at;
++
++void rt_vm_weapon_update(void)
++{
++    char key[48] = "";
++    uint32_t ent = view_model(0);
++    uint32_t hdr = ent ? rd32(ent + ENT_STUDIO) : 0;
++    if (hdr && !(hdr & 3)) {
++        char name[65];
++        memcpy(name, rt_host(hdr + 0x0Cu), 64);
++        name[64] = 0;
++        const char *w = strstr(name, "weapons/");
++        if (w) {
++            w += 8;
++            int k = 0;
++            for (; k < 47 && w[k] && w[k] != '/' && isprint((unsigned char)w[k]); k++) key[k] = w[k];
++            key[k] = 0;
++        }
++    }
++    int cur = atomic_load(&s_weapon_at);
++    if (!strcmp(key, s_weapon[cur])) return;
++    int next = 1 - cur;
++    memcpy(s_weapon[next], key, sizeof key);
++    atomic_store(&s_weapon_at, next);
++    static int logs;
++    if (logs < 40) {
++        logs++;
++        rt_log("vm bones: the weapon in hand is \"%s\"", key[0] ? key : "none");
++    }
++}
++
++int rt_host_weapon(char *out, int n)
++{
++    if (!out || n <= 0) return 0;
++    const char *w = s_weapon[atomic_load(&s_weapon_at)];
++    snprintf(out, (size_t)n, "%s", w);
++    return out[0] != 0;
++}
+-- 
+2.54.0 (Apple Git-157)
+

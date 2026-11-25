@@ -918,6 +918,65 @@ static void stereo_math(void)
           "stereo scan: dp4 oPos with c8-c11 %d, m4x4 oPos c4 %d, dp4 into r2 then mov oPos %d, passthrough %d (want "
           "8 4 8 0)",
           s1, s2, s3, s4);
+
+    /* The evaluator, on the game's two shapes: a model transform in c48
+       to c50 then c8 to c11 (vs_2_0), and one bone picked per vertex by
+       a0 from a blend index (vs_1_1, no address token). */
+    static float cf[256 * 4];
+    memset(cf, 0, sizeof cf);
+    for (int k = 0; k < 4; k++) cf[4 * (8 + k) + k] = 1.0f + (float)k; /* clip = (x, 2y, 3z, 4w) */
+    cf[4 * 0 + 1] = 1.0f;                                               /* c0.y, the model step's w */
+    for (int k = 0; k < 3; k++) cf[4 * (48 + k) + k] = 1.0f, cf[4 * (48 + k) + 3] = 10.0f * (float)(k + 1);
+    uint32_t e1[96], m1 = 0;
+    e1[m1++] = 0xFFFE0200u;
+    e1[m1++] = 0x1F, e1[m1++] = 0x80000000u, e1[m1++] = dst_tok(1, 0, 0xF); /* dcl_position v0 */
+    for (int k = 0; k < 3; k++) e1[m1++] = 9, e1[m1++] = dst_tok(0, 0, 1u << k), e1[m1++] = src_tok(1, 0), e1[m1++] = src_tok(2, 48 + k);
+    e1[m1++] = 1, e1[m1++] = dst_tok(0, 0, 8), e1[m1++] = (src_tok(2, 0) & ~0xFF0000u) | 0x55u << 16; /* mov r0.w, c0.y */
+    for (int k = 0; k < 4; k++) e1[m1++] = 9, e1[m1++] = dst_tok(4, 0, 1u << k), e1[m1++] = src_tok(0, 0), e1[m1++] = src_tok(2, 8 + k);
+    e1[m1++] = 0xFFFFu;
+    static mtl_vs_eval ev;
+    float vin[MTL_VS_EVAL_INPUTS][4] = {{1, 2, 3, 1}}, got[4];
+    int ok1 = mtl_vs_eval_init(&ev, e1, m1, cf) && mtl_vs_eval_pos(&ev, (const float(*)[4])vin, got);
+    CHECK(ok1 && got[0] == 11 && got[1] == 44 && got[2] == 99 && got[3] == 4 && ev.in_mask == 1,
+          "vs eval: model then view projection gives %g %g %g %g (want 11 44 99 4)", (double)got[0], (double)got[1],
+          (double)got[2], (double)got[3]);
+    /* vs_1_1: mad r1.x, v2.z, c3.z, c3.w; mov a0.x, r1.x; dp4 r0.xyz, v0, c[a0.x + k]; mov r0.w, c0.y; m4x4 oPos, r0, c8 */
+    cf[4 * 3 + 2] = 3.0f, cf[4 * 3 + 3] = 30.0f; /* bone 1 is at c33 */
+    for (int k = 0; k < 3; k++) cf[4 * (33 + k) + k] = 2.0f;
+    uint32_t e2[96], m2 = 0;
+    e2[m2++] = 0xFFFE0101u;
+    e2[m2++] = 0x1F, e2[m2++] = 0x80000000u, e2[m2++] = dst_tok(1, 0, 0xF);
+    e2[m2++] = 0x1F, e2[m2++] = 0x80000002u, e2[m2++] = dst_tok(1, 2, 0xF); /* dcl_blendindices v2 */
+    e2[m2++] = 4, e2[m2++] = dst_tok(0, 1, 1), e2[m2++] = (src_tok(1, 2) & ~0xFF0000u) | 0xAAu << 16,
+    e2[m2++] = (src_tok(2, 3) & ~0xFF0000u) | 0xAAu << 16, e2[m2++] = (src_tok(2, 3) & ~0xFF0000u) | 0xFFu << 16;
+    e2[m2++] = 1, e2[m2++] = dst_tok(3, 0, 1), e2[m2++] = src_tok(0, 1);
+    for (int k = 0; k < 3; k++) e2[m2++] = 9, e2[m2++] = dst_tok(0, 0, 1u << k), e2[m2++] = src_tok(1, 0), e2[m2++] = src_tok(2, k) | 0x2000u;
+    e2[m2++] = 1, e2[m2++] = dst_tok(0, 0, 8), e2[m2++] = (src_tok(2, 0) & ~0xFF0000u) | 0x55u << 16;
+    e2[m2++] = 20, e2[m2++] = dst_tok(4, 0, 0xF), e2[m2++] = src_tok(0, 0), e2[m2++] = src_tok(2, 8);
+    e2[m2++] = 0xFFFFu;
+    float vin2[MTL_VS_EVAL_INPUTS][4] = {{1, 2, 3, 1}, {0, 0, 0, 1}, {0, 0, 1, 0}};
+    int ok2 = mtl_vs_eval_init(&ev, e2, m2, cf) && mtl_vs_eval_pos(&ev, (const float(*)[4])vin2, got);
+    CHECK(ok2 && got[0] == 2 && got[1] == 8 && got[2] == 18 && got[3] == 4,
+          "vs eval: bone from a0 (1.0 * 3 + 30 = c33) gives %g %g %g %g (want 2 8 18 4)", (double)got[0],
+          (double)got[1], (double)got[2], (double)got[3]);
+    /* An op it does not know (lit) on the way poisons oPos; flow control is refused. */
+    e2[m2 - 5] = 16;
+    int poisoned = mtl_vs_eval_init(&ev, e2, m2, cf) && !mtl_vs_eval_pos(&ev, (const float(*)[4])vin2, got);
+    e2[m2 - 5] = 40; /* if */
+    CHECK(poisoned && !mtl_vs_eval_init(&ev, e2, m2, cf), "vs eval: an unknown op gives no position, a branch no run");
+
+    /* The third person mark's world point: a view point (30, 40, 500)
+       drawn under an off centre projection comes back as its tangents and
+       its depth in metres; a w at or behind the eye gives none. */
+    mtl_stereo_proj_full wp_p = {0.5441f, 0.1f, 0.7915f, -0.05f, 1.0f};
+    float wx = 0.5441f * 30.0f / 500.0f + 0.1f, wy = 0.7915f * 40.0f / 500.0f - 0.05f, wpt[4];
+    int wok = mtl_stereo_world_point(&wp_p, wx, wy, 0.5441f * 0.01f, 500.0f, 1.0f / 0.0254f, wpt);
+    CHECK(wok && fabsf(wpt[0] - 0.06f) < 1e-5f && fabsf(wpt[1] - 0.08f) < 1e-5f && fabsf(wpt[2] - 0.01f) < 1e-5f &&
+              fabsf(wpt[3] - 12.7f) < 1e-4f,
+          "world point: tangents %g %g half %g at %g m (want 0.06 0.08 0.01 at 12.7)", (double)wpt[0], (double)wpt[1],
+          (double)wpt[2], (double)wpt[3]);
+    CHECK(!mtl_stereo_world_point(&wp_p, wx, wy, 0.01f, 0.0f, 39.37f, wpt) && wpt[3] == 0.0f,
+          "world point: none at w 0");
 }
 
 /* A headset view's projection as computeProjection gives it: right-up-
@@ -1606,6 +1665,328 @@ static void draw_camera_math(void)
     CHECK(ok_ff && e_ff < 0.05f, "draw camera: a fixed-function draw from its view matrix (off %.3g)", (double)e_ff);
 }
 
+
+/* The third person aim: a camera behind and above the player looking
+   along +x (world z up), the game's projection, and a scene of a wall
+   at x = 500 and the player's head, a ball round the eye, between the
+   camera and the ray's first samples. The depth each probe would read is
+   made the way the eye's depth buffer holds it: along the camera's ray
+   through the probe's own point, the nearest surface, at its w. */
+static const float k_aim_cam[3] = {-100.0f, 20.0f, 80.0f};
+static const float k_aim_eye[3] = {0.0f, 0.0f, 60.0f};
+
+static void aim_rows(float r[4][4], float near, float far)
+{
+    const float right[3] = {0, -1, 0}, up[3] = {0, 0, 1}, fwd[3] = {1, 0, 0};
+    float a = 0.5441f, b = 0.7914f, A = far / (far - near), B = -near * A;
+    for (int i = 0; i < 3; i++) {
+        r[0][i] = a * right[i];
+        r[1][i] = b * up[i];
+        r[2][i] = A * fwd[i];
+        r[3][i] = fwd[i];
+    }
+    float dr = 0, du = 0, df = 0;
+    for (int i = 0; i < 3; i++) dr += right[i] * k_aim_cam[i], du += up[i] * k_aim_cam[i], df += fwd[i] * k_aim_cam[i];
+    r[0][3] = -a * dr;
+    r[1][3] = -b * du;
+    r[2][3] = -A * df + B;
+    r[3][3] = -df;
+}
+
+/* The scene's nearest surface along the camera's ray through p, as the
+   fraction s of the way to p (s 1 is p itself); +inf for none. */
+static float aim_scene(const float p[3], int wall, int head)
+{
+    float d[3], best = INFINITY;
+    for (int i = 0; i < 3; i++) d[i] = p[i] - k_aim_cam[i];
+    if (wall && d[0] > 0.0f) best = (500.0f - k_aim_cam[0]) / d[0];
+    if (head) {
+        /* |cam + s d - eye|^2 = 12^2 */
+        float o[3], qa = 0, qb = 0, qc = -144.0f;
+        for (int i = 0; i < 3; i++) o[i] = k_aim_cam[i] - k_aim_eye[i], qa += d[i] * d[i], qb += 2 * o[i] * d[i], qc += o[i] * o[i];
+        float disc = qb * qb - 4 * qa * qc;
+        if (disc >= 0.0f) {
+            float s0 = (-qb - sqrtf(disc)) / (2 * qa);
+            if (s0 > 0.0f && s0 < best) best = s0;
+        }
+    }
+    return best;
+}
+
+static void aim_depths(const mtl_aim_ray *r, const mtl_aim_probes *p, int wall, int head, float *out)
+{
+    for (int k = 0; k < p->n; k++) {
+        float pt[3], c[4];
+        for (int i = 0; i < 3; i++) pt[i] = r->eye[i] + r->dir[i] * p->t[k];
+        float s = aim_scene(pt, wall, head);
+        if (!isfinite(s)) {
+            out[k] = 1.0f;
+            continue;
+        }
+        float q[3];
+        for (int i = 0; i < 3; i++) q[i] = k_aim_cam[i] + s * (pt[i] - k_aim_cam[i]);
+        mtl_aim_clip(r->rows, q, c);
+        out[k] = c[2] / c[3];
+    }
+}
+
+/* A scene of a few shapes for the search, the nearest along the camera's
+   ray through each probe's point, stored as the eye's depth buffer holds
+   it: the street (z 0), the wall at x 500, balls (centre and radius) and
+   one upright pole (x, y and radius). */
+typedef struct {
+    int ground, wall, balls, pole;
+    float ball[2][4];
+    float pole_at[3];
+} aim_scene_t;
+
+static float aim_ball_hit(const float o[3], const float d[3], const float b[4])
+{
+    float oc[3], qa = 0, qb = 0, qc = -b[3] * b[3];
+    for (int i = 0; i < 3; i++) oc[i] = o[i] - b[i], qa += d[i] * d[i], qb += 2 * oc[i] * d[i], qc += oc[i] * oc[i];
+    float disc = qb * qb - 4 * qa * qc;
+    if (disc < 0.0f) return INFINITY;
+    float s0 = (-qb - sqrtf(disc)) / (2 * qa);
+    return s0 > 0.0f ? s0 : INFINITY;
+}
+
+static void aim_scene_depths(const mtl_aim_ray *r, const mtl_aim_probes *p, const aim_scene_t *sc, float *out)
+{
+    for (int k = 0; k < p->n; k++) {
+        float pt[3], d[3], best = INFINITY;
+        for (int i = 0; i < 3; i++) pt[i] = r->eye[i] + r->dir[i] * p->t[k], d[i] = pt[i] - k_aim_cam[i];
+        if (sc->ground && d[2] < 0.0f) best = fminf(best, -k_aim_cam[2] / d[2]);
+        if (sc->wall && d[0] > 0.0f) best = fminf(best, (500.0f - k_aim_cam[0]) / d[0]);
+        for (int b = 0; b < sc->balls; b++) best = fminf(best, aim_ball_hit(k_aim_cam, d, sc->ball[b]));
+        if (sc->pole) {
+            /* |(cam + s d - c) in xy| = radius */
+            float ox = k_aim_cam[0] - sc->pole_at[0], oy = k_aim_cam[1] - sc->pole_at[1];
+            float qa = d[0] * d[0] + d[1] * d[1], qb = 2 * (ox * d[0] + oy * d[1]);
+            float qc = ox * ox + oy * oy - sc->pole_at[2] * sc->pole_at[2], disc = qb * qb - 4 * qa * qc;
+            if (qa > 0.0f && disc >= 0.0f) {
+                float s0 = (-qb - sqrtf(disc)) / (2 * qa);
+                if (s0 > 0.0f) best = fminf(best, s0);
+            }
+        }
+        if (!isfinite(best)) {
+            out[k] = 1.0f;
+            continue;
+        }
+        float q[3], c[4];
+        for (int i = 0; i < 3; i++) q[i] = k_aim_cam[i] + best * d[i];
+        mtl_aim_clip(r->rows, q, c);
+        out[k] = c[2] / c[3];
+    }
+}
+
+static void aim_math(void)
+{
+    mtl_aim_ray r;
+    memset(&r, 0, sizeof r);
+    r.ok = 1;
+    aim_rows(r.rows, 4.0f, 30000.0f);
+    const float vp[6] = {0, 0, 2304, 1584, 0, 1};
+    memcpy(r.vp, vp, sizeof vp);
+    memcpy(r.eye, k_aim_eye, sizeof r.eye);
+    r.dir[0] = 1.0f;
+
+    /* A world point through the rows: (400, -30, 90) is 500 ahead of the
+       camera, 50 right and 10 up, so NDC a 50 / 500 and b 10 / 500, and
+       its tangents back 0.1 and 0.02 at 500 units. */
+    const float pt[3] = {400.0f, -30.0f, 90.0f};
+    float c[4], wp[4];
+    mtl_aim_clip(r.rows, pt, c);
+    mtl_stereo_proj_full gp;
+    int pok = mtl_stereo_proj_from_rows(r.rows[0], r.rows[1], r.rows[2], r.rows[3], &gp);
+    int wok = pok && mtl_stereo_world_point(&gp, c[0] / c[3], c[1] / c[3], 0.0f, c[3], 1.0f / 0.0254f, wp);
+    CHECK(wok && fabsf(c[0] / c[3] - 0.5441f * 0.1f) < 1e-5f && fabsf(c[1] / c[3] - 0.7914f * 0.02f) < 1e-5f &&
+              fabsf(c[3] - 500.0f) < 1e-3f && fabsf(wp[0] - 0.1f) < 1e-5f && fabsf(wp[1] - 0.02f) < 1e-5f &&
+              fabsf(wp[3] - 12.7f) < 1e-3f,
+          "aim: a world point projects to NDC %g %g w %g, tangents %g %g at %g m (want 0.05441 0.01583 500, 0.1 0.02 at "
+          "12.7)",
+          (double)(c[0] / c[3]), (double)(c[1] / c[3]), (double)c[3], (double)wp[0], (double)wp[1], (double)wp[3]);
+
+    /* The probes in an eye 1.2 units right and a little forward: each
+       one's w is the game's less the eye's forward offset, and a depth
+       stored at its own point gives that w back. */
+    mtl_stereo_proj eye_p = {0.69f, 0.27f, 0.86f, 0.09f};
+    const float t[3] = {1.2f, 0.0f, 0.5f};
+    mtl_stereo_fix fix;
+    mtl_stereo_correction3(&gp, &eye_p, t, &fix);
+    mtl_aim_probes pr;
+    int prok = mtl_aim_probe(&r, &fix, &pr);
+    int k = 100;
+    float p100[3] = {r.eye[0] + pr.t[k], r.eye[1], r.eye[2]}, c100[4];
+    mtl_aim_clip(r.rows, p100, c100);
+    float zeye = c100[2] - gp.A * t[2], weye = c100[3] - t[2];
+    float back = mtl_aim_stored_w(&pr, vp, zeye / weye);
+    CHECK(prok && pr.n == MTL_AIM_SAMPLES && fabsf(pr.t[0] - MTL_AIM_T_NEAR) < 1e-3f &&
+              fabsf(pr.t[MTL_AIM_SAMPLES - 1] - MTL_AIM_T_FAR) < 0.5f && fabsf(pr.w[k] - weye) < 1e-2f &&
+              fabsf(back - weye) < 0.01f * weye && pr.on_image > 0 && isinf(mtl_aim_stored_w(&pr, vp, 1.0f)),
+          "aim probes: %d from %g to %g, sample %d w %g (want %g), stored depth back to %g, %d on the image, the far "
+          "plane none",
+          pr.n, (double)pr.t[0], (double)pr.t[MTL_AIM_SAMPLES - 1], k, (double)pr.w[k], (double)weye, (double)back,
+          pr.on_image);
+
+    /* The search, with the game's own projection for the eye (the depths
+       below are made in it): the head hides the first samples, the wall
+       is found at t 500 to within a sample's step, and with no wall the
+       ray runs to the far end. */
+    mtl_stereo_identity(&fix);
+    mtl_aim_probe(&r, &fix, &pr);
+    static float depth[MTL_AIM_SAMPLES];
+    mtl_aim_hit h;
+    aim_depths(&r, &pr, 1, 1, depth);
+    int sok = mtl_aim_search(&r, &pr, depth, &h);
+    CHECK(sok && h.hit && fabsf(h.t - 500.0f) < 2.0f && h.hidden > 0 && fabsf(h.p[0] - 500.0f) < 2.0f &&
+              fabsf(h.w - (h.p[0] - k_aim_cam[0])) < 1e-2f,
+          "aim search: a wall at 500 behind the player's head: hit %d at t %g (sample %d), %d hidden (want a hit at "
+          "500, some hidden)",
+          h.hit, (double)h.t, h.k, h.hidden);
+    aim_depths(&r, &pr, 0, 1, depth);
+    sok = mtl_aim_search(&r, &pr, depth, &h);
+    CHECK(sok && !h.hit && h.t == MTL_AIM_T_FAR && h.k == -1,
+          "aim search: the sky: hit %d at t %g (want none, the far end %g)", h.hit, (double)h.t,
+          (double)MTL_AIM_T_FAR);
+    /* A wall 40 units out, nearer than the head is to the camera's
+       samples only by the eye's own reach: found, not passed over. */
+    aim_depths(&r, &pr, 0, 0, depth);
+    for (int q = 0; q < pr.n; q++) {
+        float p0[3] = {r.eye[0] + pr.t[q], r.eye[1], r.eye[2]};
+        float d0 = p0[0] - k_aim_cam[0], sw = (40.0f - k_aim_cam[0]) / d0, qq[3], cc[4];
+        if (sw < 1.0f) {
+            for (int i = 0; i < 3; i++) qq[i] = k_aim_cam[i] + sw * (p0[i] - k_aim_cam[i]);
+            mtl_aim_clip(r.rows, qq, cc);
+            depth[q] = cc[2] / cc[3];
+        }
+    }
+    sok = mtl_aim_search(&r, &pr, depth, &h);
+    CHECK(sok && h.hit && fabsf(h.t - 40.0f) < 0.5f, "aim search: a wall at 40: hit %d at t %g (want 40)", h.hit,
+          (double)h.t);
+
+    /* The street at a glancing angle (z 0, the eye 60 up, the camera 80):
+       the crossing is found at every pitch, where a slack of 1% alone
+       found it at some sample phases and passed over it at others. */
+    int found = 0, tries = 0;
+    float worst = 0.0f;
+    for (float deg = 4.0f; deg <= 12.0f; deg += 0.37f, tries++) {
+        float a = deg * 3.14159265f / 180.0f;
+        r.dir[0] = cosf(a), r.dir[1] = 0.0f, r.dir[2] = -sinf(a);
+        mtl_aim_probe(&r, &fix, &pr);
+        aim_scene_depths(&r, &pr, &(aim_scene_t){.ground = 1}, depth);
+        float want = 60.0f / sinf(a);
+        if (mtl_aim_search(&r, &pr, depth, &h) && h.hit) {
+            found++;
+            worst = fmaxf(worst, fabsf(h.t - want) / want);
+        }
+    }
+    CHECK(found == tries && worst < 0.01f,
+          "aim search: the street at 4 to 12 degrees down: found %d of %d, worst %.2f%% off (want all, within 1%%)",
+          found, tries, (double)(worst * 100.0f));
+
+    /* The player's own weapon on the ray 28 out and their head leaning
+       ahead of the eye (a ball 9 across, 8 ahead): neither is kept, and
+       the wall at 500 is. */
+    r.dir[0] = 1.0f, r.dir[1] = r.dir[2] = 0.0f;
+    mtl_aim_probe(&r, &fix, &pr);
+    aim_scene_t gun = {.wall = 1, .balls = 2,
+                       .ball = {{k_aim_eye[0] + 28.0f, k_aim_eye[1], k_aim_eye[2], 3.0f},
+                                {k_aim_eye[0] + 8.0f, k_aim_eye[1], k_aim_eye[2], 9.0f}}};
+    aim_scene_depths(&r, &pr, &gun, depth);
+    sok = mtl_aim_search(&r, &pr, depth, &h);
+    CHECK(sok && h.hit && fabsf(h.t - 500.0f) < 2.0f,
+          "aim search: the player's weapon and head on the ray: hit %d at t %g (want the wall at 500)", h.hit,
+          (double)h.t);
+
+    /* A thin pole (4 across) the ray passes 5 units beside, at 300, on
+       the camera's side, so the camera sees the ray go behind it: passed,
+       the wall found. A pole the ray goes through is kept. */
+    aim_scene_t pole = {.wall = 1, .pole = 1, .pole_at = {300.0f, 7.0f, 2.0f}};
+    aim_scene_depths(&r, &pr, &pole, depth);
+    int behind = 0;
+    for (int q = 0; q < pr.n; q++) {
+        if (pr.t[q] > 300.0f && pr.t[q] < 500.0f && pr.px[q][0] >= 0.0f && mtl_aim_stored_w(&pr, vp, depth[q]) < pr.w[q] - 1.0f) behind++;
+    }
+    sok = mtl_aim_search(&r, &pr, depth, &h);
+    CHECK(behind > 0 && sok && h.hit && fabsf(h.t - 500.0f) < 2.0f,
+          "aim search: a pole beside the ray (%d samples behind it): hit %d at t %g (want the wall at 500)", behind,
+          h.hit, (double)h.t);
+    pole.pole_at[1] = 0.0f;
+    aim_scene_depths(&r, &pr, &pole, depth);
+    sok = mtl_aim_search(&r, &pr, depth, &h);
+    CHECK(sok && h.hit && fabsf(h.t - 298.0f) < 3.0f, "aim search: a pole on the ray: hit %d at t %g (want 298)",
+          h.hit, (double)h.t);
+
+    /* The engine's trace: its distance is the answer, placed through the
+       rows as the search's is, with no depth read; one that met nothing
+       is the far end; no trace gives no point. */
+    r.traced = 1;
+    r.trace_hit = 1;
+    r.trace_t = 500.0f;
+    int tok = mtl_aim_traced(&r, &h);
+    CHECK(tok && h.hit && h.t == 500.0f && h.k == -1 && fabsf(h.p[0] - 500.0f) < 1e-3f &&
+              fabsf(h.w - (h.p[0] - k_aim_cam[0])) < 1e-2f,
+          "aim trace: a hit at 500: hit %d at t %g, x %g, w %g (want 500, w %g)", h.hit, (double)h.t, (double)h.p[0],
+          (double)h.w, (double)(500.0f - k_aim_cam[0]));
+    r.trace_hit = 0;
+    r.trace_t = MTL_AIM_T_FAR;
+    tok = mtl_aim_traced(&r, &h);
+    CHECK(tok && !h.hit && h.t == MTL_AIM_T_FAR, "aim trace: nothing met: hit %d at t %g (want none at %g)", h.hit,
+          (double)h.t, (double)MTL_AIM_T_FAR);
+    r.traced = 0;
+    CHECK(!mtl_aim_traced(&r, &h), "aim trace: no trace, no point");
+
+    r.ok = 0;
+    CHECK(!mtl_aim_probe(&r, &fix, &pr) && pr.n == 0, "aim: no ray, no probes");
+}
+
+/* The arms' hand from point pairs: a known turn and move come back from
+   the bind and drawn points, with noise and through clip space. */
+static void hand_fit_math(void)
+{
+    float r0[3][3], t0[3] = {120.0f, -40.5f, 63.0f};
+    double ang = 0.9, ax[3] = {0.3, -0.5, 0.81};
+    double l = sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+    for (int k = 0; k < 3; k++) ax[k] /= l;
+    double c = cos(ang), s = sin(ang), v = 1 - c;
+    double rr[3][3] = {{c + ax[0] * ax[0] * v, ax[0] * ax[1] * v - ax[2] * s, ax[0] * ax[2] * v + ax[1] * s},
+                       {ax[1] * ax[0] * v + ax[2] * s, c + ax[1] * ax[1] * v, ax[1] * ax[2] * v - ax[0] * s},
+                       {ax[2] * ax[0] * v - ax[1] * s, ax[2] * ax[1] * v + ax[0] * s, c + ax[2] * ax[2] * v}};
+    for (int j = 0; j < 3; j++)
+        for (int k = 0; k < 3; k++) r0[j][k] = (float)rr[j][k];
+    float a[40][3], b[40][3];
+    unsigned seed = 7;
+    for (int i = 0; i < 40; i++) {
+        for (int k = 0; k < 3; k++) {
+            seed = seed * 1103515245u + 12345u;
+            a[i][k] = 10.0f + 3.0f * (float)((seed >> 8) & 1023) / 1023.0f;
+        }
+        for (int j = 0; j < 3; j++) {
+            seed = seed * 1103515245u + 12345u;
+            float noise = 0.01f * ((float)((seed >> 8) & 1023) / 1023.0f - 0.5f);
+            b[i][j] = r0[j][0] * a[i][0] + r0[j][1] * a[i][1] + r0[j][2] * a[i][2] + t0[j] + noise;
+        }
+    }
+    float r[3][3], t[3], rms = -1;
+    int ok = mtl_rigid_fit((const float(*)[3])a, (const float(*)[3])b, 40, r, t, &rms);
+    float worst = 0;
+    for (int j = 0; j < 3; j++)
+        for (int k = 0; k < 3; k++) worst = fmaxf(worst, fabsf(r[j][k] - r0[j][k]));
+    float tw = fmaxf(fabsf(t[0] - t0[0]), fmaxf(fabsf(t[1] - t0[1]), fabsf(t[2] - t0[2])));
+    CHECK(ok && worst < 2e-3f && tw < 0.05f && rms < 0.01f, "hand fit: a turn of %.2f rad comes back (rotation %.4f, move %.4f, rms %.4f)",
+          ang, (double)worst, (double)tw, (double)rms);
+    CHECK(!mtl_rigid_fit((const float(*)[3])a, (const float(*)[3])b, 2, r, t, &rms), "hand fit: two points are not enough");
+
+    /* Through a perspective view projection and back. */
+    float rows[4][4] = {{1.2f, 0.1f, 0.0f, 3.0f}, {0.0f, 1.6f, 0.2f, -1.0f}, {0.05f, 0.0f, 1.0f, -4.0f}, {0.05f, 0.0f, 1.0f, 0.0f}};
+    float p[3] = {14.0f, -6.0f, 220.0f}, cl[4], back[3];
+    mtl_aim_clip(rows, p, cl);
+    int got = mtl_clip_to_world(rows, cl, back);
+    CHECK(got && fabsf(back[0] - p[0]) < 1e-3f && fabsf(back[1] - p[1]) < 1e-3f && fabsf(back[2] - p[2]) < 1e-2f,
+          "hand fit: a clip point goes back to its world point (%.3f %.3f %.3f)", (double)back[0], (double)back[1],
+          (double)back[2]);
+}
+
 int main(void)
 {
     ring_rules();
@@ -1622,6 +2003,8 @@ int main(void)
     draw_camera_math();
     overlay_cover_math();
     arm_side_math();
+    aim_math();
+    hand_fit_math();
     printf("%s: %d passed, %d failed\n", s_fail ? "FAILED" : "ALL PASS", s_pass, s_fail);
     return s_fail ? 1 : 0;
 }

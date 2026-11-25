@@ -58,6 +58,21 @@ final class SpatialInput: @unchecked Sendable {
         return 25
     }()
 
+    /// The runtime's rest offset for the gun, `RT_HANDAIM_REST`
+    /// "forward,right,up" in game units, 0,0,-3 if not set, and the game
+    /// units a metre (`RT_STEREO_UNITS_PER_M`, the inch): the gun's frame
+    /// the gloves are placed in is worked out as handaim.c works it.
+    static let handAimRest: SIMD3<Float> = {
+        let v = (ProcessInfo.processInfo.environment["RT_HANDAIM_REST"] ?? "").split(separator: ",").compactMap {
+            Float($0.trimmingCharacters(in: .whitespaces))
+        }
+        return v.count == 3 ? SIMD3(v[0], v[1], v[2]) : SIMD3(0, 0, -3)
+    }()
+    static let unitsPerMetre: Float = {
+        if let v = ProcessInfo.processInfo.environment["RT_STEREO_UNITS_PER_M"], let f = Float(v), f > 0 { return f }
+        return Float(1.0 / 0.0254)
+    }()
+
     /// The reticle's shape, `RT_RETICLE_STYLE`: 0 cross, 1 circle and dot,
     /// 2 dot, 3 circle, 4 cross and dot.
     static let reticleStyle: Int32 = {
@@ -73,11 +88,83 @@ final class SpatialInput: @unchecked Sendable {
     /// leaves it out of sight, so they are drawn where the eye already is.
     static let reticleGauges: Bool = ProcessInfo.processInfo.environment["RT_RETICLE_GAUGES"] != "0"
 
-    /// The arm HUD, in full view: the game's left gauge (health and the
-    /// portrait) on a card at the left controller and its right one (blood
-    /// and the discipline) at the right, the rest of the HUD on the panel.
-    /// On unless `RT_ARM_HUD=0`, which the backend reads too.
-    static let armHUD: Bool = ProcessInfo.processInfo.environment["RT_ARM_HUD"] != "0"
+    /// The arm HUD's old cards, in full view: the game's left gauge
+    /// (health and the portrait) on a card at the left controller and its
+    /// right one (blood and the discipline) at the right. Only with
+    /// `RT_ARM_HUD=1`, which the backend reads too; the orbs replaced them.
+    static let armHUD: Bool = ProcessInfo.processInfo.environment["RT_ARM_HUD"] == "1"
+
+    /// The orbs, in full view: health in a blue orb beside the left
+    /// controller and blood in a red one beside the right, the selected
+    /// discipline's icon above it, the game's own gauges off the panel.
+    /// On unless `RT_ORB_HUD=0` or the cards are asked for.
+    static let orbHUD: Bool = !armHUD && ProcessInfo.processInfo.environment["RT_ORB_HUD"] != "0"
+
+    /// Each orb's diameter in metres: `RT_ORB_SIZE` in centimetres, 3 to
+    /// 30, default 8, about a fist at arm's length.
+    static let orbSize: Float = {
+        if let v = ProcessInfo.processInfo.environment["RT_ORB_SIZE"], let f = Float(v), f >= 3, f <= 30 {
+            return f / 100
+        }
+        return 0.08
+    }()
+
+    /// In third person the orbs leave the hands for places beside the
+    /// body, following its facing: `RT_ORB_TP_HEIGHT` centimetres below
+    /// the eyes (default 15), `RT_ORB_TP_SIDE` out to each side (default
+    /// 25) and `RT_ORB_TP_FORWARD` ahead (default 45), about 30 degrees
+    /// off centre and a little low, where both are seen at once.
+    static let orbThirdPersonHeight: Float = orbCentimetres("RT_ORB_TP_HEIGHT", default: 15, range: -50...100)
+    static let orbThirdPersonSide: Float = orbCentimetres("RT_ORB_TP_SIDE", default: 25, range: 0...150)
+    static let orbThirdPersonForward: Float = orbCentimetres("RT_ORB_TP_FORWARD", default: 45, range: 10...200)
+
+    /// Which hand holds the health orb (the weapon and its ammunition):
+    /// `RT_ORB_HEALTH_SIDE=right` (the default, the gun hand) or `left`;
+    /// the blood orb takes the other. 1 right, 0 left, as `HandPose.Side`.
+    static let orbHealthHand: Int = ProcessInfo.processInfo.environment["RT_ORB_HEALTH_SIDE"] == "left" ? 0 : 1
+
+    /// Each orb's turn from upright with its porthole level towards the
+    /// head, in degrees: pitch turns the porthole up towards the eyes (the
+    /// cage's top leaning back, away from them; negative leans the top
+    /// towards them, the porthole down), default 40; yaw
+    /// turns it outwards (away from the body), roll turns it clockwise as
+    /// seen. `RT_ORB_PITCH`, `RT_ORB_YAW`, `RT_ORB_ROLL` give both orbs
+    /// the same, mirrored, so they tilt symmetrically; `RT_ORB_TILT_SPLIT`
+    /// as six numbers, left hand's pitch, yaw, roll then the right's,
+    /// gives each its own in the same sense (yaw outwards and roll
+    /// mirrored for the left). Index 0 the left hand, 1 the right.
+    static let orbTilt: [SIMD3<Float>] = {
+        let env = ProcessInfo.processInfo.environment
+        func degrees(_ name: String, default value: Float = 0) -> Float {
+            if let v = env[name], let f = Float(v), abs(f) <= 180 { return f }
+            return value
+        }
+        if let split = env["RT_ORB_TILT_SPLIT"] {
+            let values = split.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+            if values.count == 6, values.allSatisfy({ abs($0) <= 180 }) {
+                return [SIMD3(values[0], values[1], values[2]), SIMD3(values[3], values[4], values[5])]
+            }
+        }
+        // Pitched 40 degrees by default: the orbs sit below the eyes, so the
+        // porthole is turned up to face them.
+        let both = SIMD3<Float>(degrees("RT_ORB_PITCH", default: 40), degrees("RT_ORB_YAW"), degrees("RT_ORB_ROLL"))
+        return [both, both]
+    }()
+
+    private static func orbCentimetres(_ name: String, default value: Float, range: ClosedRange<Float>) -> Float {
+        if let v = ProcessInfo.processInfo.environment[name], let f = Float(v), range.contains(f) { return f / 100 }
+        return value / 100
+    }
+
+    /// How far each orb's centre sits out from its grip, away from the
+    /// body, in metres: `RT_ORB_OFFSET` in centimetres, 0 to 40, default 9,
+    /// clear of the hand and the controller's ring.
+    static let orbOffset: Float = {
+        if let v = ProcessInfo.processInfo.environment["RT_ORB_OFFSET"], let f = Float(v), f >= 0, f <= 40 {
+            return f / 100
+        }
+        return 0.09
+    }()
 
     /// Each card's height in metres: `RT_ARM_HUD_SIZE` in centimetres, 5 to
     /// 60, default 28. A gauge is a tall thin column, so at 14 cm it was a
@@ -107,6 +194,42 @@ final class SpatialInput: @unchecked Sendable {
             return f
         }
         return 45
+    }()
+
+    /// Our own hands at the controllers (`Hands/`), in place of the game's
+    /// first person arms, which the backend then leaves out (draw.m,
+    /// hide_arms): only with `RT_HANDS=1` until they have been seen on the
+    /// headset. Drawn in first person and in menus; in third person too
+    /// with `RT_HANDS_TP=1`.
+    static let hands: Bool = ProcessInfo.processInfo.environment["RT_HANDS"] == "1"
+    static let handsInThirdPerson: Bool = ProcessInfo.processInfo.environment["RT_HANDS_TP"] == "1"
+
+    /// The hand model's place in its controller's grip space, for fitting
+    /// it to the controller: `RT_HANDS_OFFSET` as x, y, z centimetres
+    /// (right, up, back in the grip's axes) and `RT_HANDS_ROT` as pitch,
+    /// yaw, roll degrees, both for the right hand and mirrored for the
+    /// left. The defaults put the palm round the grip with the fingers
+    /// along its forward axis.
+    static let handsOffset: SIMD3<Float> = {
+        if let v = ProcessInfo.processInfo.environment["RT_HANDS_OFFSET"] {
+            let f = v.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+            if f.count == 3, f.allSatisfy({ abs($0) <= 50 }) { return SIMD3(f[0], f[1], f[2]) / 100 }
+        }
+        return SIMD3(0.03, -0.005, 0.06)
+    }()
+    static let handsRotation: SIMD3<Float> = {
+        if let v = ProcessInfo.processInfo.environment["RT_HANDS_ROT"] {
+            let f = v.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+            if f.count == 3, f.allSatisfy({ abs($0) <= 180 }) { return SIMD3(f[0], f[1], f[2]) }
+        }
+        return SIMD3(-15, 0, 0)
+    }()
+    /// The model's scale, `RT_HANDS_SCALE`, 0.5 to 2, default 1.15: the
+    /// glove as modelled read small against the player's own hands on the
+    /// headset (2026-11-24). The layout edit changes it live.
+    static let handsScale: Float = {
+        if let v = ProcessInfo.processInfo.environment["RT_HANDS_SCALE"], let f = Float(v), f >= 0.5, f <= 2 { return f }
+        return 1.15
     }()
 
     /// Its colour, white and nearly opaque: it is drawn over the world with

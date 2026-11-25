@@ -1,0 +1,412 @@
+From 3c327c2e7374e79d27c6be6f04b65beb9014fd8e Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:53:48 -0600
+Subject: [PATCH] runtime: the view model's hand bones for gloves on the game's
+ hands
+
+The first person view model keeps the bone to world matrices its last SetupBones made. Reading the view model list, its studio header's bone names and that cache (client +0x4A0D64, +0x6AC, +0x728) after the frame is drawn gives the game's hands as its animations posed them, after the hand aim shim moved the model. RT_VM_BONES=1 logs the bones; RT_HANDS_ATTACH=1 hands them to the renderer. Nothing is called; these are reads.
+---
+ runtime/input.c              |   2 +
+ runtime/input_selftest.c     |  19 +++
+ runtime/rt.h                 |   8 +
+ runtime/sources.txt          |   1 +
+ runtime/sources_visionos.txt |   1 +
+ runtime/vmbones.c            | 287 +++++++++++++++++++++++++++++++++++
+ 6 files changed, 318 insertions(+)
+ create mode 100644 runtime/vmbones.c
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 34aa7d9..9fd445c 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1768,6 +1768,7 @@ int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3])
+    frame's: read at the pump, it would be the frame before's. */
+ void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]));
+ void metal_d3d9_fullview_aim_trace_source(int (*fn)(float *t, int *hit));
++void metal_d3d9_fullview_hands_source(int (*fn)(float pts[18]));
+ /* Which ray the shot is traced along. The eye along the engine's view
+    angles is the game's: the depth search on it sat on the game's mark in
+    most of A.'s checks. The camera's own forward (CInput +0x164 off the
+@@ -2086,6 +2087,7 @@ void rt_input_pump_end(void)
+         aim_registered = 1;
+         metal_d3d9_fullview_aim_source(aim_for_renderer);
+         metal_d3d9_fullview_aim_trace_source(aim_trace_for_renderer);
++        if (rt_vm_bones_wanted()) metal_d3d9_fullview_hands_source(rt_vm_hands);
+     }
+ #endif
+     if (s_pad_started) pad_pump();
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 64402e7..7ab0f9f 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -3038,6 +3038,24 @@ static void hang_background(void)
+     check(rt_hang_blocked_ms(30 * S, 0, 0, 0) == 0, "hang_background", "no call in progress counts nothing");
+ }
+ 
++/* The view model's hand bones are found by name: the usual rigs' right
++   and left hands, and nothing that is a finger, an arm or sideless. */
++static void vm_bone_names(void)
++{
++    static const struct {
++        const char *name;
++        int want;
++    } k[] = {
++        {"Bip01 R Hand", 1},            {"Bip01 L Hand", 2},     {"ValveBiped.Bip01_R_Hand", 1},
++        {"ValveBiped.Bip01_L_Hand", 2}, {"R_Hand", 1},           {"left hand", 2},
++        {"RightHand", 0},               {"Bip01 R Finger0", 0},  {"Bip01 R Forearm", 0},
++        {"Bip01 Head", 0},              {"hand", 0},             {"Bip01 R Finger01 hand", 0},
++    };
++    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
++        check(rt_vm_bone_hand(k[i].name) == k[i].want, "view model bone names", "\"%s\" gives %d, want %d", k[i].name,
++              rt_vm_bone_hand(k[i].name), k[i].want);
++}
++
+ int rt_input_selftest(void)
+ {
+     setvbuf(stdout, NULL, _IOLBF, 0);
+@@ -3082,6 +3100,7 @@ int rt_input_selftest(void)
+     hand_place();
+     pad_turn();
+     pad_recentre();
++    vm_bone_names();
+     printf("input selftest: %d PASS, %d FAIL\n", s_pass, s_fail);
+     return s_fail ? 1 : 0;
+ }
+diff --git a/runtime/rt.h b/runtime/rt.h
+index c6ba796..930c9c3 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -491,5 +491,13 @@ void rt_aspect_engine_init(int w, int h);
+ void rt_aspect_engine_set(int w, int h, int on);
+ void rt_hand_aim_init(void);
+ uint32_t rt_hand_aim_commands(void);
++/* The first person view model's hand bones (vmbones.c): per hand, right
++   then left, its origin and points 4 units along its x and y axes, game
++   world units. Bit 0 right found, bit 1 left. 0 when off (RT_VM_BONES,
++   RT_HANDS_ATTACH) or none. */
++int rt_vm_bones_wanted(void);
++int rt_vm_hands(float pts[18]);
++/* A bone name's hand: 1 right, 2 left, 0 not a hand bone. */
++int rt_vm_bone_hand(const char *name);
+ 
+ #endif
+diff --git a/runtime/sources.txt b/runtime/sources.txt
+index 3b7cdd7..04e04c2 100644
+--- a/runtime/sources.txt
++++ b/runtime/sources.txt
+@@ -14,6 +14,7 @@ runtime/toggles.c
+ runtime/aspect.c
+ runtime/g2b_engine.c
+ runtime/handaim.c
++runtime/vmbones.c
+ runtime/hud.m
+ runtime/fx.m
+ runtime/m9_selftest.c
+diff --git a/runtime/sources_visionos.txt b/runtime/sources_visionos.txt
+index f29e8b4..69147cd 100644
+--- a/runtime/sources_visionos.txt
++++ b/runtime/sources_visionos.txt
+@@ -14,6 +14,7 @@ runtime/toggles.c
+ runtime/aspect.c
+ runtime/g2b_engine.c
+ runtime/handaim.c
++runtime/vmbones.c
+ runtime/hud_vision.c
+ runtime/fx_vision.c
+ runtime/m9_selftest.c
+diff --git a/runtime/vmbones.c b/runtime/vmbones.c
+new file mode 100644
+index 0000000..9ace0e8
+--- /dev/null
++++ b/runtime/vmbones.c
+@@ -0,0 +1,287 @@
++#include "recomp_types.h"
++#include "rt.h"
++
++#include <ctype.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/*
++ * The first person view model's own hands, for gloves drawn where the
++ * game's hands are. The view model (gun and arms in one skinned model)
++ * keeps the bone to world matrices its last SetupBones made, so reading
++ * them after the frame is drawn gives the hands as the game posed them,
++ * reload, recoil and swap included, and after the hand aim shim moved the
++ * model (CViewRender::CopyViewModelInfoToEntities sets the entity's origin
++ * and angles from the pose record the shim adjusts, before the draw).
++ *
++ * Read from client.dll (the recompiled base):
++ *   the view models: a CUtlVector of entity handles, memory at client
++ *     +0x4A0D64 and count at +0x4A0D70, as C_BaseViewModel's lookup by
++ *     index (+0xAB1E0) walks it; a handle resolves through the entity
++ *     list (pointer at +0x2B8E98) at ((h & 0x1FFF) * 12 + 4): the entity,
++ *     then the serial, which must equal h >> 13; the model's index is at
++ *     entity +0x7D4.
++ *   the studio header: entity +0x6AC (C_BaseAnimating's model pointer,
++ *     +0x8F900); bone count at +0xF0, bone table offset at +0xF4, 0xA0 a
++ *     bone, the name's offset from the bone at +0 (Studio_BoneIndexByName,
++ *     +0x8CDC0); the model's name at +0x08.
++ *   the cached bones: C_BaseAnimating::SetupBones (+0x919C0, on the
++ *     renderable part at entity +4) copies its output from a CUtlVector
++ *     of matrix3x4_t at renderable +0x724 (count +0x730), so entity +0x728
++ *     and +0x734; the frame they were made in at renderable +0x6D8
++ *     (entity +0x6DC) against the client's frame counter at +0x49C4D4.
++ *
++ * Nothing is called; these are reads of guest memory, on the game thread
++ * at the frame's Present. Off unless RT_VM_BONES=1 (the probe's log) or
++ * RT_HANDS_ATTACH=1 (gloves on the game's hands).
++ */
++
++#define VM_LIST_RVA 0x4A0D64u
++#define VM_COUNT_RVA 0x4A0D70u
++#define ENT_LIST_RVA 0x2B8E98u
++#define FRAME_RVA 0x49C4D4u
++#define ENT_VM_INDEX 0x7D4u
++#define ENT_STUDIO 0x6ACu
++#define ENT_BONES 0x728u
++#define ENT_BONE_COUNT 0x734u
++#define ENT_BONE_FRAME 0x6DCu
++#define HDR_NAME 0x08u
++#define HDR_NUM_BONES 0xF0u
++#define HDR_BONE_INDEX 0xF4u
++#define BONE_SIZE 0xA0u
++#define BONES_MAX 256
++#define HAND_AXIS_UNITS 4.0f
++
++static uint32_t rd32(uint32_t va)
++{
++    uint32_t v;
++    memcpy(&v, rt_host(va), sizeof v);
++    return v;
++}
++
++static int env_on(const char *k)
++{
++    const char *v = getenv(k);
++    return v && *v && *v != '0';
++}
++
++int rt_vm_bones_wanted(void)
++{
++    static int s = -1;
++    if (s < 0) s = env_on("RT_VM_BONES") || env_on("RT_HANDS_ATTACH");
++    return s;
++}
++
++static uint32_t handle_entity(uint32_t h)
++{
++    if (h == 0xFFFFFFFFu) return 0;
++    uint32_t slot = rt_hook_va("client", ENT_LIST_RVA);
++    uint32_t base = slot ? rd32(slot) : 0;
++    if (!base) return 0;
++    uint32_t e = base + (h & 0x1FFFu) * 12u + 4u;
++    if (rd32(e + 4) != h >> 13) return 0;
++    return rd32(e);
++}
++
++/* The view model with index i, or 0. */
++static uint32_t view_model(int i)
++{
++    uint32_t mem_slot = rt_hook_va("client", VM_LIST_RVA), n_slot = rt_hook_va("client", VM_COUNT_RVA);
++    if (!mem_slot || !n_slot) return 0;
++    uint32_t mem = rd32(mem_slot);
++    int32_t n = (int32_t)rd32(n_slot);
++    if (!mem || (mem & 3) || n <= 0 || n > 16) return 0;
++    for (int k = 0; k < n; k++) {
++        uint32_t ent = handle_entity(rd32(mem + 4u * (uint32_t)k));
++        if (ent && !(ent & 3) && (int32_t)rd32(ent + ENT_VM_INDEX) == i) return ent;
++    }
++    return 0;
++}
++
++typedef struct {
++    uint32_t ent, hdr, bones;
++    int n, cached, fresh;
++    char model[64];
++} vm_model;
++
++static int model_of(uint32_t ent, vm_model *m)
++{
++    memset(m, 0, sizeof *m);
++    m->ent = ent;
++    m->hdr = rd32(ent + ENT_STUDIO);
++    if (!m->hdr || (m->hdr & 3)) return 0;
++    m->n = (int32_t)rd32(m->hdr + HDR_NUM_BONES);
++    if (m->n <= 0 || m->n > BONES_MAX) return 0;
++    memcpy(m->model, rt_host(m->hdr + HDR_NAME), sizeof m->model - 1);
++    for (int i = 0; i < (int)sizeof m->model; i++)
++        if (m->model[i] && !isprint((unsigned char)m->model[i])) m->model[i] = '?';
++    m->bones = rd32(ent + ENT_BONES);
++    m->cached = (int32_t)rd32(ent + ENT_BONE_COUNT);
++    uint32_t fslot = rt_hook_va("client", FRAME_RVA);
++    m->fresh = fslot && rd32(ent + ENT_BONE_FRAME) == rd32(fslot);
++    return m->bones && !(m->bones & 3) && m->cached >= m->n;
++}
++
++static void bone_name(const vm_model *m, int i, char out[48])
++{
++    uint32_t b = m->hdr + rd32(m->hdr + HDR_BONE_INDEX) + (uint32_t)i * BONE_SIZE;
++    uint32_t s = b + rd32(b);
++    const char *p = (const char *)rt_host(s);
++    int k = 0;
++    for (; k < 47 && p[k]; k++) out[k] = isprint((unsigned char)p[k]) ? p[k] : '?';
++    out[k] = 0;
++}
++
++/* The side a bone name gives, by its words: 1 right, 2 left, 0 none. A
++   word is a run of letters, so "Bip01 R Hand", "ValveBiped.Bip01_R_Hand"
++   and "R_Hand" all read as right. */
++static int name_side(const char *name)
++{
++    char w[16];
++    int side = 0;
++    for (const char *p = name; *p;) {
++        while (*p && !isalpha((unsigned char)*p)) p++;
++        int k = 0;
++        while (*p && isalpha((unsigned char)*p)) {
++            if (k < 15) w[k++] = (char)tolower((unsigned char)*p);
++            p++;
++        }
++        w[k] = 0;
++        if (!strcmp(w, "r") || !strcmp(w, "right") || !strcmp(w, "rhand")) side = 1;
++        else if (!strcmp(w, "l") || !strcmp(w, "left") || !strcmp(w, "lhand")) side = 2;
++    }
++    return side;
++}
++
++static int has_word(const char *name, const char *word)
++{
++    char low[48];
++    int k = 0;
++    for (; name[k] && k < 47; k++) low[k] = (char)tolower((unsigned char)name[k]);
++    low[k] = 0;
++    return strstr(low, word) != NULL;
++}
++
++/* A hand bone's side by its name: one with "hand" and a side and no
++   "finger" in it; 0 for any other bone. */
++int rt_vm_bone_hand(const char *name)
++{
++    if (!has_word(name, "hand") || has_word(name, "finger")) return 0;
++    return name_side(name);
++}
++
++static void find_hands(const vm_model *m, int hand[2])
++{
++    hand[0] = hand[1] = -1;
++    for (int i = 0; i < m->n; i++) {
++        char nm[48];
++        bone_name(m, i, nm);
++        int side = rt_vm_bone_hand(nm);
++        if (side == 1 && hand[0] < 0) hand[0] = i;
++        if (side == 2 && hand[1] < 0) hand[1] = i;
++    }
++}
++
++/* matrix3x4_t, rows of four: column j is axis j, column 3 the origin. */
++static void bone_points(const vm_model *m, int i, float out[9])
++{
++    float b[12];
++    memcpy(b, rt_host(m->bones + (uint32_t)i * 48u), sizeof b);
++    for (int r = 0; r < 3; r++) {
++        out[r] = b[4 * r + 3];
++        out[3 + r] = b[4 * r + 3] + HAND_AXIS_UNITS * b[4 * r + 0];
++        out[6 + r] = b[4 * r + 3] + HAND_AXIS_UNITS * b[4 * r + 1];
++    }
++}
++
++static int finite_n(const float *v, int n)
++{
++    for (int i = 0; i < n; i++)
++        if (!isfinite(v[i])) return 0;
++    return 1;
++}
++
++/* The probe's log: each model once with every bone's name, and once a
++   second while RT_VM_BONES=1 the hands as found. */
++static void probe_log(const vm_model *m, int vi, const int hand[2], const float pts[18], int mask)
++{
++    static uint32_t named[8];
++    static int named_n;
++    static uint64_t last_ns;
++    if (!env_on("RT_VM_BONES")) return;
++    int seen = 0;
++    for (int i = 0; i < named_n; i++)
++        if (named[i] == m->hdr) seen = 1;
++    if (!seen) {
++        if (named_n < 8) named[named_n++] = m->hdr;
++        else memmove(named, named + 1, 7 * sizeof *named), named[7] = m->hdr;
++        rt_log("vm bones: view model %d \"%s\", %d bones (cached %d, %s)", vi, m->model, m->n, m->cached,
++               m->fresh ? "this frame" : "an earlier frame");
++        char line[400];
++        int len = 0;
++        for (int i = 0; i < m->n; i++) {
++            char nm[48];
++            bone_name(m, i, nm);
++            int w = snprintf(line + len, sizeof line - (size_t)len, "%s%d %s", len ? ", " : "", i, nm);
++            if (w < 0 || len + w >= (int)sizeof line - 1) {
++                rt_log("vm bones:   %s", line);
++                len = 0;
++                w = snprintf(line, sizeof line, "%d %s", i, nm);
++            }
++            len += w;
++        }
++        if (len) rt_log("vm bones:   %s", line);
++    }
++    uint64_t now = rt_now_ns();
++    if (now - last_ns < 1000000000ull) return;
++    last_ns = now;
++    char rn[48] = "none", ln[48] = "none";
++    if (hand[0] >= 0) bone_name(m, hand[0], rn);
++    if (hand[1] >= 0) bone_name(m, hand[1], ln);
++    rt_log("vm bones: \"%s\" %s; right %d %s%s at %.1f %.1f %.1f x %.2f %.2f %.2f y %.2f %.2f %.2f; left %d %s%s at "
++           "%.1f %.1f %.1f x %.2f %.2f %.2f y %.2f %.2f %.2f",
++           m->model, m->fresh ? "fresh" : "stale", hand[0], rn, mask & 1 ? "" : " (none)", pts[0], pts[1], pts[2],
++           (pts[3] - pts[0]) / HAND_AXIS_UNITS, (pts[4] - pts[1]) / HAND_AXIS_UNITS, (pts[5] - pts[2]) / HAND_AXIS_UNITS,
++           (pts[6] - pts[0]) / HAND_AXIS_UNITS, (pts[7] - pts[1]) / HAND_AXIS_UNITS, (pts[8] - pts[2]) / HAND_AXIS_UNITS,
++           hand[1], ln, mask & 2 ? "" : " (none)", pts[9], pts[10], pts[11], (pts[12] - pts[9]) / HAND_AXIS_UNITS,
++           (pts[13] - pts[10]) / HAND_AXIS_UNITS, (pts[14] - pts[11]) / HAND_AXIS_UNITS,
++           (pts[15] - pts[9]) / HAND_AXIS_UNITS, (pts[16] - pts[10]) / HAND_AXIS_UNITS,
++           (pts[17] - pts[11]) / HAND_AXIS_UNITS);
++}
++
++int rt_vm_hands(float pts[18])
++{
++    memset(pts, 0, 18 * sizeof *pts);
++    if (!rt_vm_bones_wanted()) return 0;
++    static int logged_none;
++    for (int vi = 0; vi < 2; vi++) {
++        uint32_t ent = view_model(vi);
++        vm_model m;
++        if (!ent || !model_of(ent, &m)) continue;
++        int hand[2];
++        find_hands(&m, hand);
++        if (hand[0] < 0 && hand[1] < 0) {
++            probe_log(&m, vi, hand, pts, 0);
++            continue;
++        }
++        int mask = 0;
++        for (int s = 0; s < 2; s++) {
++            if (hand[s] < 0) continue;
++            bone_points(&m, hand[s], pts + 9 * s);
++            if (finite_n(pts + 9 * s, 9)) mask |= 1 << s;
++            else memset(pts + 9 * s, 0, 9 * sizeof *pts);
++        }
++        probe_log(&m, vi, hand, pts, mask);
++        if (mask) {
++            logged_none = 0;
++            return mask;
++        }
++    }
++    if (!logged_none && env_on("RT_VM_BONES")) {
++        logged_none = 1;
++        rt_log("vm bones: no view model with hand bones (third person, a menu, or no weapon)");
++    }
++    return 0;
++}
+-- 
+2.54.0 (Apple Git-157)
+

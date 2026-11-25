@@ -1,0 +1,167 @@
+From 7e08634ff913889d1b8c2440551058f50ab32053 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 22:34:24 -0600
+Subject: [PATCH] runtime: the gun takes the wrist's roll
+
+A.: "if I twist it around, it clips through". The view model took the
+hand's pitch and yaw but not its roll, so a glove placed on the grip
+and following the whole controller parted from the gun as the wrist
+twisted. The hand aim's view model pose now sets the angles' roll to
+the view's plus the tilted aim's roll about its forward
+(rt_headlook_roll, right side down positive), on the pose and its copy
+before lag. The command's angles, which the shot follows, are left as
+they were. RT_HANDAIM_ROLL=0 keeps the gun level. The selftest takes
+200 random turns apart and checks the roll and pitch come back.
+---
+ runtime/handaim.c        | 27 +++++++++++++++++++++++++--
+ runtime/headlook.c       | 13 +++++++++++++
+ runtime/headlook.h       |  5 +++++
+ runtime/input_selftest.c | 36 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/handaim.c b/runtime/handaim.c
+index c80db2f..0e2b3cd 100644
+--- a/runtime/handaim.c
++++ b/runtime/handaim.c
+@@ -97,6 +97,18 @@ static void tilt_down(float m[16])
+     }
+ }
+ 
++/* RT_HANDAIM_ROLL=0 keeps the gun level whatever the wrist does, as it
++   was before the gun took the hand's roll. */
++static int roll_wanted(void)
++{
++    static int env = -2;
++    if (env == -2) {
++        const char *v = getenv("RT_HANDAIM_ROLL");
++        env = !(v && *v == '0');
++    }
++    return env;
++}
++
+ /* RT_HANDAIM_POS=0 leaves the gun where the view model holds it and
+    turns it only, to tell a wrong place from a wrong angle on a run. */
+ static int place_wanted(void)
+@@ -178,6 +190,17 @@ static void view_model_to_hand(uint32_t rec, uint32_t angp)
+     rt_headlook_hand_aim(zero, head_yaw, head_pitch, aim, d);
+     turn(rec + REC_ANGLES, d);
+     turn(rec + REC_STILL, d);
++    /* The wrist's roll as well, so the gun cants with the hand and a glove
++       placed on its grip stays on it when the wrist twists (A.: "if I
++       twist it around, it clips through"). The view's own roll plus the
++       hand's; the shot's direction is the command's and does not roll. */
++    float roll = roll_wanted() ? rt_headlook_roll(aim) : 0.0f;
++    for (uint32_t at = REC_ANGLES + 8; at <= REC_STILL + 8; at += REC_STILL - REC_ANGLES) {
++        float r;
++        memcpy(&r, rt_host(rec + at), sizeof r);
++        r = view[2] + roll;
++        memcpy(rt_host(rec + at), &r, sizeof r);
++    }
+     /* Position only while the hand's is tracked: at state 1 ARKit gives
+        orientation alone and the translation is stale. */
+     float head[3], off[3] = {0, 0, 0};
+@@ -194,8 +217,8 @@ static void view_model_to_hand(uint32_t rec, uint32_t angp)
+     /* Two models a frame: the first pose and then one in 240, about two
+        seconds, so a run shows how far the gun was turned and moved. */
+     if (n == 1 || n % 240 == 0)
+-        rt_log("hand aim view model %u: turned pitch %.1f yaw %.1f, moved %s %.1f %.1f %.1f (state %d)", n, d[0], d[1],
+-               placed ? "by" : "not", off[0], off[1], off[2], state);
++        rt_log("hand aim view model %u: turned pitch %.1f yaw %.1f roll %.1f, moved %s %.1f %.1f %.1f (state %d)", n, d[0], d[1],
++               roll, placed ? "by" : "not", off[0], off[1], off[2], state);
+ }
+ #endif
+ 
+diff --git a/runtime/headlook.c b/runtime/headlook.c
+index d881398..c2a0df2 100644
+--- a/runtime/headlook.c
++++ b/runtime/headlook.c
+@@ -180,3 +180,16 @@ void rt_headlook_hand_offset(const float head_pos[3], float head_yaw, const floa
+     out[1] = (float)(fwd * gs + left * gc);
+     out[2] = (float)up;
+ }
++
++float rt_headlook_roll(const float m[16])
++{
++    double fx = -m[8], fy = -m[9], fz = -m[10];
++    /* Level right: the forward crossed with the room's up (y). */
++    double rx = -fz, rz = fx, rl = sqrt(rx * rx + rz * rz);
++    if (rl < 1e-6) return 0.0f;
++    rx /= rl, rz /= rl;
++    /* Level up: right crossed with forward. */
++    double ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
++    double a = m[4] * rx + m[6] * rz, b = m[4] * ux + m[5] * uy + m[6] * uz;
++    return (float)(atan2(a, b) * 57.29577951308232);
++}
+diff --git a/runtime/headlook.h b/runtime/headlook.h
+index a4a9a59..2e144f5 100644
+--- a/runtime/headlook.h
++++ b/runtime/headlook.h
+@@ -101,6 +101,11 @@ void rt_headlook_hand_aim(const float cmd[3], float head_yaw, float head_pitch,
+ /* A transform's heading and elevation, the head's convention: yaw
+    positive turning left from -Z, pitch positive up, degrees. */
+ void rt_headlook_yaw_pitch(const float m[16], float *yaw_deg, float *pitch_deg);
++/* An aim's roll about its own forward in degrees, the game's sense:
++   positive with the right side down (the up axis leaning right), from
++   level, where level is the up the yaw and pitch alone give. Together
++   with rt_headlook_yaw_pitch it gives the whole turn back. */
++float rt_headlook_roll(const float m[16]);
+ /* Hand aim's view model: where the aiming hand is from the head, in the
+    game's world units and axes (x forward, y left, z up at yaw 0), for
+    the gun to be drawn there. head_pos is the head's ARKit position in
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 66cdd10..7ba9d0b 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -2953,6 +2953,41 @@ static void aim_at(float yaw_deg, float pitch_deg, float m[16])
+     memcpy(m, r, sizeof r);
+ }
+ 
++/* The roll of an aim (headlook.c): yaw, pitch and roll give its axes
++   back, in the room's frame as ARKit has it (y up, forward -z, yaw
++   positive left, pitch up positive, roll right side down positive). */
++static void hand_roll(void)
++{
++    const double rad = 0.017453292519943295;
++    unsigned seed = 11;
++    float worst = 0;
++    for (int i = 0; i < 200; i++) {
++        double v[3];
++        for (int k = 0; k < 3; k++) {
++            seed = seed * 1103515245u + 12345u;
++            v[k] = (double)((seed >> 8) & 0xFFFF) / 65535.0;
++        }
++        double yaw = (v[0] * 360 - 180) * rad, pitch = (v[1] * 170 - 85) * rad, roll = (v[2] * 340 - 170) * rad;
++        double f[3] = {-sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch)};
++        double r0[3] = {cos(yaw), 0, -sin(yaw)};
++        double u0[3] = {r0[1] * f[2] - r0[2] * f[1], r0[2] * f[0] - r0[0] * f[2], r0[0] * f[1] - r0[1] * f[0]};
++        double u[3], r[3];
++        for (int k = 0; k < 3; k++) {
++            u[k] = u0[k] * cos(roll) + r0[k] * sin(roll);
++            r[k] = r0[k] * cos(roll) - u0[k] * sin(roll);
++        }
++        float m[16] = {(float)r[0], (float)r[1], (float)r[2], 0, (float)u[0], (float)u[1], (float)u[2], 0,
++                       (float)-f[0], (float)-f[1], (float)-f[2], 0, 0, 0, 0, 1};
++        float gy, gp, gr = rt_headlook_roll(m);
++        rt_headlook_yaw_pitch(m, &gy, &gp);
++        float e = fabsf((float)(gr - roll / rad));
++        if (e > 180) e = 360 - e;
++        e = fmaxf(e, fabsf((float)(gp - pitch / rad)));
++        if (e > worst) worst = e;
++    }
++    check(worst < 0.01f, "an aim's roll and pitch come back from its axes at 200 random turns", "worst %.5f degrees", worst);
++}
++
+ /* Hand aim's angles (headlook.c): the command stands for the head's pose,
+    and the hand's offset from it turns the command alone. */
+ static void hand_aim(void)
+@@ -3190,6 +3225,7 @@ int rt_input_selftest(void)
+     head_look_drift();
+     head_look_write();
+     hand_aim();
++    hand_roll();
+     hand_place();
+     pad_turn();
+     pad_recentre();
+-- 
+2.54.0 (Apple Git-157)
+

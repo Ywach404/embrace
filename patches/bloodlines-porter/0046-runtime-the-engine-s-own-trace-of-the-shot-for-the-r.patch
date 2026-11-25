@@ -1,0 +1,193 @@
+From 230c9424fe8e20d2c77a3925eddfb4523866cc05 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:18:53 -0600
+Subject: [PATCH] runtime: the engine's own trace of the shot for the renderer
+
+The third person reticle was placed by searching the frame's depth along
+the shot's ray, which guessed wrong at fences whose bars bullets pass,
+at the edges of characters and at thin poles. The client's own shot
+trace (TraceRay with MASK_SHOT through a filter that skips the player)
+answers exactly, so the renderer is handed its distance along the ray
+at the frame's Present, on the guest thread that holds the lock.
+RT_AIM_TRACE=0 turns it off and the depth search is used again.
+---
+ runtime/input.c  | 108 ++++++++++++++++++++++++++++++++++++++++++++++-
+ runtime/rt.h     |   2 +
+ runtime/thread.c |  15 +++++++
+ 3 files changed, 124 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index fc66a9d..32cb391 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1551,6 +1551,82 @@ int rt_player_aim(float eye[3], float dir[3], float cam[3], float cam_ang[3])
+     return 1;
+ }
+ 
++/* Where the shot lands, from the engine's own trace rather than from the
++   frame's depth: the same call the client's shots make, IEngineTrace's
++   TraceRay (vtable +0x10, the interface EngineTraceClient003 that the
++   client keeps at +0x4A582C) on a Ray_t from the eye to 8192 units along
++   the aim, MASK_SHOT (0x46004003, the mask the client's bullet traces
++   pass, +0x59BA), through a CTraceFilterSimple that skips the local
++   player (constructor +0x4B5C0: vtable, the entity to pass, collision
++   group 0). The ray is set up by Ray_t::Init (+0x5E00: start at +0,
++   delta at +0xC, is ray and is swept at +0x30 and +0x31); the trace_t
++   it fills has the end at +0xC, the fraction at +0x2C and start solid at
++   +0x37. So a fence's bars that bullets pass, the player's own model and
++   a thin pole the ray only passes behind give what the shot gives, where
++   the depth search had to guess. Only on a guest thread holding the
++   lock (the frame's Present), since it runs the game's code; elsewhere,
++   or with RT_AIM_TRACE=0, there is no trace and the renderer searches
++   the depth as before. */
++#define CLIENT_ENGINETRACE_RVA 0x4A582Cu
++#define CLIENT_FILTER_SIMPLE_RVA 0x4B5C0u
++#define CLIENT_RAY_INIT_RVA 0x5E00u
++#define ENGINETRACE_TRACERAY 0x10u
++#define MASK_SHOT 0x46004003u
++#define AIM_TRACE_LEN 8192.0f
++#define TRACE_END 0x0Cu
++#define TRACE_FRACTION 0x2Cu
++#define TRACE_START_SOLID 0x37u
++
++static int aim_trace_on(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("RT_AIM_TRACE");
++        v = !(e && !strcmp(e, "0"));
++        if (!v) rt_log("aim: the engine's trace is off (RT_AIM_TRACE=0); the renderer searches the depth");
++    }
++    return v;
++}
++
++/* 1 with *t the distance along dir to what the shot meets, *hit 0 when
++   it meets nothing within the length; 0 when no trace could be made. */
++int rt_player_aim_trace(const float eye[3], const float dir[3], float *t, int *hit)
++{
++    static uint32_t mem;
++    if (!aim_trace_on() || !rt_guest_call_ready()) return 0;
++    uint32_t tr_slot = rt_hook_va("client", CLIENT_ENGINETRACE_RVA), slot = rt_hook_va("client", LOCAL_PLAYER_RVA);
++    uint32_t filter_ctor = rt_hook_va("client", CLIENT_FILTER_SIMPLE_RVA), ray_init = rt_hook_va("client", CLIENT_RAY_INIT_RVA);
++    uint32_t trace = tr_slot ? panel32(tr_slot) : 0, player = slot ? panel32(slot) : 0;
++    if (!trace || !player || !filter_ctor || !ray_init) return 0;
++    uint32_t fn = panel32(panel32(trace) + ENGINETRACE_TRACERAY);
++    if (!fn) return 0;
++    if (!mem && !(mem = rt_heap_alloc(0x100, 1))) return 0;
++    /* ray +0x00, start +0x40, end +0x50, filter +0x60, trace +0x80 */
++    uint32_t ray = mem, start = mem + 0x40, end = mem + 0x50, filter = mem + 0x60, out = mem + 0x80;
++    float e[3];
++    for (int i = 0; i < 3; i++) e[i] = eye[i] + dir[i] * AIM_TRACE_LEN;
++    memcpy(rt_host(start), eye, 3 * sizeof *eye);
++    memcpy(rt_host(end), e, sizeof e);
++    memset(rt_host(out), 0, 0x80);
++    uint32_t a2[2] = {player, 0};
++    rt_guest_thiscall(filter_ctor, filter, 2, a2);
++    uint32_t r2[2] = {start, end};
++    rt_guest_thiscall(ray_init, ray, 2, r2);
++    uint32_t a4[4] = {ray, MASK_SHOT, filter, out};
++    rt_guest_thiscall(fn, trace, 4, a4);
++    float f;
++    memcpy(&f, rt_host(out + TRACE_FRACTION), sizeof f);
++    if (!isfinite(f) || f < 0.0f || f > 1.0f || panel8(out + TRACE_START_SOLID)) return 0;
++    *t = f * AIM_TRACE_LEN;
++    *hit = f < 1.0f;
++    return 1;
++}
++
++/* The trace made with the ray the renderer took last, on the same thread
++   and in the same call (aim_for_renderer). */
++static int s_trace_ok, s_trace_hit;
++static float s_trace_t;
++
+ /* The last read, for the host on any thread: a sequence word, odd while
+    the game thread writes, around the valid flag and the four vectors. */
+ static uint32_t s_aim_seq;
+@@ -1621,7 +1697,36 @@ int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3])
+    thread, so the ray and the depth it is searched against are one
+    frame's: read at the pump, it would be the frame before's. */
+ void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]));
+-static int aim_for_renderer(float eye[3], float dir[3]) { return aim_take(eye, dir); }
++void metal_d3d9_fullview_aim_trace_source(int (*fn)(float *t, int *hit));
++static int aim_for_renderer(float eye[3], float dir[3])
++{
++    s_trace_ok = 0;
++    if (!aim_take(eye, dir)) return 0;
++    s_trace_ok = rt_player_aim_trace(eye, dir, &s_trace_t, &s_trace_hit);
++    static int logged;
++    static uint64_t last_ns;
++    uint64_t now = rt_now_ns();
++    if (logged < 40 && now - last_ns >= 2000000000ull) {
++        logged++;
++        last_ns = now;
++        if (s_trace_ok)
++            rt_log("aim trace: %s at t %.1f (%.1f %.1f %.1f)%s", s_trace_hit ? "hits" : "meets nothing", s_trace_t,
++                   eye[0] + dir[0] * s_trace_t, eye[1] + dir[1] * s_trace_t, eye[2] + dir[2] * s_trace_t,
++                   logged == 40 ? "; no more of these" : "");
++        else rt_log("aim trace: none (not on the guest thread, or off)");
++    }
++    return 1;
++}
++
++/* The renderer's second question, right after the first: 1 with the
++   trace's distance and whether it met anything, 0 for no trace. */
++static int aim_trace_for_renderer(float *t, int *hit)
++{
++    if (!s_trace_ok) return 0;
++    *t = s_trace_t;
++    *hit = s_trace_hit;
++    return 1;
++}
+ #endif
+ 
+ #if TARGET_OS_VISION
+@@ -1856,6 +1961,7 @@ void rt_input_pump_end(void)
+     if (!aim_registered) {
+         aim_registered = 1;
+         metal_d3d9_fullview_aim_source(aim_for_renderer);
++        metal_d3d9_fullview_aim_trace_source(aim_trace_for_renderer);
+     }
+ #endif
+     if (s_pad_started) pad_pump();
+diff --git a/runtime/rt.h b/runtime/rt.h
+index 7675808..c6ba796 100644
+--- a/runtime/rt.h
++++ b/runtime/rt.h
+@@ -205,6 +205,8 @@ uint32_t rt_thread_terminate(uint32_t h, uint32_t code);
+ uint32_t rt_teb_new(uint32_t teb, uint32_t tid, uint32_t stack_lo, uint32_t stack_hi);
+ void rt_tls_zero_slot(uint32_t slot);
+ uint32_t rt_guest_call(uint32_t va, int n, const uint32_t *args);
++int rt_guest_call_ready(void);
++uint32_t rt_guest_thiscall(uint32_t va, uint32_t self, int n, const uint32_t *args);
+ void rt_lock_take(void);
+ void rt_block_begin(const char *kind, uint32_t ms);
+ void rt_block_end(void);
+diff --git a/runtime/thread.c b/runtime/thread.c
+index e75ca8b..89ca01a 100644
+--- a/runtime/thread.c
++++ b/runtime/thread.c
+@@ -363,6 +363,21 @@ void rt_thread_exit(uint32_t code)
+     pthread_exit(NULL);
+ }
+ 
++/* Whether this thread may call into the guest now: a guest thread that
++   holds the lock, or any guest thread when there is no lock. */
++int rt_guest_call_ready(void) { return t_guest && (!s_lock_on || t_held); }
++
++/* A thiscall: the object in ecx, the arguments on the stack. ecx is the
++   caller's again afterwards, as every register is. */
++uint32_t rt_guest_thiscall(uint32_t va, uint32_t self, int n, const uint32_t *args)
++{
++    uint32_t c = g_ecx;
++    g_ecx = self;
++    uint32_t r = rt_guest_call(va, n, args);
++    g_ecx = c;
++    return r;
++}
++
+ uint32_t rt_guest_call(uint32_t va, int n, const uint32_t *args)
+ {
+     if (s_lock_on && !t_held) rt_stop(5, va, "guest call to 0x%08X without the guest lock", va);
+-- 
+2.54.0 (Apple Git-157)
+

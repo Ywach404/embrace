@@ -201,6 +201,7 @@ final class WindowCoordinator {
     /// returning, the game's window moves into it and the game goes back
     /// to the window.
     func windowSceneAppeared(_ scene: UIWindowScene) {
+        keepGameAspect(scene)
         guard returning else { return }
         returning = false
         if let window = gameWindow(), window.windowScene !== scene {
@@ -210,6 +211,56 @@ final class WindowCoordinator {
             ScreenCompositor.log("game window moved into the new window scene")
         }
         returnToWindow()
+    }
+
+    /// The window keeps the game's own shape, so the frame fills it edge to
+    /// edge. One request was not enough: SDL asks for the window's size
+    /// again when it makes its window, with no restriction, and the
+    /// system clamps that size, so the window ended 16:9 (its drawable was
+    /// 1280x720 against the frame's 2304x1584, a headset run, 2026-11-23)
+    /// with glass bars either side of the frame. So while the game is in
+    /// the window its shape is checked twice a second, and when it is off
+    /// by more than a percent the same width is asked for at the frame's
+    /// aspect, resized only uniformly from then on, so a resize by the
+    /// player keeps the shape too.
+    private func keepGameAspect(_ scene: UIWindowScene) {
+        requestGameAspect(scene, width: nil)
+        guard aspectKeeper == nil else { return }
+        aspectKeeper = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                guard let self, let window = self.gameWindow(), !window.isHidden,
+                      let scene = window.windowScene else { continue }
+                let size = window.bounds.size
+                guard size.width > 0, size.height > 0 else { continue }
+                let want = Self.frameAspect
+                if abs(size.width / size.height - want) / want > 0.01 {
+                    self.requestGameAspect(scene, width: size.width)
+                }
+            }
+        }
+    }
+
+    @ObservationIgnored private var aspectKeeper: Task<Void, Never>?
+    @ObservationIgnored private var aspectRequests = 0
+
+    private static var frameAspect: CGFloat {
+        CGFloat(GameLauncher.desktopSize.width) / CGFloat(GameLauncher.desktopSize.height)
+    }
+
+    private func requestGameAspect(_ scene: UIWindowScene, width: CGFloat?) {
+        let w = width ?? CGFloat(GameLauncher.desktopSize.width)
+        let size = CGSize(width: w, height: (w / Self.frameAspect).rounded())
+        let preferences = UIWindowScene.GeometryPreferences.Vision(
+            size: size, minimumSize: nil, maximumSize: nil, resizingRestrictions: .uniform
+        )
+        aspectRequests += 1
+        if aspectRequests <= 10 {
+            ScreenCompositor.log(String(format: "window asked for %.0fx%.0f, the frame's shape", size.width, size.height))
+        }
+        scene.requestGeometryUpdate(preferences) { error in
+            ScreenCompositor.log("window shape not kept: \(error.localizedDescription)")
+        }
     }
 
     private func returnToWindow() {

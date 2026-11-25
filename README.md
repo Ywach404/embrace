@@ -6,7 +6,9 @@
 
 <img src="docs/media/embrace-downtown.gif" alt="Downtown Los Angeles in full view on Apple Vision Pro: a hand-aimed rifle, then a conversation" width="480">
 
-<img src="docs/media/hand-aimed-rifle.jpg" alt="First person, the rifle held and aimed with the controller" width="260"> <img src="docs/media/third-person-street.jpg" alt="Third person on a downtown street, the world held still around the player" width="260"> <img src="docs/media/side-gauges.jpg" alt="The health and blood gauges riding on the controllers" width="260">
+<img src="docs/media/orbs-at-the-hands.jpg" alt="First person downtown: a blood orb with the power's icon and a brass nameplate by the left hand, a health orb with the rifle and its ammo by the right" width="400"> <img src="docs/media/orbs-third-person.jpg" alt="Third person at a bus stop: the two orbs held beside the player, the katana in hand" width="400">
+
+<img src="docs/media/hand-aimed-rifle.jpg" alt="First person, the rifle held and aimed with the controller" width="260"> <img src="docs/media/third-person-street.jpg" alt="Third person on a downtown street, the world held still around the player" width="260">
 
 ## What it is
 
@@ -24,13 +26,29 @@ camera.
 - **Native Metal renderer.** The game's Direct3D 9 calls go straight to a
   Metal backend made for this port, with no Vulkan layer underneath. Its
   shaders are translated to Metal Shading Language and cached on device.
-- **Hand-aimed weapons.** Guns follow the controller in your hand, with the
-  reticle drawn at the gun hand, and health and blood shown as arcs
-  around it.
+- **Hand-aimed weapons.** Guns follow the controller in your hand and
+  tilt with your wrist. The reticle sits where the shot will land, opens
+  and closes with the weapon's spread, and carries health and blood as
+  arcs around it.
+- **A reticle that matches the game's aim.** In third person the reticle
+  sits on the game's own aim point, so it follows walls, fences and
+  characters exactly as the game's own crosshair does.
 - **PlayStation VR2 Sense controllers, tracked.** Both halves are tracked
   in the room. In menus, point a controller to move the cursor.
-- **Gauges on the controllers.** The HUD's side gauges ride on the
-  controllers instead of floating in front of your face.
+- **Caged orbs for health and blood.** The flat side gauges are replaced
+  by two glass orbs in iron and brass cages, drawn in real 3D for each
+  eye. Health rides by your gun hand with the weapon and its ammo count;
+  blood rides by the other hand with the selected power's icon and its
+  name on a brass nameplate. The liquid falls as you spend it and sloshes
+  as you move. In third person the orbs hold their place beside you.
+- **An in-game layout editor.** Hold both thumbsticks to pick up the
+  orbs, the gloves and the reticle and place them by hand, or with a
+  gizmo's move arrows, rotation rings and scale handle. Layouts are saved
+  on the headset.
+- **Gloved hands.** Optional leather gloves of the project's own design
+  follow the controllers, with fingers that answer the trigger and grip.
+  While a gun is out, the gun hand's glove steps aside so the weapon
+  stands on its own.
 - **A comfortable held camera.** In dialogue and in third person the view
   holds steady around you, so close-ups and chase views never swing with
   your head.

@@ -77,7 +77,7 @@ enum {
     RS_COLORWRITEENABLE1 = 190, RS_COLORWRITEENABLE2 = 191, RS_COLORWRITEENABLE3 = 192, RS_BLENDFACTOR = 193,
     RS_SRGBWRITEENABLE = 194, RS_DEPTHBIAS = 195, RS_SEPARATEALPHABLENDENABLE = 206, RS_SRCBLENDALPHA = 207,
     RS_DESTBLENDALPHA = 208, RS_BLENDOPALPHA = 209, RS_SPECULARENABLE = 29, RS_POINTSCALEENABLE = 157,
-    RS_POINTSCALE_B = 159, RS_POINTSCALE_C = 160,
+    RS_POINTSCALE_B = 159, RS_POINTSCALE_C = 160, RS_VERTEXBLEND = 151,
 };
 
 /* D3DSAMPLERSTATETYPE */
@@ -219,6 +219,9 @@ typedef struct {
     void *back;
     uint64_t presented_ns; /* the game's Present, for the immersive handoff's ages */
     float pose[3];         /* the head pose the frame was drawn for, latched at Present */
+    mtl_aim_ray aim;       /* third person: the shot's ray and the frame's view projection (mtl_fv_aim) */
+    mtl_vm_hands hands;    /* first person: the view model's hands (mtl_fv_aim) */
+    mtl_vm_depth vmz;      /* first person: the view model's projection and depth range (mtl_fv_aim) */
 } cmd_present;
 
 @interface MtlDrawCache : NSObject {
@@ -238,6 +241,10 @@ typedef struct {
     id<MTLBuffer> zero;                            /* the null stream, and spare zero CBVs */
     id<MTLTexture> dummy2d, dummy3d, dummycube;
     id<MTLLibrary> util_lib;
+    id<MTLComputePipelineState> aim_pso;           /* the third person aim's depth reads (mtl_aim_gather) */
+    id<MTLComputePipelineState> scene_pso;         /* the scene's depth in metres for the compositor (mtl_scene_depth) */
+    int aim_pso_failed;
+    int scene_pso_failed;
     NSString *cache_dir;
     ring_chunk ring[RING_MAX];
     uint32_t nring, cur;
@@ -253,6 +260,14 @@ typedef struct {
     uint32_t arm_x[2];                             /* and where each starts in arm_ct */
     int arm_used, arm_drawn[2], arm_broken;        /* this frame cleared it, and drew each side; no target to be had */
     mtl_arm_frame arm_last;
+    id<MTLTexture> icon_tex[2];                    /* full view, orbs: each side's picture this frame, the weapon's and the discipline's (orb_note) */
+    float icon_area[2];                            /* and its box's area */
+    id<MTLTexture> lab_ct, lab_dt;                 /* the orbs' labels: each side's glyphs drawn larger (label_enter) */
+    int lab_used;                                  /* this frame cleared it */
+    float label_px[2][4];                          /* each side's glyphs' union box in its pixels (orb_label_note) */
+    int label_on[2];
+    int xhair_n;                                   /* full view: this frame's crosshair draws so far (crosshair_note), */
+    float xhair_box[4], xhair_ring, xhair_widest;  /* their union box, the ring's x half extent and the widest's */
     mtl_pipes *pipes;                              /* functions and pipelines across runs (pipelines.h) */
 }
 @end
@@ -469,11 +484,114 @@ static id<MTLLibrary> util_library(mtl_device *d)
                                   "    o.uv = r.xy + t * r.zw; return o;\n"
                                   "}\n"
                                   "fragment float4 blit_fs(v_out i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
-                                  "                        sampler s [[sampler(0)]]) { return t.sample(s, i.uv); }\n";
+                                  "                        sampler s [[sampler(0)]]) { return t.sample(s, i.uv); }\n"
+                                  "kernel void aim_depth(depth2d<float, access::read> t [[texture(0)]],\n"
+                                  "                      constant float2 *px [[buffer(0)]], device float *out [[buffer(1)]],\n"
+                                  "                      uint i [[thread_position_in_grid]]) {\n"
+                                  "    float2 p = px[i]; uint2 q = uint2(max(p, 0.0));\n"
+                                  "    out[i] = p.x < 0.0 || q.x >= t.get_width() || q.y >= t.get_height() ? 1.0 : t.read(q);\n"
+                                  "}\n"
+                                  "kernel void scene_depth(depth2d<float, access::read> l [[texture(0)]],\n"
+                                  "                        depth2d<float, access::read> r [[texture(1)]],\n"
+                                  "                        texture2d_array<float, access::write> out [[texture(2)]],\n"
+                                  "                        constant float4 *k [[buffer(0)]], uint3 g [[thread_position_in_grid]]) {\n"
+                                  "    if (g.x >= out.get_width() || g.y >= out.get_height()) return;\n"
+                                  "    bool right = g.z == 1;\n"
+                                  "    uint w = right ? r.get_width() : l.get_width(), h = right ? r.get_height() : l.get_height();\n"
+                                  "    uint2 s = uint2(w / out.get_width(), h / out.get_height());\n"
+                                  "    float z = 1.0;\n"
+                                  "    for (uint y = 0; y < max(s.y, 1u); y++)\n"
+                                  "        for (uint x = 0; x < max(s.x, 1u); x++) {\n"
+                                  "            uint2 q = min(g.xy * s + uint2(x, y), uint2(w - 1, h - 1));\n"
+                                  "            z = min(z, right ? r.read(q) : l.read(q));\n"
+                                  "        }\n"
+                                  "    float A = right ? k[0].z : k[0].x, B = right ? k[0].w : k[0].y;\n"
+                                  "    float zn = k[1].y > 0.0 ? (z - k[1].x) / k[1].y : z;\n"
+                                  "    if (k[3].z > 0.0 && z >= k[3].x && z <= k[3].x + k[3].y) {\n"
+                                  "        A = right ? k[2].z : k[2].x; B = right ? k[2].w : k[2].y;\n"
+                                  "        zn = k[3].y > 0.0 ? (z - k[3].x) / k[3].y : z;\n"
+                                  "    }\n"
+                                  "    float m = zn < 1.0 ? B / (zn - A) * k[1].z : 0.0;\n"
+                                  "    out.write(float4(m > 0.0 && isfinite(m) ? min(m, 60000.0) : 0.0), g.xy, g.z);\n"
+                                  "}\n";
     NSError *err = nil;
     c->util_lib = [MTLD(d) newLibraryWithSource:src options:nil error:&err];
     if (!c->util_lib) mtl_log("utility library failed: %s", err.localizedDescription.UTF8String);
     return c->util_lib;
+}
+
+/* The third person aim's GPU part: one thread per probe reads the eye's
+   depth at its pixel, MTL_AIM_SAMPLES reads in all. The pixels go into
+   the front of a small shared buffer (MTL_AIM_BUF_FLOATS, more than
+   setBytes may carry) and the depths after them (MTL_AIM_DEPTH_AT), which
+   the frame's completion reads (immersive.m). The search itself is plain
+   C (stereo.c, mtl_aim_search), where it can be tested. */
+int mtl_aim_gather(mtl_device *d, void *cb, void *depth, const mtl_aim_probes *p, void *out)
+{
+    __unsafe_unretained MtlDrawCache *c = CACHE(d);
+    if (!depth || !out || p->n != MTL_AIM_SAMPLES) return 0;
+    if (!c->aim_pso && !c->aim_pso_failed) {
+        id<MTLLibrary> lib = util_library(d);
+        id<MTLFunction> fn = [lib newFunctionWithName:@"aim_depth"];
+        NSError *err = nil;
+        c->aim_pso = fn ? [MTLD(d) newComputePipelineStateWithFunction:fn error:&err] : nil;
+        if (!c->aim_pso) {
+            c->aim_pso_failed = 1;
+            mtl_log("full view: the aim's depth read pipeline failed: %s",
+                    err ? err.localizedDescription.UTF8String : "no function");
+            return 0;
+        }
+    }
+    if (!c->aim_pso) return 0;
+    id<MTLComputeCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)cb computeCommandEncoder];
+    if (!enc) return 0;
+    [enc setComputePipelineState:c->aim_pso];
+    [enc setTexture:(__bridge id<MTLTexture>)depth atIndex:0];
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)out;
+    memcpy(buf.contents, p->px, sizeof p->px);
+    [enc setBuffer:buf offset:0 atIndex:0];
+    [enc setBuffer:buf offset:MTL_AIM_DEPTH_AT * sizeof(float) atIndex:1];
+    enum { GROUP = 64 };
+    [enc dispatchThreadgroups:MTLSizeMake(MTL_AIM_SAMPLES / GROUP, 1, 1) threadsPerThreadgroup:MTLSizeMake(GROUP, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+/* The scene's depth for the compositor (immersive.m): each eye's depth
+   buffer, as stored, into metres along that eye's forward on a smaller
+   two slice target, the nearest of each block of texels kept so a hand
+   is hidden by an edge rather than seen through it. terms are each eye's
+   A and B (mtl_stereo_depth_terms) then the viewport's depth range (min,
+   max - min) and metres per unit. */
+int mtl_scene_depth(mtl_device *d, void *cb, void *left, void *right, const float terms[16], void *out)
+{
+    __unsafe_unretained MtlDrawCache *c = CACHE(d);
+    if (!left || !right || !out) return 0;
+    if (!c->scene_pso && !c->scene_pso_failed) {
+        id<MTLLibrary> lib = util_library(d);
+        id<MTLFunction> fn = [lib newFunctionWithName:@"scene_depth"];
+        NSError *err = nil;
+        c->scene_pso = fn ? [MTLD(d) newComputePipelineStateWithFunction:fn error:&err] : nil;
+        if (!c->scene_pso) {
+            c->scene_pso_failed = 1;
+            mtl_log("full view: the scene depth pipeline failed: %s", err ? err.localizedDescription.UTF8String : "no function");
+            return 0;
+        }
+    }
+    if (!c->scene_pso) return 0;
+    id<MTLComputeCommandEncoder> enc = [(__bridge id<MTLCommandBuffer>)cb computeCommandEncoder];
+    if (!enc) return 0;
+    id<MTLTexture> o = (__bridge id<MTLTexture>)out;
+    enc.label = @"scene depth";
+    [enc setComputePipelineState:c->scene_pso];
+    [enc setTexture:(__bridge id<MTLTexture>)left atIndex:0];
+    [enc setTexture:(__bridge id<MTLTexture>)right atIndex:1];
+    [enc setTexture:o atIndex:2];
+    [enc setBytes:terms length:16 * sizeof(float) atIndex:0];
+    MTLSize group = MTLSizeMake(16, 16, 1);
+    [enc dispatchThreadgroups:MTLSizeMake((o.width + 15) / 16, (o.height + 15) / 16, 2) threadsPerThreadgroup:group];
+    [enc endEncoding];
+    return 1;
 }
 
 static id<MTLRenderPipelineState> clear_pipeline(mtl_device *d, MTLPixelFormat cf, int has_ds, uint32_t flags)
@@ -1731,17 +1849,60 @@ typedef struct {
     /* Its arm HUD side from the same box (mtl_stereo_arm_side), 0 the
        panel, -1 not yet known: read in the first eye, kept for the second. */
     int8_t arm_side;
+    /* Whether it is the game's crosshair (draw.m, crosshair), -1 not yet
+       known: read in the first eye, kept for the second, as arm_side. */
+    int8_t xhair;
     uint8_t cov_stream, cov_type, cov_ok;
     uint16_t cov_off, cov_stride;
     float cov_rows[3][4];
+    /* A small world draw's box in the game's NDC (x0 x1 y0 y1) and its
+       nearest clip w, and its centre (NDC x, y and mean w), for the
+       third person crosshair and the shot dump (wbox_note): -1 not worked
+       out, 0 not to be had (wbox_why says why, wbox_behind how many
+       vertices were behind the eye), 1 known. */
+    int8_t wbox_ok, wbox_why;
+    uint16_t wbox_behind;
+    float wbox[5], wbox_c[3];
+    /* And how it was submitted, for the dump to tell submitters apart: a
+       UP draw or not, stream 0's stride, and its declaration's first
+       elements as usage and type. */
+    uint8_t wbox_up, wbox_nel;
+    uint16_t wbox_stride;
+    uint8_t wbox_decl[8][2];
     tex_ref tex[];
 } cmd_draw;
+
+/* Why a small world draw has no box (wbox_eval), for the shot dump: the
+   evaluator's refusals each say where it stopped, so a "bb ?" names its
+   cause instead of leaving it to be guessed. */
+enum {
+    WBOX_OK,
+    WBOX_DECL,    /* no declaration, POSITIONT, or instanced */
+    WBOX_BLEND,   /* fixed-function vertex blending: not one set of rows */
+    WBOX_SHADER,  /* a shader the evaluator does not run (flow control) */
+    WBOX_STREAM,  /* an input's stream is not bound, or not readable */
+    WBOX_INDEX,   /* the indices are not readable, or not an indexed or plain call */
+    WBOX_VERTEX,  /* a vertex past its buffer, or an element type not decoded */
+    WBOX_UNKNOWN, /* a position the evaluator could not work out (an op or register it does not know) */
+    WBOX_BEHIND,  /* a vertex at or behind the eye: w not positive */
+};
+
+static const char *wbox_why_name(int why)
+{
+    static const char *const k[] = {"", "declaration", "vertex blending", "shader not run", "stream", "indices",
+                                    "vertex read", "position unknown", "behind the eye"};
+    return why >= 0 && why < (int)(sizeof k / sizeof *k) ? k[why] : "?";
+}
 
 struct mtl_fv_draw {
     uint32_t off, group;
     float a;
     float cam[3];
     int has_cam;
+    /* A shader draw's view projection, c8 to c11, when it places its
+       vertices with it (MTL_POS_VIEWPROJ): the third person aim's rows. */
+    int has_rows;
+    float rows[4][4];
 };
 
 /* The common part of every draw: everything but the call, resolved from
@@ -1756,7 +1917,7 @@ typedef struct {
    is complete (mtl_fv_scan), so it only notes where they are: offsets,
    since the list's memory moves as it grows. Threaded mode only: inline
    mode has already encoded a draw by the time the list ends. */
-static void fv_note_draw(mtl_device *d, cmd_draw *cd)
+static void fv_note_draw(mtl_device *d, cmd_draw *cd, const float *rows)
 {
     if (d->fv_n == d->fv_cap) {
         uint32_t n = d->fv_cap ? d->fv_cap * 2 : 1024;
@@ -1769,7 +1930,10 @@ static void fv_note_draw(mtl_device *d, cmd_draw *cd)
                                                   d->fv_group,
                                                   cd->stereo_p.a,
                                                   {d->fv_cam[0], d->fv_cam[1], d->fv_cam[2]},
-                                                  d->fv_cam_ok};
+                                                  d->fv_cam_ok,
+                                                  rows != NULL,
+                                                  {{0}}};
+    if (rows) memcpy(d->fv_draws[d->fv_n - 1].rows, rows, sizeof d->fv_draws[0].rows);
 }
 
 /* The source engine draws the 3D sky (the distant city, a model at a
@@ -1780,6 +1944,8 @@ static void fv_note_draw(mtl_device *d, cmd_draw *cd)
    draws all share one a drew none, which is how third person looks from
    here (the game switches it per weapon, not only through its camera
    commands). Both are logged on change. */
+static int arm_known(const mtl_device *d, const void *t);
+
 void mtl_fv_scan(mtl_device *d, uint8_t *cmds, int present)
 {
     uint32_t n = d->fv_n;
@@ -1835,18 +2001,29 @@ void mtl_fv_scan(mtl_device *d, uint8_t *cmds, int present)
        cost four to five times the GPU time. The model itself is shaded
        and writes depth. */
     uint32_t sky = 0, vm = 0, screen = 0;
-    void *arm_tex = NULL;
+    void *arm_tex = NULL, *arm_tex2 = NULL;
     float vm_a = 0.0f;
+    const struct mtl_fv_draw *aim = NULL;
     for (uint32_t i = 0; i < n; i++) {
         const struct mtl_fv_draw *w = &d->fv_draws[i];
         cmd_draw *cd = (cmd_draw *)(cmds + w->off);
         int same = fabsf(w->a - main_a) <= 0.02f * main_a;
+        /* The main view's first draw with its view projection in c8 to
+           c11: the frame's world as the eyes draw it, which the third
+           person aim is projected through (mtl_fv_aim). */
+        if (!aim && w->has_rows && w->group == best && same) aim = w;
         if (w->group != best && same) {
             cd->stereo_sky = 1;
             sky++;
         } else if (w->group == best && !same) {
             vm++;
             vm_a = w->a;
+            if (!d->fv_vm_ok && w->has_rows) {
+                memcpy(d->fv_vm_rows, w->rows, sizeof d->fv_vm_rows);
+                d->fv_vm_vp[0] = cd->vp[4];
+                d->fv_vm_vp[1] = cd->vp[5];
+                d->fv_vm_ok = 1;
+            }
         }
         /* The first person arms: the view model's skinned meshes drawn with
            one shader whatever the weapon (a capture of the shotgun and the
@@ -1857,13 +2034,36 @@ void mtl_fv_scan(mtl_device *d, uint8_t *cmds, int present)
             !strcmp(mtl_sc_hash(cd->vs->sc), "0578c91b49f192fe099969e6b265821a")) {
             void *t = cd->tex[0].view[0];
             if (!arm_tex) arm_tex = t;
+            else if (t != arm_tex && !arm_tex2) arm_tex2 = t;
             cd->arm_mesh = t == arm_tex ? 1 : 2;
+        } else if (cd->ntex && !cd->arm_mesh && arm_known(d, cd->tex[0].view[0])) {
+            /* An arm texture under another shader: still the arms. */
+            cd->arm_mesh = cd->tex[0].view[0] == d->fv_arm_known[0] ? 1 : 2;
         }
         /* Whatever camera it reports: the aura's is not the model's. */
         if (!same && !cd->vs && !(cd->dss & 2)) {
             cd->stereo_screen = 1;
             screen++;
         }
+    }
+    /* The next frame's arm draws are found by these (arm_hands_note). */
+    if (arm_tex) d->fv_arm_tex[0] = arm_tex, d->fv_arm_tex[1] = arm_tex2;
+    for (int k = 0; k < 2; k++) {
+        void *t = k ? arm_tex2 : arm_tex;
+        if (t && !arm_known(d, t)) {
+            if (d->fv_arm_known_n == 4) memmove(d->fv_arm_known, d->fv_arm_known + 1, 3 * sizeof(void *)), d->fv_arm_known_n = 3;
+            d->fv_arm_known[d->fv_arm_known_n++] = t;
+        }
+    }
+    if (aim) {
+        const cmd_draw *cd = (const cmd_draw *)(cmds + aim->off);
+        memcpy(d->fv_aim_rows, aim->rows, sizeof d->fv_aim_rows);
+        /* The viewport as the rasteriser has it, without the half pixel
+           record_draw adds for D3D9's pixel centres. */
+        d->fv_aim_vp[0] = cd->vp[0] - 0.5f;
+        d->fv_aim_vp[1] = cd->vp[1] - 0.5f;
+        for (int i = 2; i < 6; i++) d->fv_aim_vp[i] = cd->vp[i];
+        d->fv_aim_ok = 1;
     }
     if (screen && d->fv_screen_logs < 4) {
         d->fv_screen_logs++;
@@ -1964,6 +2164,28 @@ static float stereo_class(mtl_device *d, const mtl_surface *rt, const mtl_blob *
     return a;
 }
 
+/* The fixed-function stage's rows taking a position to clip x, y and w,
+   from the world, view and projection the device holds now. */
+static void ff_clip_rows(const mtl_device *d, float r[3][4])
+{
+    /* D3D row vectors: clip = p W V P. */
+    float wv[16], m[16];
+    const float *w = d->st.xf[MTL_XF_WORLD0], *v = d->st.xf[MTL_XF_VIEW], *p = d->st.xf[MTL_XF_PROJ];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            wv[i * 4 + j] = 0.0f;
+            for (int q = 0; q < 4; q++) wv[i * 4 + j] += w[i * 4 + q] * v[q * 4 + j];
+        }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            m[i * 4 + j] = 0.0f;
+            for (int q = 0; q < 4; q++) m[i * 4 + j] += wv[i * 4 + q] * p[q * 4 + j];
+        }
+    static const int col[3] = {0, 1, 3};
+    for (int o = 0; o < 3; o++)
+        for (int i = 0; i < 4; i++) r[o][i] = m[i * 4 + col[o]];
+}
+
 /* Notes what fv_cover needs to read a HUD draw's positions back: the
    position element, its stream's stride, and the rows taking it to clip
    x, y and w. POSITIONT vertices are already in pixels, so their rows map
@@ -1990,22 +2212,7 @@ static void cov_note(mtl_device *d, cmd_draw *cd, const mtl_blob *decl, const dr
         r[1][1] = -2.0f / vh, r[1][3] = 1.0f + 2.0f * cd->vp[1] / vh;
         r[2][3] = 1.0f;
     } else if (k->ff_vs) {
-        /* D3D row vectors: clip = p W V P. */
-        float wv[16], m[16];
-        const float *w = d->st.xf[MTL_XF_WORLD0], *v = d->st.xf[MTL_XF_VIEW], *p = d->st.xf[MTL_XF_PROJ];
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) {
-                wv[i * 4 + j] = 0.0f;
-                for (int q = 0; q < 4; q++) wv[i * 4 + j] += w[i * 4 + q] * v[q * 4 + j];
-            }
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) {
-                m[i * 4 + j] = 0.0f;
-                for (int q = 0; q < 4; q++) m[i * 4 + j] += wv[i * 4 + q] * p[q * 4 + j];
-            }
-        static const int col[3] = {0, 1, 3};
-        for (int o = 0; o < 3; o++)
-            for (int i = 0; i < 4; i++) r[o][i] = m[i * 4 + col[o]];
+        ff_clip_rows(d, r);
     } else {
         int pr = vi->pos_regs;
         if (pr != MTL_POS_VIEWPROJ && pr != MTL_POS_MVP) return;
@@ -2202,9 +2409,14 @@ static cmd_draw *record_draw(mtl_device *d, uint32_t type, const stream_override
     cd->block = (buf_ref){block_buf, block_off, 0};
     cd->instances = 1;
     cd->stereo_a = stereo_class(d, rt, decl, &k, vi, pi, &cd->stereo_hud, &cd->stereo_p);
-    if (cd->stereo_a > 0.0f && rt == d->back && mtl_threaded(d)) fv_note_draw(d, cd);
+    if (cd->stereo_a > 0.0f && rt == d->back && mtl_threaded(d))
+        fv_note_draw(d, cd, !k.ff_vs && vi->pos_regs == MTL_POS_VIEWPROJ ? d->st.vsf + 4 * MTL_POS_VIEWPROJ : NULL);
     cd->fv_full = -1;
     cd->arm_side = -1;
+    cd->xhair = -1;
+    cd->wbox_ok = -1;
+    cd->wbox_why = 0;
+    cd->wbox_behind = 0;
     cd->cov_ok = 0;
     if (cd->stereo_hud) cov_note(d, cd, decl, &k, vi, up);
     return cd;
@@ -2256,6 +2468,345 @@ static void call_indexed(cmd_draw *cd, MTLPrimitiveType prim, uint32_t n, MTLInd
     cd->base = base;
 }
 
+/* A vertex element as the vertex stage reads it, 0 0 0 1 where it is
+   short; 0 for a type it does not decode. */
+static int wbox_elem(uint32_t type, const uint8_t *p, size_t room, float out[4])
+{
+    static const uint8_t size[17] = {4, 8, 12, 16, 4, 4, 4, 8, 4, 4, 8, 4, 8, 0, 0, 4, 8};
+    if (type > 16 || !size[type] || room < size[type]) return 0;
+    out[0] = out[1] = out[2] = 0.0f, out[3] = 1.0f;
+    switch (type) {
+    case 0: case 1: case 2: case 3: memcpy(out, p, size[type]); break;
+    case 4: /* D3DCOLOR is B G R A in memory */
+        out[0] = p[2] / 255.0f, out[1] = p[1] / 255.0f, out[2] = p[0] / 255.0f, out[3] = p[3] / 255.0f;
+        break;
+    case 5: case 8:
+        for (int i = 0; i < 4; i++) out[i] = type == 5 ? (float)p[i] : p[i] / 255.0f;
+        break;
+    case 6: case 7: case 9: case 10:
+        for (int i = 0; i < (type == 6 || type == 9 ? 2 : 4); i++) {
+            int16_t v;
+            memcpy(&v, p + 2 * i, 2);
+            out[i] = type <= 7 ? (float)v : fmaxf(v / 32767.0f, -1.0f);
+        }
+        break;
+    case 11: case 12:
+        for (int i = 0; i < (type == 11 ? 2 : 4); i++) {
+            uint16_t v;
+            memcpy(&v, p + 2 * i, 2);
+            out[i] = v / 65535.0f;
+        }
+        break;
+    case 15: case 16:
+        for (int i = 0; i < (type == 15 ? 2 : 4); i++) {
+            _Float16 v;
+            memcpy(&v, p + 2 * i, 2);
+            out[i] = (float)v;
+        }
+        break;
+    }
+    return 1;
+}
+
+/* The box of a small world draw in the game's NDC (x0 x1 y0 y1), its
+   nearest clip w, and its centre: the mean of its vertices' clip x, y
+   and w, divided through, so a quad's centre is exact under perspective
+   and the w is the depth along the game's forward axis. The third
+   person crosshair is not a HUD draw but something small in the world,
+   so finding it means projecting the world's small draws as their vertex
+   stage does: a sprite or a bone placed model part has no fixed rows to
+   project through, so a shader's own arithmetic is run on each vertex
+   (mtl_vs_eval_pos). Worked out as the draw is recorded, the one time
+   the API's constants and the vertices are all at hand. A vertex at or
+   behind the eye has no NDC, so it leaves no box (WBOX_BEHIND) rather
+   than a wrong one; behind says how many were, and wbox[4] then holds
+   the lowest w, for the dump. */
+#define WBOX_MAX_COUNT 600
+static int wbox_eval(mtl_device *d, cmd_draw *cd, uint32_t up_stride, uint32_t *behind)
+{
+    *behind = 0;
+    const mtl_state *st = &d->st;
+    const mtl_blob *decl = st->decl;
+    if (!decl || decl->has_post || cd->instances != 1) return WBOX_DECL;
+    const decl_elem *el = (const decl_elem *)decl->data;
+    uint32_t nel = decl->bytes / 8 - 1;
+    int ff = !st->vs;
+    if (ff && d->rs[RS_VERTEXBLEND]) return WBOX_BLEND;
+    static mtl_vs_eval ev; /* the game thread's, and big for a stack */
+    float rows[3][4];
+    /* The element each input reads: the shader's declared inputs, or the
+       fixed-function stage's position. */
+    int src[MTL_VS_EVAL_INPUTS];
+    for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++) src[r] = -1;
+    if (ff) {
+        ff_clip_rows(d, rows);
+        for (uint32_t i = 0; i < nel; i++)
+            if (el[i].usage == 0 && el[i].index == 0) src[0] = (int)i;
+        if (src[0] < 0) return WBOX_DECL;
+    } else {
+        size_t ntk = 0;
+        const uint32_t *tk = st->vs->sc ? mtl_sc_tokens(st->vs->sc, &ntk) : NULL;
+        if (!mtl_vs_eval_init(&ev, tk, ntk, st->vsf)) return WBOX_SHADER;
+        for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++)
+            if (ev.in_mask & (1u << r))
+                for (uint32_t i = 0; i < nel; i++)
+                    if (el[i].usage == ev.in_usage[r] && el[i].index == ev.in_index[r]) src[r] = (int)i;
+    }
+    const uint8_t *base[MTL_MAX_STREAMS] = {0};
+    size_t len[MTL_MAX_STREAMS] = {0}, stride[MTL_MAX_STREAMS] = {0};
+    for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++) {
+        if (src[r] < 0) continue;
+        uint32_t s = el[src[r]].stream;
+        if (s >= MTL_MAX_STREAMS || !(cd->streams & (1u << s))) return WBOX_STREAM;
+        if (base[s]) continue;
+        id<MTLBuffer> vb = OBJ(cd->stream[s].buf);
+        if (!vb || vb.storageMode == MTLStorageModePrivate || cd->stream[s].off > vb.length) return WBOX_STREAM;
+        base[s] = (const uint8_t *)vb.contents + cd->stream[s].off;
+        len[s] = vb.length - cd->stream[s].off;
+        stride[s] = s == 0 && up_stride ? up_stride : st->vb_stride[s];
+    }
+    const uint8_t *ix = NULL;
+    size_t isz = 0;
+    if (cd->call == CALL_INDEXED) {
+        id<MTLBuffer> ib = OBJ(cd->ib.buf);
+        isz = cd->index_type == MTLIndexTypeUInt32 ? 4 : 2;
+        if (!ib || ib.storageMode == MTLStorageModePrivate || cd->ib.off + (size_t)cd->count * isz > ib.length)
+            return WBOX_INDEX;
+        ix = (const uint8_t *)ib.contents + cd->ib.off;
+    } else if (cd->call != CALL_ARRAYS) return WBOX_INDEX;
+    float bb[5] = {INFINITY, -INFINITY, INFINITY, -INFINITY, INFINITY}, sum[3] = {0, 0, 0};
+    for (uint32_t i = 0; i < cd->count; i++) {
+        int64_t vx = ix ? (int64_t)(isz == 4 ? ((const uint32_t *)ix)[i] : ((const uint16_t *)ix)[i]) + cd->base
+                        : (int64_t)cd->start + i;
+        if (vx < 0) return WBOX_VERTEX;
+        float v[MTL_VS_EVAL_INPUTS][4] = {{0}}, clip[4];
+        for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++) {
+            v[r][3] = 1.0f;
+            if (src[r] < 0) continue;
+            const decl_elem *x = &el[src[r]];
+            size_t at = (size_t)vx * stride[x->stream] + x->offset;
+            if (at >= len[x->stream] || !wbox_elem(x->type, base[x->stream] + at, len[x->stream] - at, v[r]))
+                return WBOX_VERTEX;
+        }
+        if (ff) {
+            for (int o = 0; o < 3; o++) clip[o < 2 ? o : 3] = rows[o][0] * v[0][0] + rows[o][1] * v[0][1] + rows[o][2] * v[0][2] + rows[o][3] * v[0][3];
+        } else if (!mtl_vs_eval_pos(&ev, (const float(*)[4])v, clip)) return WBOX_UNKNOWN;
+        float w = clip[3];
+        bb[4] = fminf(bb[4], w);
+        if (!(w > 1e-6f)) {
+            (*behind)++;
+            continue;
+        }
+        float px = clip[0] / w, py = clip[1] / w;
+        bb[0] = fminf(bb[0], px), bb[1] = fmaxf(bb[1], px);
+        bb[2] = fminf(bb[2], py), bb[3] = fmaxf(bb[3], py);
+        sum[0] += clip[0], sum[1] += clip[1], sum[2] += w;
+    }
+    memcpy(cd->wbox, bb, sizeof bb);
+    if (*behind) return WBOX_BEHIND;
+    cd->wbox_c[0] = sum[0] / sum[2];
+    cd->wbox_c[1] = sum[1] / sum[2];
+    cd->wbox_c[2] = sum[2] / (float)cd->count;
+    return WBOX_OK;
+}
+
+/* A small world draw's box, for every small world draw in the frames a
+   shot may take: the shot dump's record of what the third person
+   crosshair and its neighbours are. */
+static void wbox_note(mtl_device *d, cmd_draw *cd, uint32_t up_stride)
+{
+    if (!(cd->stereo_a > 0.0f) || !cd->count || cd->count > WBOX_MAX_COUNT) return;
+    if (!mtl_frames_shot_soon(d)) return;
+    const mtl_blob *decl = d->st.decl;
+    cd->wbox_up = up_stride != 0;
+    cd->wbox_stride = (uint16_t)(up_stride ? up_stride : d->st.vb_stride[0]);
+    cd->wbox_nel = 0;
+    if (decl)
+        for (uint32_t i = 0; i < decl->bytes / 8 - 1 && cd->wbox_nel < 8; i++, cd->wbox_nel++) {
+            const decl_elem *x = (const decl_elem *)decl->data + i;
+            cd->wbox_decl[i][0] = (uint8_t)x->usage, cd->wbox_decl[i][1] = (uint8_t)x->type;
+        }
+    uint32_t behind = 0;
+    int why = wbox_eval(d, cd, up_stride, &behind);
+    cd->wbox_ok = why == WBOX_OK;
+    cd->wbox_why = (int8_t)why;
+    cd->wbox_behind = (uint16_t)(behind > 65535 ? 65535 : behind);
+}
+
+static int arm_known(const mtl_device *d, const void *t)
+{
+    for (int k = 0; t && k < d->fv_arm_known_n; k++)
+        if (d->fv_arm_known[k] == t) return 1;
+    return 0;
+}
+
+/* The arms' hands from their own draws. The game draws its first person
+   hands as a model of its own (hands/male/shared/v_shared_male_hands.mdl,
+   whatever the weapon), skinned by the shader the scan marks arm meshes
+   by; with a weapon out the arms' cached bones are not remade (A.'s gun
+   run, 2026-11-25), but the draw is posed as the game shows it. So at
+   each arm draw the palm's vertices, picked by their bind pose place
+   (the runtime gives the palm's middle and a radius, rt_vm_hands_bind),
+   are run through the draw's own shader and taken back to the world
+   through its view projection, c8 to c11; the turn and move that best
+   takes the bind palm onto the drawn one, applied to the hand bone's
+   bind frame, is the hand as drawn (arm_hands_fit at the Present). The
+   palm follows the hand bone alone, so the fit is rigid. */
+#define ARM_VS "0578c91b49f192fe099969e6b265821a"
+static void arm_hands_note(mtl_device *d, cmd_draw *cd, uint32_t up_stride)
+{
+    if (!(cd->stereo_a > 0.0f) || !d->fv_arm_known_n || !cd->ntex) return;
+    void *t = cd->tex[0].view[0];
+    if (!arm_known(d, t)) return;
+    /* Skinned: the declaration carries blend indices, so a world texture
+       that reuses a freed arm texture's object is not taken for the arms. */
+    const mtl_blob *dl = d->st.decl;
+    int skinned = 0;
+    if (dl)
+        for (uint32_t i = 0; i < dl->bytes / 8 - 1 && !skinned; i++) skinned = ((const decl_elem *)dl->data)[i].usage == 2;
+    if (!skinned) return;
+    /* Decided on the draw itself, in its own frame: in A.'s runs
+       (2026-11-25) the arms showed in frames whose scan did not mark them,
+       once with the scan's field of view test and once on the first shot
+       of a burst, as a muzzle flash's light gives the arms another
+       shader. RT_HIDE_ARMS reads it. */
+    cd->arm_mesh = t == d->fv_arm_known[0] ? 1 : 2;
+    if (!cd->vs || !cd->vs->sc || strcmp(mtl_sc_hash(cd->vs->sc), ARM_VS)) {
+        static int told;
+        if (told < 8 && cd->vs && cd->vs->sc) {
+            told++;
+            mtl_log("full view: an arm draw with another shader, %s, left out with the arms", mtl_sc_hash(cd->vs->sc));
+        }
+        return;
+    }
+    if (!d->fv_arm_bind_asked) {
+        d->fv_arm_bind_asked = 1;
+        d->fv_arm_bind_mask = mtl_immersive_hands_bind(d->fv_arm_bind);
+    }
+    int mask = d->fv_arm_bind_mask;
+    if (!mask || cd->instances != 1) return;
+    const mtl_state *st = &d->st;
+    const mtl_blob *decl = st->decl;
+    if (!decl || decl->has_post || !st->vs) return;
+    const decl_elem *el = (const decl_elem *)decl->data;
+    uint32_t nel = decl->bytes / 8 - 1;
+    static mtl_vs_eval ev; /* the game thread's, and big for a stack */
+    size_t ntk = 0;
+    const uint32_t *tk = mtl_sc_tokens(st->vs->sc, &ntk);
+    if (!mtl_vs_eval_init(&ev, tk, ntk, st->vsf)) return;
+    int src[MTL_VS_EVAL_INPUTS], posr = -1;
+    for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++) {
+        src[r] = -1;
+        if (!(ev.in_mask & (1u << r))) continue;
+        for (uint32_t i = 0; i < nel; i++)
+            if (el[i].usage == ev.in_usage[r] && el[i].index == ev.in_index[r]) src[r] = (int)i;
+        if (ev.in_usage[r] == 0 && ev.in_index[r] == 0) posr = r;
+    }
+    if (posr < 0 || src[posr] < 0) return;
+    const uint8_t *base[MTL_MAX_STREAMS] = {0};
+    size_t len[MTL_MAX_STREAMS] = {0}, stride[MTL_MAX_STREAMS] = {0};
+    for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++) {
+        if (src[r] < 0) continue;
+        uint32_t s = el[src[r]].stream;
+        if (s >= MTL_MAX_STREAMS || !(cd->streams & (1u << s))) return;
+        if (base[s]) continue;
+        id<MTLBuffer> vb = OBJ(cd->stream[s].buf);
+        if (!vb || vb.storageMode == MTLStorageModePrivate || cd->stream[s].off > vb.length) return;
+        base[s] = (const uint8_t *)vb.contents + cd->stream[s].off;
+        len[s] = vb.length - cd->stream[s].off;
+        stride[s] = s == 0 && up_stride ? up_stride : st->vb_stride[s];
+    }
+    const uint8_t *ix = NULL;
+    size_t isz = 0;
+    if (cd->call == CALL_INDEXED) {
+        id<MTLBuffer> ib = OBJ(cd->ib.buf);
+        isz = cd->index_type == MTLIndexTypeUInt32 ? 4 : 2;
+        if (!ib || ib.storageMode == MTLStorageModePrivate || cd->ib.off + (size_t)cd->count * isz > ib.length) return;
+        ix = (const uint8_t *)ib.contents + cd->ib.off;
+    } else if (cd->call != CALL_ARRAYS) return;
+    float rows[4][4];
+    memcpy(rows, st->vsf + 4 * MTL_POS_VIEWPROJ, sizeof rows);
+    if (!d->fv_arm_rows_ok) {
+        memcpy(d->fv_arm_rows, rows, sizeof rows);
+        d->fv_arm_rows_ok = 1;
+    }
+    /* Each vertex once: the last few taken are remembered per hand. */
+    int64_t seen[2][MTL_ARM_PAIRS];
+    int nseen[2] = {0, 0};
+    for (uint32_t i = 0; i < cd->count; i++) {
+        int64_t vx = ix ? (int64_t)(isz == 4 ? ((const uint32_t *)ix)[i] : ((const uint16_t *)ix)[i]) + cd->base
+                        : (int64_t)cd->start + i;
+        if (vx < 0) return;
+        float pos[4] = {0, 0, 0, 1};
+        const decl_elem *px = &el[src[posr]];
+        size_t pat = (size_t)vx * stride[px->stream] + px->offset;
+        if (pat >= len[px->stream] || !wbox_elem(px->type, base[px->stream] + pat, len[px->stream] - pat, pos)) return;
+        int want = 0;
+        for (int s = 0; s < 2; s++) {
+            if (!(mask & (1 << s)) || d->fv_arm_n[s] >= MTL_ARM_PAIRS) continue;
+            const float *b = d->fv_arm_bind + 16 * s;
+            float dx = pos[0] - b[12], dy = pos[1] - b[13], dz = pos[2] - b[14];
+            if (dx * dx + dy * dy + dz * dz > b[15] * b[15]) continue;
+            int dup = 0;
+            for (int k = 0; k < nseen[s] && !dup; k++) dup = seen[s][k] == vx;
+            if (!dup) want |= 1 << s;
+        }
+        if (!want) continue;
+        float v[MTL_VS_EVAL_INPUTS][4] = {{0}}, clip[4], w[3];
+        for (int r = 0; r < MTL_VS_EVAL_INPUTS; r++) {
+            v[r][3] = 1.0f;
+            if (src[r] < 0) continue;
+            const decl_elem *x = &el[src[r]];
+            size_t at = (size_t)vx * stride[x->stream] + x->offset;
+            if (at >= len[x->stream] || !wbox_elem(x->type, base[x->stream] + at, len[x->stream] - at, v[r])) return;
+        }
+        if (!mtl_vs_eval_pos(&ev, (const float(*)[4])v, clip) || !(clip[3] > 1e-6f) || !mtl_clip_to_world(rows, clip, w))
+            continue;
+        for (int s = 0; s < 2; s++) {
+            if (!(want & (1 << s))) continue;
+            int n = d->fv_arm_n[s]++;
+            memcpy(d->fv_arm_a[s][n], pos, sizeof d->fv_arm_a[s][n]);
+            memcpy(d->fv_arm_b[s][n], w, sizeof w);
+            if (nseen[s] < MTL_ARM_PAIRS) seen[s][nseen[s]++] = vx;
+        }
+    }
+}
+
+/* At the Present: each hand's bone as the frame drew it, from the pairs
+   the arm draws left, as the runtime's three points (origin and 4 units
+   along x and y, world units). Bit 0 right, bit 1 left; the error of each
+   fit in *rms. A fit worse than 1.5 units (the palm did not move as one,
+   or the pick took other vertices) gives nothing. */
+static int arm_hands_fit(mtl_device *d, float pts[18], float palm[6], float rms[2])
+{
+    int mask = 0;
+    for (int s = 0; s < 2; s++) {
+        rms[s] = -1.0f;
+        if (!(d->fv_arm_bind_mask & (1 << s)) || d->fv_arm_n[s] < 12) continue;
+        float r[3][3], t[3];
+        if (!mtl_rigid_fit((const float(*)[3])d->fv_arm_a[s], (const float(*)[3])d->fv_arm_b[s], d->fv_arm_n[s], r, t,
+                           &rms[s]) ||
+            !(rms[s] < 1.5f))
+            continue;
+        const float *hb = d->fv_arm_bind + 16 * s;
+        float o[3], ax[3], ay[3];
+        for (int j = 0; j < 3; j++) {
+            o[j] = r[j][0] * hb[3] + r[j][1] * hb[7] + r[j][2] * hb[11] + t[j];
+            ax[j] = r[j][0] * hb[0] + r[j][1] * hb[4] + r[j][2] * hb[8];
+            ay[j] = r[j][0] * hb[1] + r[j][1] * hb[5] + r[j][2] * hb[9];
+        }
+        for (int j = 0; j < 3; j++) palm[3 * s + j] = r[j][0] * hb[12] + r[j][1] * hb[13] + r[j][2] * hb[14] + t[j];
+        float *p = pts + 9 * s;
+        for (int j = 0; j < 3; j++) {
+            p[j] = o[j];
+            p[3 + j] = o[j] + 4.0f * ax[j];
+            p[6 + j] = o[j] + 4.0f * ay[j];
+        }
+        mask |= 1 << s;
+    }
+    return mask;
+}
+
 static HRESULT dev_dp(mtl_device *d, uint32_t type, uint32_t start, uint32_t count)
 {
     if (!count) return D3D_OK;
@@ -2270,6 +2821,8 @@ static HRESULT dev_dp(mtl_device *d, uint32_t type, uint32_t start, uint32_t cou
             } else {
                 call_arrays(cd, type, start, prim_verts(type, count), instance_count(d));
             }
+            wbox_note(d, cd, 0);
+            arm_hands_note(d, cd, 0);
             d->draws++;
         }
     }
@@ -2322,6 +2875,8 @@ static HRESULT dev_dip(mtl_device *d, uint32_t type, int32_t base, uint32_t min,
             mtl_rec_keep(d, ib->gbuf);
             draw_indexed(d, cd, type, base, count, ib->mem + (size_t)start * isize, ib->gbuf, start * isize, isize,
                          instance_count(d));
+            wbox_note(d, cd, 0);
+            arm_hands_note(d, cd, 0);
         }
     }
     mtl_rec_end(d);
@@ -2363,6 +2918,8 @@ static HRESULT dev_dp_up(mtl_device *d, uint32_t type, uint32_t count, const voi
                 } else {
                     call_arrays(cd, type, 0, n, 1);
                 }
+                wbox_note(d, cd, stride);
+                arm_hands_note(d, cd, stride);
                 d->draws++;
             }
         }
@@ -2386,7 +2943,11 @@ static HRESULT dev_dip_up(mtl_device *d, uint32_t type, uint32_t min, uint32_t n
             memcpy(p, data, (size_t)(min + num) * stride);
             up.stride = stride;
             cmd_draw *cd = record_draw(d, type, &up);
-            if (cd) draw_indexed(d, cd, type, 0, count, idx, NULL, 0, isize, instance_count(d));
+            if (cd) {
+                draw_indexed(d, cd, type, 0, count, idx, NULL, 0, isize, instance_count(d));
+                wbox_note(d, cd, stride);
+                arm_hands_note(d, cd, stride);
+            }
         }
     }
     unset_after_up(d);
@@ -3094,6 +3655,76 @@ void mtl_rec_present(mtl_device *d, void *back)
     c->presented_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     mtl_immersive_pose_now(c->pose);
     mtl_rec_keep(d, back);
+    d->fv_present_off = (uint32_t)((uint8_t *)c - mtl_rec_base(d));
+    d->fv_present_set = 1;
+}
+
+/* At the Present's submit, once the list's world draws have been scanned:
+   the frame's view projection, from its main view's draws in whichever of
+   its lists drew them, and the shot's ray as the game has it now, on the
+   game thread at the frame's own Present (mtl_immersive_aim), go into the
+   Present for the replay to search that frame's depth with. */
+/* Once a second with RT_VM_BONES=1: where the hands came from. */
+static void arm_hands_log(mtl_device *d, int from_draws, const float rms[2])
+{
+    static int on = -1;
+    static double last;
+    if (on < 0) {
+        const char *e = getenv("RT_VM_BONES");
+        on = e && *e && *e != '0';
+    }
+    if (!on) return;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - last < 1.0) return;
+    last = now;
+    if (from_draws)
+        mtl_log("vm hands: from the arms' draws, right %s (%d pairs, error %.2f), left %s (%d pairs, error %.2f)",
+                from_draws & 1 ? "fitted" : "none", d->fv_arm_n[0], (double)rms[0], from_draws & 2 ? "fitted" : "none",
+                d->fv_arm_n[1], (double)rms[1]);
+    else
+        mtl_log("vm hands: none (arm draws gave %d and %d pairs, bind pose mask %d, errors %.2f %.2f); gloves stay on the "
+                "controllers",
+                d->fv_arm_n[0], d->fv_arm_n[1], d->fv_arm_bind_mask, (double)rms[0], (double)rms[1]);
+}
+
+void mtl_fv_aim(mtl_device *d, uint8_t *cmds)
+{
+    if (!d->fv_present_set) return;
+    d->fv_present_set = 0;
+    cmd_present *c = (cmd_present *)(cmds + d->fv_present_off);
+    memset(&c->aim, 0, sizeof c->aim);
+    memset(&c->hands, 0, sizeof c->hands);
+    memset(&c->vmz, 0, sizeof c->vmz);
+    if (d->fv_vm_ok) {
+        c->vmz.ok = 1;
+        memcpy(c->vmz.rows, d->fv_vm_rows, sizeof c->vmz.rows);
+        memcpy(c->vmz.vp, d->fv_vm_vp, sizeof c->vmz.vp);
+    }
+    d->fv_vm_ok = 0;
+    /* The hands only from the arms' own draws. The arms' cached bones,
+       even when the frame marks them this frame's, are not the pose the
+       arms are drawn in with a weapon out (A.'s run, 2026-11-25: the
+       glove fitted to them sat 5 to 38 cm off the drawn hand as the
+       controller moved), so the runtime's read is only asked for its
+       probe log; with no fit the glove stays on the controller. The
+       points go on through the arm draw's own rows, so they land where
+       full view shows the arms. */
+    float rms[2] = {-1.0f, -1.0f}, cache[18];
+    if (d->fv_aim_ok) (void)mtl_immersive_hands(cache);
+    int from_draws = d->fv_aim_ok && d->fv_arm_rows_ok ? arm_hands_fit(d, c->hands.pts, c->hands.palm, rms) : 0;
+    c->hands.mask = from_draws;
+    if (from_draws) memcpy(c->hands.rows, d->fv_arm_rows, sizeof c->hands.rows);
+    arm_hands_log(d, from_draws, rms);
+    d->fv_arm_n[0] = d->fv_arm_n[1] = 0;
+    d->fv_arm_bind_asked = 0;
+    d->fv_arm_rows_ok = 0;
+    if (d->fv_aim_ok && mtl_immersive_aim(c->aim.eye, c->aim.dir)) {
+        memcpy(c->aim.rows, d->fv_aim_rows, sizeof c->aim.rows);
+        memcpy(c->aim.vp, d->fv_aim_vp, sizeof c->aim.vp);
+        c->aim.ok = 1;
+        c->aim.traced = mtl_immersive_aim_trace(&c->aim.trace_t, &c->aim.trace_hit);
+    }
+    d->fv_aim_ok = 0;
 }
 
 /* Replay. Everything below runs on the thread that replays (the render
@@ -3559,17 +4190,302 @@ static void arm_fill(MtlDrawCache *dc, mtl_arm_frame *out)
     out->h = (uint32_t)dc->arm_ct.height;
 }
 
+/* The orbs (an arm HUD side in mode 2, immersive.h): each side's
+   picture is taken as the game's own texture, for the compositor to
+   scale up and print on its orb's glass. On the right the discipline's
+   icon is a quad on a 128x128 texture (build/hud-cap2); the ornament
+   behind it is a larger quad on another 128x128 one and the bar's end
+   cap a small one on a 64x64 texture (the smallest square quad, which
+   the first headset run took for the icon, 2026-11-24), so of the square
+   quads of 96 pixels or more the smaller is taken. On the left the
+   weapon's picture is the one quad on a texture twice as wide as high. */
+static void orb_note(MtlDrawCache *dc, const mtl_emit *e, const cmd_draw *c, int side)
+{
+    float bb[4];
+    if (c->count != 6 || !cov_box(c, bb)) return;
+    int k = side - 1;
+    for (uint32_t i = 0; i < c->ntex; i++) {
+        if (!c->tex[i].fragment) continue;
+        id<MTLTexture> t = OBJ(swap_tex(e, c->tex[i].view[0]));
+        if (!t || t.width > 512) continue;
+        int fits = side == 2 ? t.width == t.height && t.width >= 96 : t.width == 2 * t.height && t.height >= 32;
+        if (!fits) continue;
+        float area = (bb[1] - bb[0]) * (bb[3] - bb[2]);
+        if (!dc->icon_tex[k] || (side == 2 && area < dc->icon_area[k])) dc->icon_tex[k] = t, dc->icon_area[k] = area;
+        return;
+    }
+}
+
+/* The orbs' labels: the power's name on the right and the ammunition's
+   count on the left, the game's glyph batches in a window of the screen
+   round where each sits (build/hud-cap2: the name at y -0.919 to -0.902,
+   the count at x -0.923 to -0.864, y -0.898 to -0.744), drawn into their
+   own target with the window filling a region of it, so the letters get
+   about four times the pixels (the name) and three and a half (the
+   count, which is short and printed large) and the compositor prints
+   them on the glass.
+   Each window keeps its region's shape at the back buffer's aspect. */
+#define LABEL_W 1024u
+#define LABEL_H 1024u
+static void label_region(int side, uint32_t r[4])
+{
+    if (side == 2) r[0] = 0, r[1] = 0, r[2] = LABEL_W, r[3] = 256;
+    else r[0] = 0, r[1] = 256, r[2] = 768, r[3] = 768;
+}
+
+static void label_window(int side, const cmd_pass *p, float w[4])
+{
+    double aspect = (double)p->width / (double)p->height;
+    uint32_t r[4];
+    label_region(side, r);
+    float x0 = side == 2 ? 0.77f : -0.98f, x1 = side == 2 ? 1.0f : -0.80f, yc = side == 2 ? -0.91f : -0.82f;
+    float hy = (float)((x1 - x0) * aspect * r[3] / r[2]) * 0.5f;
+    w[0] = x0, w[1] = x1, w[2] = yc - hy, w[3] = yc + hy;
+}
+
+static int orb_label(const mtl_emit *e, const cmd_draw *c, int side)
+{
+    float bb[4], w[4];
+    if (c->count == 6 || !e->pass || !cov_box(c, bb)) return 0;
+    label_window(side, (const cmd_pass *)e->pass, w);
+    return bb[0] >= w[0] - 0.01f && bb[1] <= w[1] + 0.01f && bb[2] >= w[2] - 0.01f && bb[3] <= w[3] + 0.01f;
+}
+
+static void orb_label_note(MtlDrawCache *dc, const mtl_emit *e, const cmd_draw *c, int side)
+{
+    float bb[4], w[4];
+    if (!cov_box(c, bb)) return;
+    label_window(side, (const cmd_pass *)e->pass, w);
+    uint32_t r[4];
+    label_region(side, r);
+    float sx = r[2] / (w[1] - w[0]), sy = r[3] / (w[3] - w[2]);
+    float px[4] = {r[0] + (bb[0] - w[0]) * sx - 6.0f, r[1] + (w[3] - bb[3]) * sy - 6.0f,
+                   r[0] + (bb[1] - w[0]) * sx + 6.0f, r[1] + (w[3] - bb[2]) * sy + 6.0f};
+    px[0] = fmaxf(px[0], (float)r[0]), px[1] = fmaxf(px[1], (float)r[1]);
+    px[2] = fminf(px[2], (float)(r[0] + r[2])), px[3] = fminf(px[3], (float)(r[1] + r[3]));
+    int k = side - 1;
+    if (!dc->label_on[k]) {
+        memcpy(dc->label_px[k], px, sizeof px);
+    } else {
+        dc->label_px[k][0] = fminf(dc->label_px[k][0], px[0]), dc->label_px[k][1] = fminf(dc->label_px[k][1], px[1]);
+        dc->label_px[k][2] = fmaxf(dc->label_px[k][2], px[2]), dc->label_px[k][3] = fmaxf(dc->label_px[k][3], px[3]);
+    }
+    dc->label_on[k] = 1;
+}
+
+/* The viewport that puts a side's window on its region of the labels. */
+static MTLViewport label_viewport(const mtl_emit *e, int side, const cmd_draw *c)
+{
+    float w[4];
+    uint32_t r[4];
+    label_window(side, (const cmd_pass *)e->pass, w);
+    label_region(side, r);
+    double vw = r[2] * 2.0 / (w[1] - w[0]), vh = r[3] * 2.0 / (w[3] - w[2]);
+    return (MTLViewport){r[0] - (w[0] + 1.0) * 0.5 * vw, r[1] - (1.0 - w[3]) * 0.5 * vh, vw, vh, c->vp[4], c->vp[5]};
+}
+
+/* Opens the labels' pass in place of the eye's, as arm_enter does the
+   cards'; in_arm 2 says which. A target that cannot be made drops the
+   labels and nothing else. */
+static int label_enter(mtl_device *d, mtl_emit *e, const cmd_draw *c)
+{
+    __unsafe_unretained MtlDrawCache *dc = CACHE(d);
+    const cmd_pass *p = e->pass;
+    if (!p || !e->enc) return 0;
+    MTLPixelFormat pf = (MTLPixelFormat)c->pd.k.color_pf;
+    if (!dc->lab_ct || dc->lab_ct.pixelFormat != pf) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                      width:LABEL_W
+                                                                                     height:LABEL_H
+                                                                                  mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        dc->lab_ct = [MTLD(d) newTextureWithDescriptor:td];
+        dc->lab_ct.label = @"orb labels";
+        td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)mtl_depth_pixel_format()
+                                                                width:LABEL_W
+                                                               height:LABEL_H
+                                                            mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = MTLTextureUsageRenderTarget;
+        dc->lab_dt = [MTLD(d) newTextureWithDescriptor:td];
+        dc->lab_used = 0;
+        if (!dc->lab_ct || !dc->lab_dt) return 0;
+    }
+    mtl_emit_close(e);
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dc->lab_ct;
+    rp.colorAttachments[0].loadAction = dc->lab_used ? MTLLoadActionLoad : MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (p->dt) {
+        rp.depthAttachment.texture = dc->lab_dt;
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.clearDepth = 1.0;
+        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+        rp.stencilAttachment.texture = dc->lab_dt;
+        rp.stencilAttachment.loadAction = MTLLoadActionClear;
+        rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+    }
+    id<MTLRenderCommandEncoder> lenc = [CB(e) renderCommandEncoderWithDescriptor:rp];
+    if (!lenc) {
+        e->in_arm = 2;
+        arm_leave(e, 1);
+        return 0;
+    }
+    [lenc setFrontFacingWinding:MTLWindingClockwise];
+    e->enc = (void *)CFBridgingRetain(lenc);
+    e->in_arm = 2;
+    dc->lab_used = 1;
+    return 1;
+}
+
 void mtl_arm_take(mtl_device *d, mtl_arm_frame *out)
 {
     __unsafe_unretained MtlDrawCache *dc = CACHE(d);
     arm_fill(dc, out);
     for (int s = 0; s < 2; s++) out->drawn[s] = dc->arm_used && dc->arm_drawn[s];
     dc->arm_last = *out;
+    /* Each side's picture goes with this frame, owned by the taker. With
+       the orbs' labels drawn, the frame's target is theirs instead of
+       the cards' (the orbs and the cards are never both up), whole, and
+       each side's label is its glyphs' box on it. */
+    for (int k = 0; k < 2; k++) {
+        out->icon[k] = dc->icon_tex[k] ? (__bridge_retained void *)dc->icon_tex[k] : NULL;
+        dc->icon_tex[k] = nil;
+        dc->icon_area[k] = 0.0f;
+    }
+    if (dc->lab_used && dc->lab_ct) {
+        out->tex = (__bridge void *)dc->lab_ct;
+        out->h = LABEL_H;
+        for (int k = 0; k < 2; k++) {
+            out->x[k] = 0, out->w[k] = LABEL_W;
+            out->drawn[k] = dc->label_on[k];
+            memcpy(out->label[k], dc->label_px[k], sizeof out->label[k]);
+            out->label_on[k] = dc->label_on[k] && out->label[k][2] > out->label[k][0] && out->label[k][3] > out->label[k][1];
+        }
+    }
+    dc->lab_used = 0;
+    dc->label_on[0] = dc->label_on[1] = 0;
     dc->arm_used = 0;
     dc->arm_drawn[0] = dc->arm_drawn[1] = 0;
 }
 
 void mtl_arm_last(mtl_device *d, mtl_arm_frame *out) { *out = CACHE(d)->arm_last; }
+
+/* The game's crosshair (its CTargeted HUD element): a centre dot, the
+   accuracy ring whose radius follows the weapon's spread, and at times a
+   larger mark, each a 6 or 24 vertex batch of quads with an 8x8 or 64x64
+   texture, centred on NDC (0, 0) to within a few ten thousandths (the
+   full view shots, build/hud-cap). +crosshair 0 does not turn it off.
+   Full view leaves it out of both eyes when the compositor draws its own
+   reticle, and hands where it was and how big to the compositor, which
+   puts that reticle exactly there in third person. Read from the box
+   once, in the first eye, and kept on the command like arm_side, so the
+   second eye leaves out exactly what the first did. The test is tight on
+   the centre, since the HUD's other small textured quads (icons, the
+   gauges' parts) sit away from it, and needs a texture, since an
+   untextured centred quad is a fade or a test pattern, not the mark. */
+static int crosshair(const mtl_emit *e, const cmd_draw *cc)
+{
+    if (!e->stereo || !e->fv.on || e->fv.game_eye) return 0;
+    if (!cc->stereo_hud || cc->stereo_a > 0.0f) return 0;
+    cmd_draw *c = (cmd_draw *)cc;
+    if (c->xhair < 0) {
+        c->xhair = 0;
+        if ((c->count != 6 && c->count != 24) || fv_cover(c)) return 0;
+        int real = 0;
+        for (uint32_t i = 0; i < c->ntex; i++)
+            for (uint32_t v = 0; v < MTL_TEX_VIEWS; v++) {
+                if (c->tex[i].slot[v] == MTL_TEX_NONE) continue;
+                id<MTLTexture> t = OBJ(v == 0 ? swap_tex(e, c->tex[i].view[0]) : c->tex[i].view[v]);
+                if (!t || (t.width == 1 && t.height == 1)) continue; /* the unbound views' dummies */
+                if (t.width > 64 || t.height > 64) return 0;
+                real = 1;
+            }
+        float b[4];
+        if (!real || !cov_box(c, b)) return 0;
+        /* The accuracy ring (the 24 vertex batch) opens well past the
+           other parts with a shotgun's recoil: logs topped out at a half
+           of 0.1576, just under the 0.16 this once allowed it, and a
+           ring past that was taken for something else, so it flashed
+           on the panel and the reticle saw no ring at all (headset run,
+           2026-11-24). The ring may open to most of the screen; the
+           single quads keep the tight bound. */
+        float cx = (b[0] + b[1]) * 0.5f, cy = (b[2] + b[3]) * 0.5f;
+        float widest = c->count == 24 ? 0.7f : 0.16f;
+        c->xhair = (b[1] - b[0]) * 0.5f <= widest && fabsf(cx) <= 0.02f && fabsf(cy) <= 0.02f;
+    }
+    return c->xhair > 0;
+}
+
+/* The game's first person crosshair is left out of full view, where the
+   compositor's reticle replaces it and takes its spread from it
+   (crosshair_note); A. dropped it once ours proved accurate (2026-11-23).
+   RT_GAME_CROSSHAIR=1 keeps it beside ours, to compare; with
+   RT_HANDAIM=0 it is always kept, since the compositor then draws no
+   reticle of its own. The same environment the host app reads
+   (SpatialInput.handAim), as the game runs in its process. The third
+   person mark is a world draw, not this, and stays. */
+static int keep_crosshair(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *g = getenv("RT_GAME_CROSSHAIR"), *h = getenv("RT_HANDAIM");
+        int keep = g && !strcmp(g, "1"), no_aim = h && !strcmp(h, "0");
+        v = keep || no_aim;
+        mtl_log("full view: the game's crosshair %s", no_aim ? "kept (RT_HANDAIM=0, no reticle of ours)"
+                                                     : keep ? "kept beside the compositor's reticle (RT_GAME_CROSSHAIR=1)"
+                                                            : "left out for the compositor's reticle");
+    }
+    return v;
+}
+
+/* Adds a crosshair draw's box to the frame's, in the first eye only. Only
+   the accuracy ring (the 24 vertex batch on its 8x8 texture) follows the
+   spread, from a half of about 0.03 of the screen moving slowly to 0.15
+   running (build/hud-cap2), so only its half extent is handed on. The
+   centre dot (0.007) and the larger 64x64 mark the game shows alone when
+   the aim has settled (0.057) are not the spread: taking the widest box
+   when there was no ring put the reticle at its largest standing still
+   and at its smallest as the ring first appeared (headset run,
+   2026-11-23). A frame with no ring hands on 0. */
+static void crosshair_note(MtlDrawCache *dc, const cmd_draw *c, const float bb[4])
+{
+    float half = (bb[1] - bb[0]) * 0.5f;
+    if (!dc->xhair_n) {
+        memcpy(dc->xhair_box, bb, sizeof dc->xhair_box);
+        dc->xhair_ring = dc->xhair_widest = 0.0f;
+    } else {
+        dc->xhair_box[0] = fminf(dc->xhair_box[0], bb[0]), dc->xhair_box[1] = fmaxf(dc->xhair_box[1], bb[1]);
+        dc->xhair_box[2] = fminf(dc->xhair_box[2], bb[2]), dc->xhair_box[3] = fmaxf(dc->xhair_box[3], bb[3]);
+    }
+    dc->xhair_n++;
+    dc->xhair_widest = fmaxf(dc->xhair_widest, half);
+    if (c->count == 24) dc->xhair_ring = fmaxf(dc->xhair_ring, half);
+}
+
+void mtl_crosshair_take(mtl_device *d, mtl_crosshair_frame *out)
+{
+    __unsafe_unretained MtlDrawCache *dc = CACHE(d);
+    memset(out, 0, sizeof *out);
+    if (dc->xhair_n) {
+        out->shown = 1;
+        out->ndc[0] = (dc->xhair_box[0] + dc->xhair_box[1]) * 0.5f;
+        out->ndc[1] = (dc->xhair_box[2] + dc->xhair_box[3]) * 0.5f;
+        out->half = dc->xhair_ring;
+        static float last = -1.0f;
+        static int logged;
+        if (fabsf(out->half - last) > 0.004f && logged < 60) {
+            logged++;
+            last = out->half;
+            mtl_log("full view: the game's accuracy ring %s half %.4f (widest draw %.4f)%s",
+                    out->half > 0.0f ? "at" : "not drawn,", out->half, dc->xhair_widest,
+                    logged == 60 ? "; no more of these" : "");
+        }
+    }
+    dc->xhair_n = 0;
+}
 
 /* RT_HIDE_ARMS: which of the view model's arm meshes full view leaves
    out, a mask (1 the first, 2 the second, 3 both), to find which arm is
@@ -3580,7 +4496,10 @@ static int hide_arms(void)
     if (v < 0) {
         const char *e = getenv("RT_HIDE_ARMS");
         v = e && *e ? atoi(e) & 3 : 0;
-        if (v) mtl_log("full view: arm meshes left out (RT_HIDE_ARMS=%d)", v);
+        /* The host's own hands (RT_HANDS=1) stand in for both arms. */
+        const char *h = getenv("RT_HANDS");
+        if (h && !strcmp(h, "1") && !(e && *e)) v = 3;
+        if (v) mtl_log("full view: arm meshes left out (RT_HIDE_ARMS=%d%s)", v, h && !strcmp(h, "1") ? ", RT_HANDS" : "");
     }
     return v;
 }
@@ -3596,11 +4515,30 @@ static void emit_draw(mtl_device *d, mtl_emit *e, const cmd_draw *c)
         }
     }
     __unsafe_unretained MtlDrawCache *dc = CACHE(d);
+    /* The game's crosshair is noted in the first eye, whether or not it
+       is drawn, so a kept crosshair still hands the compositor where
+       it is, to compare. */
+    if (crosshair(e, c)) {
+        float bb[4];
+        if (!e->eye && cov_box(c, bb)) crosshair_note(dc, c, bb);
+        if (!keep_crosshair()) return;
+    }
     /* A gauge's draw goes on its card once, in the first eye's replay, and
        neither eye's panel shows it. */
     int arm = e->in_aura ? 0 : arm_side(d, e, c);
     if (e->in_arm && !arm) arm_leave(e, 1);
-    if (arm) {
+    if (arm && e->fv.arm[arm - 1] == 2) {
+        /* The orbs stand for this side: its picture is noted and its
+           label's glyphs drawn into the labels' target, in the first eye
+           only; nothing of the side reaches either eye's panel. */
+        if (e->eye) return;
+        orb_note(dc, e, c, arm);
+        if (!orb_label(e, c, arm)) return;
+        if (e->in_arm == 1) arm_leave(e, 1);
+        if (e->in_arm != 2 && !label_enter(d, e, c)) return;
+        orb_label_note(dc, e, c, arm);
+    } else if (arm) {
+        if (e->in_arm == 2) arm_leave(e, 1);
         if (e->eye) return;
         if (!e->in_arm && !arm_enter(d, e, c)) arm = 0;
     }
@@ -3661,6 +4599,12 @@ static void emit_draw(mtl_device *d, mtl_emit *e, const cmd_draw *c)
         NSUInteger y1 = MIN((NSUInteger)ceil((c->sc[1] + c->sc[3]) * sy), dc->aura_ct.height);
         if (x1 <= x0 || y1 <= y0) return;
         [enc setScissorRect:(MTLScissorRect){x0, y0, x1 - x0, y1 - y0}];
+    } else if (e->in_arm == 2) {
+        /* The side's window of the screen onto its region of the labels. */
+        uint32_t r[4];
+        label_region(arm, r);
+        [enc setViewport:label_viewport(e, arm, c)];
+        [enc setScissorRect:(MTLScissorRect){r[0], r[1], r[2], r[3]}];
     } else if (e->in_arm) {
         /* The game's viewport and scissor at the same pixels, moved so the
            side's columns of the back buffer land on its part of the cards,
@@ -3899,6 +4843,18 @@ static void dump_tex(FILE *f, const char *what, void *p)
             t.label.length ? [[NSString stringWithFormat:@":%@", t.label] UTF8String] : "");
 }
 
+/* Whether every texture a draw binds is 128 pixels or less a side: the
+   crosshair's candidates are small sprites, and the world's glow sprites,
+   which it has to be told from, are 128 square. */
+static int small_textures(mtl_emit *e, const cmd_draw *c)
+{
+    for (uint32_t i = 0; i < c->ntex; i++) {
+        id<MTLTexture> t = OBJ(swap_tex(e, c->tex[i].view[0]));
+        if (t && (t.width > 128 || t.height > 128)) return 0;
+    }
+    return 1;
+}
+
 static void dump_cmd(mtl_emit *e, const cmd_head *h)
 {
     FILE *f = e->dump;
@@ -3934,7 +4890,25 @@ static void dump_cmd(mtl_emit *e, const cmd_head *h)
                 fprintf(f, " bb %.3f %.3f %.3f %.3f", bb[0], bb[1], bb[2], bb[3]);
                 int side = c->fv_full == 1 ? 0 : mtl_stereo_arm_side(bb);
                 if (side) fprintf(f, " arm %s%s", side == 1 ? "L" : "R", e->fv.arm[side - 1] ? "" : " (on the panel)");
+                if (crosshair(e, c)) fprintf(f, " crosshair%s", keep_crosshair() ? " (kept)" : "");
             } else fprintf(f, " bb ?");
+        } else if (c->stereo_a > 0.0f && !c->stereo_sky && !c->stereo_screen && c->count <= WBOX_MAX_COUNT &&
+                   small_textures(e, c)) {
+            /* A small world draw, where the third person crosshair is:
+               its box, nearest w and centre (wbox_note), or why not. */
+            if (c->wbox_ok == 1)
+                fprintf(f, " bb %.3f %.3f %.3f %.3f depth %.2f centre %.4f %.4f w %.2f", c->wbox[0], c->wbox[1],
+                        c->wbox[2], c->wbox[3], c->wbox[4], c->wbox_c[0], c->wbox_c[1], c->wbox_c[2]);
+            else if (c->wbox_ok < 0) fprintf(f, " bb ? (not worked out)");
+            else if (c->wbox_why == WBOX_BEHIND)
+                fprintf(f, " bb ? (behind the eye: %u of %u vertices, w down to %.2f)", c->wbox_behind, c->count, c->wbox[4]);
+            else fprintf(f, " bb ? (%s)", wbox_why_name(c->wbox_why));
+            if (c->wbox_ok >= 0) {
+                fprintf(f, " call %s%s base %d start %u stride %u%s decl", c->call == CALL_INDEXED ? "indexed" : "arrays",
+                        c->call != CALL_INDEXED ? "" : c->index_type == MTLIndexTypeUInt32 ? "32" : "16", c->base,
+                        c->start, c->wbox_stride, c->wbox_up ? " up" : "");
+                for (uint32_t i = 0; i < c->wbox_nel; i++) fprintf(f, "%s%u:%u", i ? "," : " ", c->wbox_decl[i][0], c->wbox_decl[i][1]);
+            }
         }
         for (uint32_t i = 0; i < c->ntex; i++) {
             char what[24];
@@ -3995,6 +4969,9 @@ void mtl_emit_run(mtl_device *d, mtl_emit *e, const uint8_t *cmds, size_t from, 
             if (!e->second) {
                 const cmd_present *c = (const cmd_present *)h;
                 memcpy(e->pose, c->pose, sizeof e->pose);
+                e->aim = c->aim;
+                e->hands = c->hands;
+                e->vmz = c->vmz;
                 /* An eye's replay presents once the other eye is drawn
                    too, which is after this list has run again (frame.m). */
                 if (e->stereo) {

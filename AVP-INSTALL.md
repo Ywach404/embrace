@@ -148,6 +148,11 @@ xcrun devicectl device process launch --device <device> <your bundle id> --noful
 
 In Xcode, add `--nofullview` to the Host scheme's launch arguments.
 
+The gloved hands are off by default. To turn them on, launch with
+`RT_HANDS=1` in the environment (from the command line,
+`DEVICECTL_CHILD_RT_HANDS=1` before `xcrun devicectl`; in Xcode, an
+environment variable on the Host scheme).
+
 ## Controls and known issues
 
 - Pair the Sense controllers (or a gamepad) with the headset before
@@ -158,5 +163,10 @@ In Xcode, add `--nofullview` to the Host scheme's launch arguments.
   trigger clicks, Circle goes back.
 - Square opens the inventory. Hold Options to switch between first and
   third person; tap it for the game menu.
+- Tap Circle to reload; hold it to use doors and talk.
 - Click both thumbsticks together (or F8 on a keyboard) to switch between
   full view and the theater screen.
+- Hold both thumbsticks in for a second and a half to open the layout
+  editor. Grab the orbs, the gloves or the reticle with the trigger, or
+  use the gizmo's arrows, rings and scale handle; Cross or Square changes
+  the gizmo's mode. Tap Options to save and close.

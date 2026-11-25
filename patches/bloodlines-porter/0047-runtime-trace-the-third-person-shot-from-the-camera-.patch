@@ -1,0 +1,63 @@
+From bee690fac8eca4931f3ce5211c7999bbaddee0f0 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:32:47 -0600
+Subject: [PATCH] runtime: trace the third person shot from the camera, where
+ the game's mark is
+
+The game's third person mark sits on the middle of the frame, on the
+camera's own forward. The camera looks about 8 degrees lower than the
+engine's view angles, so a ray from the eye along those angles landed
+higher and farther than the mark at every range. The renderer is now
+handed the camera's ray and its trace; RT_AIM_FROM=eye restores the eye.
+---
+ runtime/input.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/runtime/input.c b/runtime/input.c
+index 32cb391..4df3f2a 100644
+--- a/runtime/input.c
++++ b/runtime/input.c
+@@ -1698,10 +1698,40 @@ int rt_host_aim_ray(float eye[3], float dir[3], float cam[3], float cam_ang[3])
+    frame's: read at the pump, it would be the frame before's. */
+ void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]));
+ void metal_d3d9_fullview_aim_trace_source(int (*fn)(float *t, int *hit));
++/* Where the game's third person mark is: on the camera's own forward, the
++   middle of the frame, not the eye's aim. In third person the camera
++   (CInput +0x164 off the eye, turned to +0x170) looks about 8 degrees
++   further down than the engine's view angles (a headset run, 2026-11-23:
++   camera pitch 9.6 against the aim's 1.4, 5.3 against -4.5, every line),
++   and a ray from the eye along the view angles landed higher and farther
++   than the game's mark at every range; the mark sits on the frame's
++   middle. So the shot is traced from the camera along the camera's angles
++   and the renderer is handed that ray. RT_AIM_FROM=eye goes back to the
++   eye and the view angles. */
++static int aim_from_eye(void)
++{
++    static int v = -1;
++    if (v < 0) {
++        const char *e = getenv("RT_AIM_FROM");
++        v = e && !strcmp(e, "eye");
++        rt_log("aim: the shot traced from the %s", v ? "eye along the view angles (RT_AIM_FROM=eye)"
++                                                    : "camera along its own angles, the frame's middle");
++    }
++    return v;
++}
++
+ static int aim_for_renderer(float eye[3], float dir[3])
+ {
+     s_trace_ok = 0;
+     if (!aim_take(eye, dir)) return 0;
++    float e[3], d[3], cam[3], ang[3];
++    if (!aim_from_eye() && rt_player_aim(e, d, cam, ang)) {
++        float p = ang[0] * (float)M_PI / 180.0f, y = ang[1] * (float)M_PI / 180.0f;
++        memcpy(eye, cam, sizeof cam);
++        dir[0] = cosf(p) * cosf(y);
++        dir[1] = cosf(p) * sinf(y);
++        dir[2] = -sinf(p);
++    }
+     s_trace_ok = rt_player_aim_trace(eye, dir, &s_trace_t, &s_trace_hit);
+     static int logged;
+     static uint64_t last_ns;
+-- 
+2.54.0 (Apple Git-157)
+

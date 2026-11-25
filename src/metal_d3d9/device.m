@@ -40,6 +40,7 @@
 #endif
 #include <dlfcn.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -544,6 +545,34 @@ static void dev_gamma(mtl_device *d, uint32_t swap, uint32_t flags, const void *
     (void)ramp;
 }
 
+/* The drawable back at the back buffer's size when something else sized
+   it. On visionOS SDL's Metal view sets its layer's drawable size to the
+   view's bounds whenever it lays out (SDL_uikitmetalview.m,
+   updateDrawableSize), and the view follows the window scene, which the
+   system clamps and the player resizes. A drawable smaller than the back
+   buffer then took only its top left corner, so the window cut off the
+   right and bottom edges with the health and blood gauges in them
+   (headset run, 2026-11-23). At the back buffer's size the copy is the
+   whole frame, pixel for pixel, and the layer's aspect fit gravity
+   scales it into the view. Asynchronous, since this runs on the render
+   thread and the main thread may be waiting on it; one request at a
+   time. */
+static void layer_refit(mtl_device *d, NSUInteger bw, NSUInteger bh, NSUInteger ow, NSUInteger oh)
+{
+    static _Atomic int pending, logged;
+    if (atomic_exchange(&pending, 1)) return;
+    if (atomic_fetch_add(&logged, 1) < 4)
+        mtl_log("window drawable %lux%lu differs from the back buffer %lux%lu; sized back", (unsigned long)ow,
+                (unsigned long)oh, (unsigned long)bw, (unsigned long)bh);
+    CAMetalLayer *l = LAYER(d);
+    CGSize size = CGSizeMake(bw, bh);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        l.contentsGravity = kCAGravityResizeAspect;
+        l.drawableSize = size;
+        atomic_store(&pending, 0);
+    });
+}
+
 /* Present: blit the back buffer into the layer's next drawable and show
    it. Pacing is the layer's own: nextDrawable waits while all three
    drawables are in flight, and displaySyncEnabled follows the game's
@@ -568,6 +597,7 @@ void mtl_emit_present(mtl_device *d, mtl_emit *e, void *back, void *right, uint6
         return;
     }
     id<MTLTexture> bb = (__bridge id<MTLTexture>)back, out = dr.texture;
+    if (out.width != bb.width || out.height != bb.height) layer_refit(d, bb.width, bb.height, out.width, out.height);
     id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
     [bl copyFromTexture:bb
              sourceSlice:0

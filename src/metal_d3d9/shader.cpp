@@ -338,6 +338,11 @@ const char* mtl_sc_hash(const mtl_sc* s) {
   return s->hash;
 }
 
+const uint32_t* mtl_sc_tokens(const mtl_sc* s, size_t* n) {
+  *n = s->code.size() / 4u;
+  return reinterpret_cast<const uint32_t*>(s->code.data());
+}
+
 const char* mtl_sc_chain_tag(void) {
   return k_chain_tag;
 }

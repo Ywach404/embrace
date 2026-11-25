@@ -106,6 +106,134 @@ void mtl_stereo_correction3(const mtl_stereo_proj_full *game, const mtl_stereo_p
    right, down, up, each positive outwards, as mtl_stereo_tangents gives
    them), D3D's z forward: a = 2 / (l + r), cx = (l - r) / (l + r). */
 void mtl_stereo_proj_from_tangents(const float tan[4], mtl_stereo_proj *out);
+/*
+ * Third person aim (full view): where the player's shot lands, found from
+ * the shot's own ray rather than from how the game draws its crosshair,
+ * which differs per weapon. The ray (the player's eye and aim direction,
+ * read from the game by the runtime at Present) is sampled at
+ * MTL_AIM_SAMPLES points eye + dir t, t geometric from MTL_AIM_T_NEAR to
+ * MTL_AIM_T_FAR game units, each taken through the frame's own view
+ * projection (the world draws' c8 to c11) and an eye's correction to the
+ * pixel it lands on in that eye's image and the depth it would have there.
+ * The GPU reads the eye's depth at those pixels (draw.m, mtl_aim_gather)
+ * and the search runs here on what it read.
+ */
+#define MTL_AIM_SAMPLES 1024
+#define MTL_AIM_T_NEAR 16.0f
+#define MTL_AIM_T_FAR 8192.0f
+/* The GPU buffer: the samples' pixels (two floats each), then their reads. */
+#define MTL_AIM_DEPTH_AT (2 * MTL_AIM_SAMPLES)
+#define MTL_AIM_BUF_FLOATS (3 * MTL_AIM_SAMPLES)
+/* A surface the ray meets is taken only once the ray stays behind it: to
+   MTL_AIM_HOLD of the way past it (3%, a few samples) and, near the
+   player, to at least MTL_AIM_T_BODY along the ray, past the player's
+   own arms and weapon, which the shot's trace never meets. */
+#define MTL_AIM_HOLD 1.03f
+#define MTL_AIM_T_BODY 96.0f
+/* The player's box about the eye, game units: its half width (the hull's
+   16 and a little) and how far below the eye it reaches (the eye height,
+   64, less a little so the floor at the feet is not in it). */
+#define MTL_AIM_BODY_R 18.0f
+#define MTL_AIM_BODY_DOWN 56.0f
+typedef struct {
+    int ok;
+    float rows[4][4]; /* clip x, y, z and w as dp4 rows on a world point (c8 to c11) */
+    float vp[6];      /* the world draws' viewport: x, y, width, height in pixels, min and max depth */
+    float eye[3];     /* where the shot leaves, game world units */
+    float dir[3];     /* its direction, unit length */
+    int traced;       /* 1 when the engine's own shot trace gave where it lands (mtl_aim_traced) */
+    int trace_hit;    /* and whether it met anything there */
+    float trace_t;    /* how far along the ray, game units */
+} mtl_aim_ray;
+/* The first person view model's hands (the runtime's rt_vm_hands): per
+   hand, right then left, its origin and points along its x and y axes in
+   game world units, read at the frame's Present, and the frame's view
+   projection to take them into it. mask bit 0 right, bit 1 left. */
+typedef struct {
+    int mask;
+    float rows[4][4];
+    float pts[18];
+    /* The palm's middle as drawn, right then left, when the hands came
+       from the arms' own draws (draw.m, arm_hands_fit); for the log's
+       gap between the glove and the drawn hand. */
+    float palm[6];
+} mtl_vm_hands;
+/* The first person view model's own view projection and the depth range
+   its draws are given, from the frame's first view model draw (draw.m,
+   mtl_fv_scan): its pixels in the depth buffer are turned into metres
+   with these, not the world's, so a glove on the gun is hidden behind
+   its grip (the scene depth, immersive.m). */
+typedef struct {
+    int ok;
+    float rows[4][4];
+    float vp[2]; /* the viewport's min and max depth */
+} mtl_vm_depth;
+/* A world point's clip x, y, z, w under the rows. */
+void mtl_aim_clip(const float rows[4][4], const float p[3], float clip[4]);
+typedef struct {
+    int n;          /* samples, MTL_AIM_SAMPLES when made */
+    int on_image;   /* how many land on the eye's image */
+    float A, B;     /* the eye's clip z = A w + B, so a stored depth gives its w back */
+    float t[MTL_AIM_SAMPLES];
+    float w[MTL_AIM_SAMPLES];     /* the sample's depth along the eye's forward, game units */
+    float px[MTL_AIM_SAMPLES][2]; /* its pixel in the eye's image; x -1 when it lands on none */
+} mtl_aim_probes;
+/* An eye's depth terms under its correction f (mtl_stereo_correction3 of
+   the rows' projection): a depth it stored, z in 0 to 1, is at w = B /
+   (z - A) along its forward, in the rows' units. 0 when the rows have no
+   perspective w. */
+int mtl_stereo_depth_terms(const float rows[4][4], const mtl_stereo_fix *f, float *A, float *B);
+/* The samples for one eye, whose correction (mtl_stereo_correction3 of
+   the rows' projection) is fix. 0, with out->n 0, when the ray or the
+   rows give none. */
+int mtl_aim_probe(const mtl_aim_ray *r, const mtl_stereo_fix *fix, mtl_aim_probes *out);
+/* The depth at a sample's pixel, raw as stored, back to a w along the
+   eye's forward; +inf where nothing nearer than the far plane was drawn. */
+float mtl_aim_stored_w(const mtl_aim_probes *p, const float vp[6], float stored);
+typedef struct {
+    int hit;        /* 1 a surface on the ray, 0 none on it (sky, or past the far end): the far end */
+    int k;          /* the sample the hit was found at, -1 for none */
+    int hidden;     /* samples a surface between the camera and the ray hid (the player's own body) */
+    float t;        /* along the ray, game units */
+    float p[3];     /* the point, game world units */
+    float ndc[2], w; /* and in the frame: the game's NDC and clip w */
+} mtl_aim_hit;
+/* The search over what the GPU read at the samples (depth[k], raw): the
+   first sample at or behind the surface at its pixel, with that surface
+   no nearer than the sample before it, less a slack of 1%, 2 units and
+   two samples' steps in depth, is where the ray enters it. The steps
+   are for a surface the ray meets at a glancing angle, the street ahead
+   seen from a camera little higher than the ray, whose depth at the
+   sample's pixel is nearer than the ray by up to a step or two: without
+   them the crossing was found in some frames and missed in others. A
+   surface nearer than that is one between the camera and the ray, as
+   the player's own back is to the samples just past the face, and is
+   passed over. A crossing is kept only if the samples after it stay at
+   or behind what is drawn at theirs, and that no nearer than where it
+   entered (MTL_AIM_HOLD, MTL_AIM_T_BODY): a wall or the street holds
+   the ray, where the player's arms or weapon, or a thin pole the ray
+   only passes behind, gives it back a few samples on. A crossing inside
+   the player's own box (MTL_AIM_BODY_R, MTL_AIM_BODY_DOWN) is the
+   player's head or neck and is never kept. The point is refined to where the ray's depth, linear
+   in t, equals the surface's, between the two samples. No such sample
+   gives the far end, hit 0. 0 when the ray or its point give nothing in
+   the frame. */
+int mtl_aim_search(const mtl_aim_ray *r, const mtl_aim_probes *p, const float *depth, mtl_aim_hit *out);
+/* The engine's trace's answer as a hit (r->traced): the point trace_t
+   along the ray, hit as the trace says, taken into the frame through the
+   rows as the search's is; k -1 and nothing hidden, since no depth was
+   read. 0 when the ray was not traced or its point gives nothing in the
+   frame (behind the camera). */
+int mtl_aim_traced(const mtl_aim_ray *r, mtl_aim_hit *out);
+/* A point the game drew into its world, from its NDC (x, y) and clip w
+   under the game's projection: as tangents right and up of the camera's
+   forward (x - cx) / a and (y - cy) / b, a half extent in x the same way,
+   and its depth along that forward in metres (w is the view depth for a
+   perspective projection whose w row is the view's z). out: tan x, tan
+   y, tan half, metres. 0 and zeros when the projection, w or the scale
+   give no point. */
+int mtl_stereo_world_point(const mtl_stereo_proj_full *game, float x, float y, float half, float w, float units_per_m,
+                           float out[4]);
 /* Full view's HUD: the engine's 2D, in game NDC, onto a head-locked
    panel hud_z ahead and px by py in half tangents, as an eye at t sees it:
    x' = a' px x + (cx' - a' tx / hud_z) w, the same for y. Scaled by w for
@@ -154,6 +282,29 @@ float mtl_stereo_screen_a(float aspect, float deg);
 #define MTL_POS_MVP 4
 #define MTL_POS_VIEWPROJ 8
 int mtl_stereo_scan_pos(const uint32_t *tokens, size_t n);
+
+/* A vertex shader's oPos for one vertex, evaluated from its D3D9 bytecode
+   on the CPU, for the shot dump's box of a small world draw: a sprite or
+   a bone placed model part has no fixed rows to project through, so the
+   draw's own arithmetic is run instead. Straight line code only (no flow
+   control); an instruction it does not know poisons what it writes, so a
+   position that needs one comes out unknown rather than wrong. */
+#define MTL_VS_EVAL_INPUTS 16
+typedef struct {
+    const uint32_t *tk;
+    size_t n;
+    int major;
+    int pos_type, pos_num;     /* the register oPos is: rastout 0, or vs_3_0's output with dcl_position */
+    uint32_t in_mask;          /* bit r: v r is declared */
+    uint8_t in_usage[MTL_VS_EVAL_INPUTS], in_index[MTL_VS_EVAL_INPUTS]; /* its D3DDECLUSAGE and usage index */
+    float c[256][4];           /* the API's float constants with the shader's defs over them */
+} mtl_vs_eval;
+/* 0 when the shader is not one it can run: not a vertex shader, or with
+   flow control. vsf is the API's 256 float registers. */
+int mtl_vs_eval_init(mtl_vs_eval *e, const uint32_t *tokens, size_t n, const float *vsf);
+/* oPos from the declared inputs v[r] (0 0 0 1 for an element the
+   declaration lacks); 0 when any of its four came out unknown. */
+int mtl_vs_eval_pos(const mtl_vs_eval *e, const float (*v)[4], float out[4]);
 
 /* Why a draw is or is not corrected. */
 enum {
@@ -245,6 +396,18 @@ int mtl_stereo_arm_side(const float bb[4]);
 /* The back buffer columns [x0, x1) a side's card holds, for a back
    buffer w pixels wide: the side's NDC strip, widened to whole pixels. */
 void mtl_stereo_arm_columns(int side, uint32_t w, uint32_t *x0, uint32_t *x1);
+
+/* The game's view model hands from the arms' own draws: point pairs of
+   where a vertex sits in the model's bind pose and where the frame drew
+   it in the world, and the rigid turn and move that best takes the first
+   set onto the second (Horn's closed form, through the largest
+   eigenvector of his 4 by 4 matrix by power iteration). r is row major,
+   b = r a + t; rms is the fit's error in the points' units. 0 with fewer
+   than three points or a set too flat to turn. */
+int mtl_rigid_fit(const float (*a)[3], const float (*b)[3], int n, float r[3][3], float t[3], float *rms);
+/* A world point from its clip x, y, z, w under view projection rows
+   (mtl_aim_clip backwards): 0 when the rows do not invert. */
+int mtl_clip_to_world(const float rows[4][4], const float clip[4], float p[3]);
 
 #ifdef __cplusplus
 }

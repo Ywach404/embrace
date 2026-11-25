@@ -1,0 +1,122 @@
+From 63081e5af25d24d18070bd03fff4cab803560717 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:49:09 -0600
+Subject: [PATCH] runtime: Circle held is reload
+
+The Sense pair has no touchpad or share button, the two places reload lived, so it had no way to reload. Circle held past the hold time sends r (+reload) once; a Circle tap is still use, now sent on the release.
+---
+ runtime/input_selftest.c | 52 ++++++++++++++++++++++++++++++++++++----
+ runtime/pad.c            | 10 +++++---
+ 2 files changed, 55 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/input_selftest.c b/runtime/input_selftest.c
+index 7ab0f9f..12e4004 100644
+--- a/runtime/input_selftest.c
++++ b/runtime/input_selftest.c
+@@ -1245,10 +1245,11 @@ static void pad_map_mode(rt_input_state *s, rt_pad_dev *d, SDL_JoystickID id, in
+         press(id, (int)i, 1);
+         padpump(s, d, 10);
+         snprintf(name, sizeof name, "%s %s press", mn, k_padmap[i].name);
+-        /* Options and Square in play have holds (the view toggle and the
+-           head look switch), so they wait and are a tap on the release
+-           (pad_hold, pad_headlook). */
+-        if (mode == RT_PAD_PLAY && (k_padmap[i].btn == SDL_GAMEPAD_BUTTON_START || k_padmap[i].btn == SDL_GAMEPAD_BUTTON_WEST)) {
++        /* Options, Square and Circle in play have holds (the view toggle,
++           the head look switch and reload), so they wait and are a tap on
++           the release (pad_hold, pad_headlook). */
++        if (mode == RT_PAD_PLAY && (k_padmap[i].btn == SDL_GAMEPAD_BUTTON_START || k_padmap[i].btn == SDL_GAMEPAD_BUTTON_WEST ||
++                                    k_padmap[i].btn == SDL_GAMEPAD_BUTTON_EAST)) {
+             check(s_n == 0, name, "%s", dump());
+             press(id, (int)i, 0);
+             padpump(s, d, 10);
+@@ -2342,10 +2343,53 @@ static void pad_hold_one(const char *pad)
+     padpump(&s, &d, 10);
+ }
+ 
++/* Circle in play: a tap is use (e) on the release, a hold past
++   RT_PAD_HOLD_NS is one r (+reload), the Sense pair's only way to it,
++   and its release sends no use. */
++static void pad_reload_one(const char *pad)
++{
++    rt_input_state s;
++    rt_pad_dev d;
++    char name[160];
++    st(&s);
++    s.cursor = 0;
++    rt_input_relative_update(&s);
++    rt_pad_dev_init(&d, NULL);
++    SDL_JoystickID id = rt_pad_test_attach(pad);
++    padpump(&s, &d, 10);
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 1);
++    padpump(&s, &d, 10);
++    snprintf(name, sizeof name, "%s: Circle pressed sends nothing yet", pad);
++    check(s_n == 0, name, "%s", dump());
++    padpump(&s, &d, 100);
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 0);
++    padpump(&s, &d, 10);
++    snprintf(name, sizeof name, "%s: a Circle tap is use (e) on the release", pad);
++    check(s_n >= 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x45 && s_m[s_n - 1].msg == WM_KEYUP && s_m[s_n - 1].wp == 0x45, name, "%s",
++          dump());
++    s_n = 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 1);
++    padpump(&s, &d, 10);
++    padpump(&s, &d, 600);
++    int reload = s_n == 2 && s_m[0].msg == WM_KEYDOWN && s_m[0].wp == 0x52 && s_m[1].msg == WM_KEYUP && s_m[1].wp == 0x52;
++    s_n = 0;
++    for (int i = 0; i < 10; i++) padpump(&s, &d, 100);
++    int quiet = s_n == 0;
++    rt_pad_test_button(id, SDL_GAMEPAD_BUTTON_EAST, 0);
++    padpump(&s, &d, 10);
++    snprintf(name, sizeof name, "%s: Circle held is one reload (r), and its release no use", pad);
++    check(reload && quiet && s_n == 0, name, "reload %d quiet %d %s", reload, quiet, dump());
++    rt_pad_test_detach(id);
++    padpump(&s, &d, 10);
++}
++
+ static void pad_hold(void)
+ {
+     pad_hold_one("PlayStation VR2 Sense Controllers (L/R)");
+     pad_hold_one("DualSense Wireless Controller");
++    pad_reload_one("PlayStation VR2 Sense Controllers (L/R)");
++    pad_reload_one("DualSense Wireless Controller");
+     const char *tmp = getenv("TMPDIR");
+     char dir[512], path[600];
+     snprintf(dir, sizeof dir, "%s/rt-pad-hold-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+diff --git a/runtime/pad.c b/runtime/pad.c
+index 43acf6f..ac23e53 100644
+--- a/runtime/pad.c
++++ b/runtime/pad.c
+@@ -28,8 +28,8 @@ static const int k_sdl[RT_PAD_NBTN] = {
+ /* Keys are the game's own binds (cfg/config.cfg): i is slot6, the
+    general inventory; c is +chareditor; l is +questlog; e is +use; f is
+    vm_feed; r is +reload. Square takes the inventory, which moves reload
+-   to the touchpad and the Xbox share button. The Sense pair has neither,
+-   so the quest log goes on L3 where every pad has it, and walk (lshift)
++   to the touchpad and the Xbox share button, and to Circle held (below)
++   for the Sense pair, which has neither. The quest log goes on L3 where every pad has it, and walk (lshift)
+    is left to controls.txt; crouch on R3 matters more for stealth.
+    RT in play is return, which the game also binds to +attack, not
+    mouse1: the client's mouse handler skips button changes while either
+@@ -87,13 +87,17 @@ static const struct {
+    Square held switches head look off and on by hand, for the stick
+    camera in first person; its tap is still the inventory, sent on the
+    release. Square because every pad has it, its tap opens a screen so a
+-   release-time open costs nothing, and no game action wants it held. */
++   release-time open costs nothing, and no game action wants it held.
++   Circle held is reload, the only way to it on the Sense pair; its tap
++   is still use, sent on the release, which only delays a door or a
++   pickup by the length of the tap. */
+ static const struct {
+     int idx;
+     const char *target;
+ } k_hold_default[] = {
+     {5, "z"},
+     {2, "headlook"},
++    {1, "r"},
+ };
+ 
+ /* No chord is on by default. The Sense pair has no Create (visionOS
+-- 
+2.54.0 (Apple Git-157)
+

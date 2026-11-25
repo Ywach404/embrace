@@ -1,0 +1,95 @@
+From b724f59811aeb81bea10640786d312278b97bb48 Mon Sep 17 00:00:00 2001
+From: "A.Cervantez" <155030226+Ywach404@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:54:31 -0600
+Subject: [PATCH] runtime: find the bones' pose to bone matrices in this
+ build's header
+
+A.'s run gave "bind pose: right hand not found": the 0x60 a newer
+mstudiobone_t layout gives is not a rigid turn in this build. The offset
+is now found from the header itself, once, as the first at which every
+bone of the arms model holds three orthonormal rows, and logged.
+---
+ runtime/vmbones.c | 53 ++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 43 insertions(+), 10 deletions(-)
+
+diff --git a/runtime/vmbones.c b/runtime/vmbones.c
+index 3eaadeb..1c236d5 100644
+--- a/runtime/vmbones.c
++++ b/runtime/vmbones.c
+@@ -333,22 +333,51 @@ int rt_vm_hands(float pts[18])
+     return mask;
+ }
+ 
+-/* A bone's place in the bind pose: the inverse of its pose to bone
+-   matrix (mstudiobone_t +0x60, a matrix3x4_t, after the name, parent,
+-   controllers, position, quaternion, rotation and their scales; the
+-   0xA0 a bone this build's header gives ends with the alignment
+-   quaternion after it). 0 when that matrix is not a rigid turn, which
+-   would mean the offset is wrong for this build. */
+-static int bone_bind(const vm_model *m, int i, float out[12])
++/* Where mstudiobone_t keeps its pose to bone matrix3x4_t in this build:
++   the 0x60 a newer header layout gives was not a rigid turn in A.'s run
++   (2026-11-25, "bind pose: right hand not found"), so it is found from
++   the header itself, once: the first offset at which every bone of the
++   model holds three orthonormal rows. -1 when none does. */
++static int rigid_at(const vm_model *m, int i, uint32_t off, float p[12])
+ {
+     uint32_t b = m->hdr + rd32(m->hdr + HDR_BONE_INDEX) + (uint32_t)i * BONE_SIZE;
+-    float p[12];
+-    memcpy(p, rt_host(b + 0x60u), sizeof p);
++    memcpy(p, rt_host(b + off), 12 * sizeof *p);
+     if (!finite_n(p, 12)) return 0;
+     for (int r = 0; r < 3; r++) {
+         float len = p[4 * r] * p[4 * r] + p[4 * r + 1] * p[4 * r + 1] + p[4 * r + 2] * p[4 * r + 2];
+         if (fabsf(len - 1.0f) > 0.02f) return 0;
++        for (int q = r + 1; q < 3; q++)
++            if (fabsf(p[4 * r] * p[4 * q] + p[4 * r + 1] * p[4 * q + 1] + p[4 * r + 2] * p[4 * q + 2]) > 0.02f) return 0;
++    }
++    return 1;
++}
++
++static int pose_to_bone_offset(const vm_model *m)
++{
++    static int found = -2;
++    if (found != -2) return found;
++    found = -1;
++    for (uint32_t off = 0x08; off + 48 <= BONE_SIZE; off += 4) {
++        int all = 1;
++        float p[12];
++        for (int i = 0; i < m->n && all; i++) all = rigid_at(m, i, off, p);
++        if (all) {
++            found = (int)off;
++            break;
++        }
+     }
++    rt_log("vm bones: \"%s\" pose to bone matrices %s0x%X in each %u byte bone", m->model, found < 0 ? "not found, last tried " : "at ",
++           found < 0 ? 0x94u : (unsigned)found, BONE_SIZE);
++    return found;
++}
++
++/* A bone's place in the bind pose: the inverse of its pose to bone
++   matrix. 0 when the matrix is not a rigid turn. */
++static int bone_bind(const vm_model *m, int i, float out[12])
++{
++    int off = pose_to_bone_offset(m);
++    float p[12];
++    if (off < 0 || !rigid_at(m, i, (uint32_t)off, p)) return 0;
+     /* Inverse of [R t]: [R^T, -R^T t], rows of four as a matrix3x4_t. */
+     for (int r = 0; r < 3; r++) {
+         for (int c = 0; c < 3; c++) out[4 * r + c] = p[4 * c + r];
+@@ -380,7 +409,11 @@ int rt_vm_hands_bind(float out[32])
+         memcpy(o, hb, sizeof hb);
+         float dx = fb[3] - hb[3], dy = fb[7] - hb[7], dz = fb[11] - hb[11];
+         float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+-        if (!(dist > 0.5f && dist < 40.0f)) continue;
++        if (!(dist > 0.5f && dist < 40.0f)) {
++            static int told;
++            if (!told++) rt_log("vm bones: hand to middle finger %.1f units in the bind pose, not a hand", dist);
++            continue;
++        }
+         o[12] = hb[3] + 0.5f * dx, o[13] = hb[7] + 0.5f * dy, o[14] = hb[11] + 0.5f * dz;
+         o[15] = 0.6f * dist;
+         mask |= 1 << s;
+-- 
+2.54.0 (Apple Git-157)
+

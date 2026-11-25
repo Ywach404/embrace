@@ -191,6 +191,22 @@ echo "wrote $out/run-metal.sh"
 
 if [ "$test" = 1 ]; then
     "$testdir/handoff_test"
+    # The orbs' porthole layout (the app's own arithmetic, no Metal).
+    swiftc -O "$repo/app/visionos/Host/OrbLayout.swift" "$repo/app/visionos/test/orb_layout/main.swift" \
+        -o "$testdir/orb_layout_test"
+    "$testdir/orb_layout_test"
+    # The layout edit's math: turns read back, mirrored sides, carrying.
+    swiftc -O "$repo/app/visionos/Host/Layout/HUDLayout.swift" "$repo/app/visionos/test/layout/main.swift" \
+        -o "$testdir/layout_test"
+    "$testdir/layout_test"
+    # The hands: the rig, its poses and the renderer offscreen, with the
+    # pictures it draws left beside the test to look at.
+    swiftc -O "$repo"/app/visionos/Host/Hands/*.swift "$repo/app/visionos/test/hands/main.swift" -o "$testdir/hands_test"
+    "$testdir/hands_test" "$testdir/hands" "$repo/assets/hands"
+    # The soft target lock: cone, hysteresis, ties, cycling.
+    swiftc -O "$repo"/app/visionos/Host/Selection/*.swift "$repo/app/visionos/test/selection/main.swift" \
+        -o "$testdir/selection_test"
+    "$testdir/selection_test"
     if [ -n "$methods" ]; then "$testdir/metal_d3d9_test" "$libdir/libmetal_d3d9.dylib" "$methods"
     else "$testdir/metal_d3d9_test" "$libdir/libmetal_d3d9.dylib"; fi
 fi

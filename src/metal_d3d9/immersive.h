@@ -64,6 +64,63 @@ typedef struct {
     void *arm_texture;
     int arm_shown[2];
     float arm_uv[2][4];
+    /* The orbs (an arm side in mode 2, metal_d3d9_fullview_arm_hud): the
+       selected discipline's icon and the weapon's picture as the game's
+       HUD drew them this frame, borrowed id<MTLTexture>s (the game's own,
+       gamma encoded, straight alpha) held with the slot, NULL when not
+       drawn. And each side's label (0 the ammunition's count, 1 the
+       power's name) as the game's glyphs drew it, larger, on arm_texture
+       at label_uv[side] (u0, v0, u1, v1, top left first); 0 with none. */
+    void *icon_texture;
+    void *weapon_texture;
+    int label_shown[2];
+    float label_uv[2][4];
+    /* Full view's HUD panel, head locked hud_m ahead in the frame's drawn
+       axes: game NDC (x, y) of a HUD draw is at tangent (panel[0] x,
+       panel[1] y) on it. 0 for a frame on the plane. */
+    float panel[2];
+    /* The game's crosshair in a full view frame (draw.m, crosshair), which
+       the backend leaves out when the compositor draws its own reticle:
+       crosshair_shown says the frame drew it, crosshair_ndc is its centre
+       in the game's NDC (on the panel as above) and crosshair_half its x
+       half extent there, the accuracy ring's when the frame has one. 0
+       for a frame with no crosshair, as with no weapon out. */
+    int crosshair_shown;
+    float crosshair_ndc[2], crosshair_half;
+    /* Third person: where the player's shot lands, found from its own
+       ray (the runtime's rt_player_aim, read at the frame's Present)
+       against the frame's depth (stereo.h, mtl_aim_search), whatever the
+       weapon. aim_shown 1 when the frame has one. aim_tan is the point as
+       tangents right and up of the frame's drawn forward ((x - cx) / a
+       and (y - cy) / b of the game's projection) and aim_m its depth
+       along that forward in metres from the game's camera, the eyes'
+       midpoint. aim_hit 1 for a surface on the ray, 0 for none (the sky,
+       or past aim_t's far end), where the point is the far end; aim_t is
+       the distance along the ray in game units. 0 otherwise. */
+    int aim_shown, aim_hit;
+    float aim_tan[2], aim_m, aim_t;
+    /* First person: the view model's hands where the game drew them, as
+       the aim's point is: for each hand, right then left, three points
+       (its origin, then along its x and its y axes, 4 game units out), as
+       tangents off the drawn forward and metres along it. vm_hand_shown[k]
+       1 when hand k has all three. */
+    int vm_hand_shown[2];
+    float vm_hand_tan[6][2], vm_hand_m[6];
+    /* And each hand's palm middle as drawn, the same way (0 metres for
+       none): where the glove's wrist is checked against in the log. */
+    float vm_palm_tan[2][2], vm_palm_m[2];
+    /* The scene's depth (metal_d3d9_fullview_scene_depth): a borrowed
+       id<MTLTexture>, R16Float, a 2D array of two (slice 0 the left eye),
+       held with the slot, each texel the distance in metres along its
+       eye's forward as the frame was drawn (the axes eye_tan is about) to
+       the nearest thing drawn in that block of the eye's image, 0 where
+       nothing was. At a fraction of the frame's size, covering the same
+       image. NULL when not asked for or not a full view frame. */
+    void *scene_depth;
+    /* 1 when the view model's pixels in it are in metres by its own
+       projection (its depth range is its own), so what is held is
+       there at its true distance and hides a glove behind it. */
+    int scene_depth_vm;
 } metal_d3d9_shown_frame;
 
 /* The HUD plane's distance ahead of the eyes, in metres: near enough to
@@ -114,12 +171,21 @@ void metal_d3d9_immersive_view_pose(int valid, float yaw_deg, float pitch_deg);
    thread. */
 void metal_d3d9_immersive_hand_pose(int side, int state, const float grip[16], const float aim[16], double time);
 
-/* The arm HUD: whether the compositor can show one side's card (0 left,
-   1 right), its controller tracked with a position; it says so every
-   frame it draws. A side it cannot show keeps its gauge on the head-locked
-   panel, as every side does until it is first called, out of full view,
-   and with RT_ARM_HUD=0. Any thread; latched with each frame. */
+/* The arm HUD: what the compositor shows for one side (0 left, 1 right),
+   its controller tracked with a position; it says so every frame it
+   draws. on 1: the side's gauge on its card; 2: an orb of the
+   compositor's own stands for it, so the gauge is not drawn and the
+   right side's icon is handed on (icon_texture); 0: no controller. A side
+   at 0 keeps its gauge on the head-locked panel, as every side does
+   until it is first called, out of full view, and with RT_ORB_HUD=0 and
+   no RT_ARM_HUD=1. Any thread; latched with each frame. */
 void metal_d3d9_fullview_arm_hud(int side, int on);
+
+/* Whether full view frames carry the scene's depth for the compositor
+   (metal_d3d9_shown_frame's scene_depth), for drawing what the host adds
+   behind what the game drew nearer: off until asked for, since it costs a
+   compute pass and a copy each frame. */
+void metal_d3d9_fullview_scene_depth(int on);
 
 /*
  * Stereo (the backend's stereo.h). With it on and the ring in use, each
@@ -186,6 +252,27 @@ int metal_d3d9_fullview_game_tan(float *tan_x, float *tan_y);
  * seen this session), 0 none (the game's third person, which it switches
  * per weapon), 1 drawn (first person). Read by the runtime each frame. */
 int metal_d3d9_fullview_view_model(void);
+/* The runtime's reader of the player's shot ray (eye and unit direction,
+ * game world units), called on the game thread at each Present: 1 in
+ * third person with a player in the world. The backend searches the
+ * frame's depth along it for where the shot lands (aim_shown). */
+void metal_d3d9_fullview_aim_source(int (*fn)(float eye[3], float dir[3]));
+/* The first person view model's hands (rt_vm_hands): per hand, right then
+ * left, its origin and points along its x and y axes in game world units;
+ * bit 0 right, bit 1 left. Shown frames carry them as vm_hand_*. */
+void metal_d3d9_fullview_hands_source(int (*fn)(float pts[18]));
+/* The arms' hands in their model's bind pose (rt_vm_hands_bind): per hand,
+   right then left, 16 floats, the hand bone's bind frame as a matrix3x4
+   in rows of four, then the palm's middle and a radius, model units. The
+   renderer finds the palm's vertices in the arms' own draws by it and
+   fits where the frame drew them, so the hands follow the game's
+   animation when the arms' cached bones are stale. */
+void metal_d3d9_fullview_hands_bind_source(int (*fn)(float out[32]));
+/* Asked right after the ray, on the same thread: 1 when the runtime also
+ * traced it with the engine's own shot trace, with *t the distance along
+ * the ray to what it met and *hit 0 when it met nothing; the backend then
+ * takes that point rather than searching the depth. 0 for no trace. */
+void metal_d3d9_fullview_aim_trace_source(int (*fn)(float *t, int *hit));
 void metal_d3d9_immersive_view_play(int play);
 void metal_d3d9_fullview_game_eye(int on);
 
